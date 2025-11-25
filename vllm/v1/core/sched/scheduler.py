@@ -682,14 +682,14 @@ class Scheduler(SchedulerInterface):
                 self.waiting.prepend_requests(skipped_waiting_requests)
 
             # If we scheduled all prefill, enter decode phase
-            if (not self.chunk_prefilling and not self.waiting) or len(self.running) >= self.max_num_running_reqs:
+            if (not self.chunk_prefilling and not self.waiting) or (len(self.running) - len(self.chunk_prefilling)) >= self.max_num_running_reqs:
                 self.pd_in_decode_phase = True
                 self.pd_decode_steps_remaining = self.pd_max_decode_steps
 
         # ===== DECODE SCHEDULING =====
         # Schedule all running requests for decode
         req_index = 0
-        while req_index < len(self.running) and token_budget > 0:
+        while not can_schedule_prefill and req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
             # Skip if already scheduled (e.g., from prefill above)
