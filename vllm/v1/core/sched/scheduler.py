@@ -527,7 +527,7 @@ class Scheduler(SchedulerInterface):
         # Determine if we are in decode-only phase or can do prefill
         if self.pd_in_decode_phase and self.pd_decode_steps_remaining > 0:
             # We are in decode-only phase
-            can_schedule_prefill = False
+            is_prefill_phase = False
             self.pd_decode_steps_remaining -= 1
 
             # If this is the last decode step, switch to prefill phase next time
@@ -535,12 +535,12 @@ class Scheduler(SchedulerInterface):
                 self.pd_in_decode_phase = False
         else:
             # We can schedule prefill requests
-            can_schedule_prefill = True
+            is_prefill_phase = True
             self.pd_in_decode_phase = False
 
         # ===== PREFILL SCHEDULING =====
         # Schedule as many prefill requests as possible until token budget exhausted
-        if can_schedule_prefill:
+        if is_prefill_phase:
             # First, continue prefill for running requests that haven't completed prefill
             if self.scheduler_config.enable_chunked_prefill and self.chunk_prefilling:
                 req_index = 0
@@ -689,7 +689,7 @@ class Scheduler(SchedulerInterface):
         # ===== DECODE SCHEDULING =====
         # Schedule all running requests for decode
         req_index = 0
-        while not can_schedule_prefill and req_index < len(self.running) and token_budget > 0:
+        while not is_prefill_phase and req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
             # Skip if already scheduled (e.g., from prefill above)
@@ -698,7 +698,6 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Skip if still in prefill phase (important for chunked prefill)
-            # This is impossible
             if is_prefill(request):
                 req_index += 1
                 continue
