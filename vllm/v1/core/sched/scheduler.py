@@ -209,10 +209,25 @@ class Scheduler(SchedulerInterface):
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
         # P/D competition scheduling state
-        self.pd_competition_mode = False  # Enable P/D competition scheduling
-        self.pd_decode_steps_remaining = 0  # Remaining decode steps before next prefill
-        self.pd_max_decode_steps = 5  # Maximum decode steps (N=5)
-        self.pd_in_decode_phase = False  # True if in decode-only phase, False if can do prefill
+        # N: batch size - number of requests to prefill before starting decode
+        self.pd_batch_size_N = self.max_num_running_reqs
+        # k: switching threshold - after k decodes complete, prefill k new
+        self.pd_switch_threshold_k = max(1, self.pd_batch_size_N // 5)
+
+        # Phase tracking:
+        # Phase 0: Initial prefill - prefill N requests
+        # Phase 1: Decode - decode until k requests complete
+        # Phase 2: Refill prefill - prefill k new requests (no decode)
+        # Then back to Phase 1
+        self.pd_phase = 0
+
+        # Counters
+        self.pd_prefilled_count = 0  # Prefills completed in current batch
+        self.pd_completed_decode_count = 0  # Decodes completed since last switch
+
+        # Track which requests are in decode phase
+        self.pd_decoding_requests: set[str] = set()
+
         self.chunk_prefilling: list[Request] = []
 
     def schedule_simplify(self) -> SchedulerOutput:
@@ -500,13 +515,15 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self) -> SchedulerOutput:
         """
-        P/D Competition Scheduler:
-        - Prefill step: Schedule as many prefill requests as possible (until token budget exhausted)
-        - Next N=5 decode steps: Only schedule decode (no new prefills)
-        - Then switch back to prefill step if waiting queue has requests
+        P/D Competition Scheduler with batch-based switching:
 
-        Prefill phase: num_computed_tokens < num_prompt_tokens
-        Decode phase: num_computed_tokens >= num_prompt_tokens
+        Phase 0 (Initial Prefill): Prefill N requests
+        Phase 1 (Decode): Decode all requests until k complete
+        Phase 2 (Refill Prefill): Prefill k new requests (no decode)
+        Then back to Phase 1: Decode (N-k old + k new) until k complete
+        ...repeat...
+
+        k is the switching threshold (can be optimized later).
         """
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -524,140 +541,144 @@ class Scheduler(SchedulerInterface):
         def is_prefill(req: Request) -> bool:
             return req.num_computed_tokens < req.num_prompt_tokens
 
-        # Determine if we are in decode-only phase or can do prefill
-        if self.pd_in_decode_phase and self.pd_decode_steps_remaining > 0:
-            # We are in decode-only phase
-            is_prefill_phase = False
-            self.pd_decode_steps_remaining -= 1
+        # ===== PHASE TRANSITION LOGIC =====
+        has_decoding_work = len(self.pd_decoding_requests) > 0
+        has_waiting = len(self.waiting) > 0 or len(self.chunk_prefilling) > 0
 
-            # If this is the last decode step, switch to prefill phase next time
-            if self.pd_decode_steps_remaining == 0:
-                self.pd_in_decode_phase = False
-        else:
-            # We can schedule prefill requests
-            is_prefill_phase = True
-            self.pd_in_decode_phase = False
+        if self.pd_phase == 0:
+            # Initial prefill: switch to decode when N prefilled OR no more waiting
+            if self.pd_prefilled_count >= self.pd_batch_size_N:
+                self.pd_phase = 1
+                self.pd_completed_decode_count = 0
+            elif not has_waiting and has_decoding_work:
+                # No more to prefill but we have decode work
+                self.pd_phase = 1
+                self.pd_completed_decode_count = 0
+        elif (self.pd_phase == 1
+              and self.pd_completed_decode_count >= self.pd_switch_threshold_k):
+            # Decode: switch to refill when k decodes complete
+            if has_waiting:
+                self.pd_phase = 2
+                self.pd_prefilled_count = 0
+            else:
+                # No waiting requests, stay in decode but reset counter
+                self.pd_completed_decode_count = 0
+        elif self.pd_phase == 2:
+            # Refill prefill: switch to decode when k prefilled OR no more waiting
+            if (self.pd_prefilled_count >= self.pd_switch_threshold_k
+                    or (not has_waiting and has_decoding_work)):
+                self.pd_phase = 1
+                self.pd_completed_decode_count = 0
 
-        # ===== PREFILL SCHEDULING =====
-        # Schedule as many prefill requests as possible until token budget exhausted
-        if is_prefill_phase:
-            # First, continue prefill for running requests that haven't completed prefill
-            if self.scheduler_config.enable_chunked_prefill and self.chunk_prefilling:
+        # ===== PREFILL SCHEDULING (Phase 0 or Phase 2) =====
+        if self.pd_phase in (0, 2):
+            target = (self.pd_batch_size_N if self.pd_phase == 0
+                      else self.pd_switch_threshold_k)
+            remaining = target - self.pd_prefilled_count
+
+            # Continue chunked prefills first
+            if self.scheduler_config.enable_chunked_prefill:
                 req_index = 0
-                while self.chunk_prefilling and token_budget > 0:
+                while (req_index < len(self.chunk_prefilling)
+                       and token_budget > 0 and remaining > 0):
                     request = self.chunk_prefilling[req_index]
-                    # Skip if not in prefill phase
+
                     if not is_prefill(request):
                         req_index += 1
                         continue
-
-                    # Skip if already scheduled
                     if request.request_id in num_scheduled_tokens:
                         req_index += 1
                         continue
 
-                    # Continue prefill for this request
                     num_new_tokens = request.num_tokens - request.num_computed_tokens
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
-
                     num_new_tokens = min(num_new_tokens, token_budget)
                     if num_new_tokens <= 0:
                         req_index += 1
                         continue
 
-                    # Try to allocate KV cache
                     new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens,
-                        num_lookahead_tokens=effective_lookahead_tokens,
-                    )
-
+                        request, num_new_tokens,
+                        num_lookahead_tokens=effective_lookahead_tokens)
                     if new_blocks is None:
-                        # Cannot allocate, skip this request for now
                         req_index += 1
                         continue
 
-                    # Successfully scheduled continuing prefill
-                    if request.num_tokens - request.num_computed_tokens <= num_new_tokens:
+                    # Check if prefill completes
+                    will_complete = (request.num_tokens - request.num_computed_tokens
+                                     <= num_new_tokens)
+                    if will_complete:
                         self.chunk_prefilling.remove(request)
-                        req_index -= 1
+                        self.pd_prefilled_count += 1
+                        remaining -= 1
+                        self.pd_decoding_requests.add(request.request_id)
+                    else:
+                        req_index += 1
+
                     scheduled_running_reqs.append(request)
                     req_to_new_blocks[request.request_id] = new_blocks
                     num_scheduled_tokens[request.request_id] = num_new_tokens
                     token_budget -= num_new_tokens
-                    req_index += 1
-            # Then, schedule new prefill requests from waiting queue
-            # Use a temporary queue to collect skipped requests
-            skipped_waiting_requests = create_request_queue(self.policy)
 
-            while self.waiting and token_budget > 0:
+            # Schedule new prefills from waiting queue
+            skipped = create_request_queue(self.policy)
+            while self.waiting and token_budget > 0 and remaining > 0:
                 if len(self.running) >= self.max_num_running_reqs:
                     break
 
                 request = self.waiting.peek_request()
 
-                # Get already-cached tokens
                 num_external_computed_tokens = 0
                 if request.num_computed_tokens == 0:
-                    new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
-                    )
-                    num_computed_tokens = (
-                        num_new_local_computed_tokens + num_external_computed_tokens
-                    )
+                    new_computed_blocks, num_local = (
+                        self.kv_cache_manager.get_computed_blocks(request))
+                    num_computed_tokens = num_local + num_external_computed_tokens
                 else:
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
-                    num_new_local_computed_tokens = 0
+                    num_local = 0
                     num_computed_tokens = request.num_computed_tokens
 
-                # Number of tokens to be scheduled for prefill
                 num_new_tokens = request.num_tokens - num_computed_tokens
                 threshold = self.scheduler_config.long_prefill_token_threshold
                 if 0 < threshold < num_new_tokens:
                     num_new_tokens = threshold
 
-                is_chunk_prefilling = False
-                # Check if chunked prefill is enabled
-                if (
-                    not self.scheduler_config.enable_chunked_prefill
-                    and num_new_tokens > token_budget
-                ):
-                    # Skip this request if we can't fit it
+                is_chunked = False
+                if (not self.scheduler_config.enable_chunked_prefill
+                        and num_new_tokens > token_budget):
                     self.waiting.pop_request()
-                    skipped_waiting_requests.prepend_request(request)
+                    skipped.prepend_request(request)
                     continue
-                elif num_new_tokens > token_budget: # chunked prefill is enabled
-                    is_chunk_prefilling = True
+                elif num_new_tokens > token_budget:
+                    is_chunked = True
 
                 num_new_tokens = min(num_new_tokens, token_budget)
                 if num_new_tokens <= 0:
                     break
 
-                # Try to allocate KV cache
                 new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens + num_external_computed_tokens,
-                    num_new_local_computed_tokens,
-                    new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                )
-
+                    request, num_new_tokens + num_external_computed_tokens,
+                    num_local, new_computed_blocks,
+                    num_lookahead_tokens=effective_lookahead_tokens)
                 if new_blocks is None:
-                    # Cannot allocate, stop scheduling prefills
-
                     break
 
-                # Successfully scheduled prefill
                 request = self.waiting.pop_request()
                 self.running.append(request)
-                if is_chunk_prefilling:
+
+                if is_chunked:
                     self.chunk_prefilling.append(request)
+                else:
+                    # Prefill completes in one step
+                    self.pd_prefilled_count += 1
+                    remaining -= 1
+                    self.pd_decoding_requests.add(request.request_id)
+
                 if self.log_stats:
                     request.record_event(
-                        EngineCoreEventType.SCHEDULED, scheduled_timestamp
-                    )
+                        EngineCoreEventType.SCHEDULED, scheduled_timestamp)
 
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
@@ -667,110 +688,91 @@ class Scheduler(SchedulerInterface):
                     raise RuntimeError(f"Invalid request status: {request.status}")
 
                 req_to_new_blocks[request.request_id] = (
-                    self.kv_cache_manager.get_blocks(request.request_id)
-                )
+                    self.kv_cache_manager.get_blocks(request.request_id))
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
-
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed_tokens
 
-            # Put back any skipped requests
-            if skipped_waiting_requests:
-                self.waiting.prepend_requests(skipped_waiting_requests)
+            if skipped:
+                self.waiting.prepend_requests(skipped)
 
-            # If we scheduled all prefill, enter decode phase
-            if (not self.chunk_prefilling and not self.waiting) or (len(self.running) - len(self.chunk_prefilling)) >= self.max_num_running_reqs:
-                self.pd_in_decode_phase = True
-                self.pd_decode_steps_remaining = self.pd_max_decode_steps
+        # ===== DECODE SCHEDULING (Phase 1 only) =====
+        elif self.pd_phase == 1:
+            req_index = 0
+            while req_index < len(self.running) and token_budget > 0:
+                request = self.running[req_index]
 
-        # ===== DECODE SCHEDULING =====
-        # Schedule all running requests for decode
-        req_index = 0
-        while not is_prefill_phase and req_index < len(self.running) and token_budget > 0:
-            request = self.running[req_index]
+                if request.request_id in num_scheduled_tokens:
+                    req_index += 1
+                    continue
+                if is_prefill(request):
+                    req_index += 1
+                    continue
+                # Only decode requests in pd_decoding_requests
+                if request.request_id not in self.pd_decoding_requests:
+                    req_index += 1
+                    continue
 
-            # Skip if already scheduled (e.g., from prefill above)
-            if request.request_id in num_scheduled_tokens:
+                num_new_tokens = (request.num_tokens_with_spec
+                                  + request.num_output_placeholders
+                                  - request.num_computed_tokens)
+                threshold = self.scheduler_config.long_prefill_token_threshold
+                if 0 < threshold < num_new_tokens:
+                    num_new_tokens = threshold
+                num_new_tokens = min(num_new_tokens, token_budget)
+
+                max_total = min(request.num_prompt_tokens + request.max_tokens,
+                                self.max_model_len)
+                num_new_tokens = min(num_new_tokens,
+                                     max_total - 1 - request.num_computed_tokens)
+                if num_new_tokens == 0:
+                    req_index += 1
+                    continue
+
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    request, num_new_tokens,
+                    num_lookahead_tokens=self.num_lookahead_tokens)
+
+                if new_blocks is None:
+                    # Need to preempt
+                    if self.policy == SchedulingPolicy.PRIORITY:
+                        preempted_req = max(
+                            self.running, key=lambda r: (r.priority, r.arrival_time))
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens[
+                                preempted_req.request_id]
+                            req_to_new_blocks.pop(preempted_req.request_id)
+                            num_scheduled_tokens.pop(preempted_req.request_id)
+                            req_index -= 1
+                    else:
+                        preempted_req = self.running.pop()
+
+                    self.kv_cache_manager.free(preempted_req)
+                    self.encoder_cache_manager.free(preempted_req)
+                    preempted_req.status = RequestStatus.PREEMPTED
+                    preempted_req.num_computed_tokens = 0
+                    preempted_req.num_preemptions += 1
+                    self.pd_decoding_requests.discard(preempted_req.request_id)
+
+                    if self.log_stats:
+                        preempted_req.record_event(
+                            EngineCoreEventType.PREEMPTED, scheduled_timestamp)
+                    self.waiting.prepend_request(preempted_req)
+                    preempted_reqs.append(preempted_req)
+                    if preempted_req == request:
+                        break
+                    continue
+
+                scheduled_running_reqs.append(request)
+                req_to_new_blocks[request.request_id] = new_blocks
+                num_scheduled_tokens[request.request_id] = num_new_tokens
+                token_budget -= num_new_tokens
                 req_index += 1
-                continue
-
-            # Skip if still in prefill phase (important for chunked prefill)
-            if is_prefill(request):
-                req_index += 1
-                continue
-
-            # Calculate number of tokens to schedule for decode
-            num_new_tokens = (
-                request.num_tokens_with_spec
-                + request.num_output_placeholders
-                - request.num_computed_tokens
-            )
-
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
-
-            # Apply max_model_len and max_tokens constraints
-            max_total_tokens = min(
-                request.num_prompt_tokens + request.max_tokens, self.max_model_len
-            )
-            num_new_tokens = min(
-                num_new_tokens, max_total_tokens - 1 - request.num_computed_tokens
-            )
-
-            if num_new_tokens == 0:
-                req_index += 1
-                continue
-
-            # Try to allocate KV cache
-            new_blocks = self.kv_cache_manager.allocate_slots(
-                request,
-                num_new_tokens,
-                num_lookahead_tokens=self.num_lookahead_tokens,
-            )
-
-            if new_blocks is None:
-                # Need to preempt
-                if self.policy == SchedulingPolicy.PRIORITY:
-                    preempted_req = max(
-                        self.running,
-                        key=lambda r: (r.priority, r.arrival_time),
-                    )
-                    self.running.remove(preempted_req)
-                    if preempted_req in scheduled_running_reqs:
-                        scheduled_running_reqs.remove(preempted_req)
-                        token_budget += num_scheduled_tokens[preempted_req.request_id]
-                        req_to_new_blocks.pop(preempted_req.request_id)
-                        num_scheduled_tokens.pop(preempted_req.request_id)
-                        req_index -= 1
-                else:
-                    preempted_req = self.running.pop()
-
-                self.kv_cache_manager.free(preempted_req)
-                self.encoder_cache_manager.free(preempted_req)
-                preempted_req.status = RequestStatus.PREEMPTED
-                preempted_req.num_computed_tokens = 0
-                preempted_req.num_preemptions += 1
-                if self.log_stats:
-                    preempted_req.record_event(
-                        EngineCoreEventType.PREEMPTED, scheduled_timestamp
-                    )
-
-                self.waiting.prepend_request(preempted_req)
-                preempted_reqs.append(preempted_req)
-                if preempted_req == request:
-                    break
-                continue
-
-            # Successfully scheduled decode
-            scheduled_running_reqs.append(request)
-            req_to_new_blocks[request.request_id] = new_blocks
-            num_scheduled_tokens[request.request_id] = num_new_tokens
-            token_budget -= num_new_tokens
-            req_index += 1
 
         # Construct scheduler output
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -780,24 +782,16 @@ class Scheduler(SchedulerInterface):
             any_request = self.running[0]
             num_common_prefix_blocks = (
                 self.kv_cache_manager.get_num_common_prefix_blocks(
-                    any_request.request_id
-                )
-            )
+                    any_request.request_id))
 
         new_reqs_data = [
             NewRequestData.from_request(
-                req, req_to_new_blocks[req.request_id].get_block_ids()
-            )
-            for req in scheduled_new_reqs
-        ]
+                req, req_to_new_blocks[req.request_id].get_block_ids())
+            for req in scheduled_new_reqs]
 
         cached_reqs_data = self._make_cached_request_data(
-            scheduled_running_reqs,
-            scheduled_resumed_reqs,
-            num_scheduled_tokens,
-            scheduled_spec_decode_tokens,
-            req_to_new_blocks,
-        )
+            scheduled_running_reqs, scheduled_resumed_reqs,
+            num_scheduled_tokens, scheduled_spec_decode_tokens, req_to_new_blocks)
 
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
@@ -811,8 +805,7 @@ class Scheduler(SchedulerInterface):
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
             finished_req_ids=self.finished_req_ids,
-            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
-        )
+            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes())
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -1738,6 +1731,11 @@ class Scheduler(SchedulerInterface):
                 stopped = check_stop(request, self.max_model_len, pooler_output)
 
             if stopped:
+                # P/D scheduling: count completed decode requests
+                if request.request_id in self.pd_decoding_requests:
+                    self.pd_completed_decode_count += 1
+                    self.pd_decoding_requests.discard(request.request_id)
+
                 kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
