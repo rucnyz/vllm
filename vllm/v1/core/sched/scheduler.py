@@ -554,15 +554,19 @@ class Scheduler(SchedulerInterface):
                 # No more to prefill but we have decode work
                 self.pd_phase = 1
                 self.pd_completed_decode_count = 0
-        elif (self.pd_phase == 1
-              and self.pd_completed_decode_count >= self.pd_switch_threshold_k):
-            # Decode: switch to refill when k decodes complete
-            if has_waiting:
-                self.pd_phase = 2
+        elif self.pd_phase == 1:
+            # Decode phase: check conditions to switch
+            if self.pd_completed_decode_count >= self.pd_switch_threshold_k:
+                if has_waiting:
+                    self.pd_phase = 2
+                    self.pd_prefilled_count = 0
+                else:
+                    # No waiting requests, reset counter and continue decode
+                    self.pd_completed_decode_count = 0
+            elif has_waiting and not has_decoding_work:
+                # No decode work but have waiting requests, switch to prefill
+                self.pd_phase = 0
                 self.pd_prefilled_count = 0
-            else:
-                # No waiting requests, stay in decode but reset counter
-                self.pd_completed_decode_count = 0
         elif self.pd_phase == 2:
             # Refill prefill: switch to decode when k prefilled OR no more waiting
             if (self.pd_prefilled_count >= self.pd_switch_threshold_k
