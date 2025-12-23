@@ -544,6 +544,7 @@ class Scheduler(SchedulerInterface):
         # ===== PHASE TRANSITION LOGIC =====
         has_decoding_work = len(self.pd_decoding_requests) > 0
         has_waiting = len(self.waiting) > 0 or len(self.chunk_prefilling) > 0
+        waiting_count = len(self.waiting) + len(self.chunk_prefilling)
 
         if self.pd_phase == 0:
             # Initial prefill: switch to decode when N prefilled OR no more waiting
@@ -555,14 +556,13 @@ class Scheduler(SchedulerInterface):
                 self.pd_phase = 1
                 self.pd_completed_decode_count = 0
         elif self.pd_phase == 1:
-            # Decode phase: check conditions to switch
-            if self.pd_completed_decode_count >= self.pd_switch_threshold_k:
-                if has_waiting:
-                    self.pd_phase = 2
-                    self.pd_prefilled_count = 0
-                else:
-                    # No waiting requests, reset counter and continue decode
-                    self.pd_completed_decode_count = 0
+            # Decode phase: switch to prefill when BOTH conditions met:
+            # 1. completed decode count >= k*
+            # 2. waiting queue size >= k*
+            if (self.pd_completed_decode_count >= self.pd_switch_threshold_k
+                    and waiting_count >= self.pd_switch_threshold_k):
+                self.pd_phase = 2
+                self.pd_prefilled_count = 0
             elif has_waiting and not has_decoding_work:
                 # No decode work but have waiting requests, switch to prefill
                 self.pd_phase = 0
