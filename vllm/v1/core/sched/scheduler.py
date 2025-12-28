@@ -456,7 +456,7 @@ class Scheduler(SchedulerInterface):
             old_k = self.pd_switch_threshold_k
             self.pd_switch_threshold_k = new_k
             # Also update environment variable for consistency
-            os.environ["VLLM_PD_K_STAR_DYNAMIC"] = str(new_k)
+            os.environ["VLLM_PD_K_STAR"] = str(new_k)
             logger.info(f"[P/D] State reset: k* {old_k} -> {new_k}")
         else:
             logger.info(
@@ -845,16 +845,16 @@ class Scheduler(SchedulerInterface):
 
         Environment variables:
         - VLLM_PD_RESET_STATE: Set to "1" to trigger state reset (auto-clears)
-        - VLLM_PD_ALPHA_P_DYNAMIC: Prefill overhead (seconds)
-        - VLLM_PD_ALPHA_D_DYNAMIC: Decode overhead per step (seconds)
-        - VLLM_PD_BETA_D_DYNAMIC: Per-request decode cost (seconds)
-        - VLLM_PD_P_DYNAMIC: Termination probability
-        - VLLM_PD_K_STAR_DYNAMIC: Override k* directly
+        - VLLM_PD_ALPHA_P: Prefill overhead (seconds)
+        - VLLM_PD_ALPHA_D: Decode overhead per step (seconds)
+        - VLLM_PD_BETA_D: Per-request decode cost (seconds)
+        - VLLM_PD_P: Termination probability
+        - VLLM_PD_K_STAR: Override k* directly
         """
         # Check for state reset request (for fair throughput comparison)
         if os.environ.get("VLLM_PD_RESET_STATE", "0") == "1":
             # Get new k value if provided
-            new_k_str = os.environ.get("VLLM_PD_K_STAR_DYNAMIC", "")
+            new_k_str = os.environ.get("VLLM_PD_K_STAR", "")
             new_k = int(new_k_str) if new_k_str else None
             self.reset_pd_state(new_k)
             # Clear the reset flag
@@ -865,7 +865,7 @@ class Scheduler(SchedulerInterface):
         # These are typically set once after profiling
         params_updated = False
 
-        alpha_p_str = os.environ.get("VLLM_PD_ALPHA_P_DYNAMIC", "")
+        alpha_p_str = os.environ.get("VLLM_PD_ALPHA_P", "")
         if alpha_p_str:
             try:
                 new_alpha_p = float(alpha_p_str)
@@ -875,7 +875,7 @@ class Scheduler(SchedulerInterface):
             except ValueError:
                 pass
 
-        alpha_d_str = os.environ.get("VLLM_PD_ALPHA_D_DYNAMIC", "")
+        alpha_d_str = os.environ.get("VLLM_PD_ALPHA_D", "")
         if alpha_d_str:
             try:
                 new_alpha_d = float(alpha_d_str)
@@ -885,7 +885,7 @@ class Scheduler(SchedulerInterface):
             except ValueError:
                 pass
 
-        beta_d_str = os.environ.get("VLLM_PD_BETA_D_DYNAMIC", "")
+        beta_d_str = os.environ.get("VLLM_PD_BETA_D", "")
         if beta_d_str:
             try:
                 new_beta_d = float(beta_d_str)
@@ -896,7 +896,7 @@ class Scheduler(SchedulerInterface):
                 pass
 
         # Check for dynamic p update
-        dynamic_p_str = os.environ.get("VLLM_PD_P_DYNAMIC", "")
+        dynamic_p_str = os.environ.get("VLLM_PD_P", "")
         if dynamic_p_str:
             try:
                 new_p = float(dynamic_p_str)
@@ -907,7 +907,7 @@ class Scheduler(SchedulerInterface):
                 pass
 
         # Check for dynamic k* update
-        dynamic_k_str = os.environ.get("VLLM_PD_K_STAR_DYNAMIC", "")
+        dynamic_k_str = os.environ.get("VLLM_PD_K_STAR", "")
         if dynamic_k_str:
             try:
                 new_k = int(dynamic_k_str)
@@ -943,6 +943,9 @@ class Scheduler(SchedulerInterface):
         """
         # Check for dynamic parameter updates from environment
         self._check_env_param_updates()
+
+        # Online profiling: update α_d, β_d estimates from timing data
+        self._update_online_profiling()
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -1208,6 +1211,10 @@ class Scheduler(SchedulerInterface):
                 f"total_prefilled={self.pd_prefilled_count}/{target}"
             )
 
+            # Record for online profiling
+            self.pd_last_phase = self.pd_phase
+            self.pd_last_batch_size = prefilled_this_call
+
         # ===== DECODE SCHEDULING (Phase 1 only) =====
         elif self.pd_phase == 1:
             # logger.info(
@@ -1292,12 +1299,16 @@ class Scheduler(SchedulerInterface):
             decode_scheduled = len([r for r in scheduled_running_reqs
                                     if r.request_id in self.pd_decoding_requests])
             tokens_used = self.max_num_scheduled_tokens - token_budget
-            # logger.info(
-            #     f"[P/D] DECODE done: scheduled={decode_scheduled}, "
-            #     f"token_budget: {self.max_num_scheduled_tokens}->{token_budget} "
-            #     f"(used={tokens_used}), "
-            #     f"decoding_set={len(self.pd_decoding_requests)}"
-            # )
+            logger.info(
+                f"[P/D] DECODE done: scheduled={decode_scheduled}, "
+                f"token_budget: {self.max_num_scheduled_tokens}->{token_budget} "
+                f"(used={tokens_used}), "
+                f"decoding_set={len(self.pd_decoding_requests)}"
+            )
+
+            # Record for online profiling
+            self.pd_last_phase = 1  # decode phase
+            self.pd_last_batch_size = decode_scheduled
 
         # Construct scheduler output
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())

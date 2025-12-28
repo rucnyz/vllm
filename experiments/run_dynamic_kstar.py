@@ -92,8 +92,8 @@ def run_dynamic_kstar_test(
     estimator.record_kstar(initial_k_star)
 
     # Set initial k* for scheduler via environment and trigger state reset
-    os.environ["VLLM_PD_K_STAR_DYNAMIC"] = str(initial_k_star)
-    os.environ["VLLM_PD_P_DYNAMIC"] = str(initial_p)
+    os.environ["VLLM_PD_K_STAR"] = str(initial_k_star)
+    os.environ["VLLM_PD_P"] = str(initial_p)
     os.environ["VLLM_PD_RESET_STATE"] = "1"
 
     print(f"\n{'='*60}")
@@ -223,9 +223,9 @@ def main():
     )
 
     # Set profiled parameters
-    os.environ["VLLM_PD_ALPHA_P_DYNAMIC"] = str(profile_result.alpha_p)
-    os.environ["VLLM_PD_ALPHA_D_DYNAMIC"] = str(profile_result.alpha_d)
-    os.environ["VLLM_PD_BETA_D_DYNAMIC"] = str(profile_result.beta_d)
+    os.environ["VLLM_PD_ALPHA_P"] = str(profile_result.alpha_p)
+    os.environ["VLLM_PD_ALPHA_D"] = str(profile_result.alpha_d)
+    os.environ["VLLM_PD_BETA_D"] = str(profile_result.beta_d)
 
     print("\nProfiling parameters:")
     print(f"  α_p = {profile_result.alpha_p:.6f}")
