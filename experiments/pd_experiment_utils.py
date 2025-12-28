@@ -795,7 +795,7 @@ def add_common_args(parser):
     # Experiment parameters
     parser.add_argument('--num-requests', type=int, default=500,
                         help='Number of requests for throughput testing')
-    parser.add_argument('--batch-size', type=int, default=32,
+    parser.add_argument('--batch-size', type=int, default=256,
                         help='Scheduler batch size N')
     parser.add_argument('--max-output-tokens', type=int, default=4096,
                         help='Maximum output tokens per request')

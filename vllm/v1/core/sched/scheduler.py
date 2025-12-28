@@ -984,6 +984,18 @@ class Scheduler(SchedulerInterface):
                 self.pd_completed_decode_count = 0
             elif not has_waiting and has_decoding_work:
                 # No more to prefill but we have decode work
+                # Update N_effective to actual prefilled count (token_budget constraint)
+                actual_N = self.pd_prefilled_count
+                if actual_N > 0 and actual_N != self.pd_batch_size_N:
+                    old_N = self.pd_batch_size_N
+                    old_k = self.pd_switch_threshold_k
+                    self.pd_batch_size_N = actual_N
+                    self.pd_switch_threshold_k = self._compute_optimal_k()
+                    logger.info(
+                        f"[P/D] Dynamic N update: N={old_N}->{self.pd_batch_size_N}, "
+                        f"k*={old_k}->{self.pd_switch_threshold_k} "
+                        f"(actual prefilled={actual_N})"
+                    )
                 self.pd_phase = 1
                 self.pd_completed_decode_count = 0
         elif self.pd_phase == 1:
@@ -1007,10 +1019,14 @@ class Scheduler(SchedulerInterface):
 
         # Reset to initial state when idle: no decode work, no running, but has waiting
         if (not has_decoding_work and has_waiting and len(self.running) == 0):
+            # Reset N back to max so next batch can prefill up to capacity
+            old_N = self.pd_batch_size_N
+            self.pd_batch_size_N = self.max_num_running_reqs
+            self.pd_switch_threshold_k = self._compute_optimal_k()
             logger.info(
                 f"[P/D] RESET triggered: phase {self.pd_phase} -> 0 | "
-                f"waiting={waiting_count}, running={len(self.running)}, "
-                f"decoding={len(self.pd_decoding_requests)}"
+                f"N={old_N}->{self.pd_batch_size_N}, k*={self.pd_switch_threshold_k}, "
+                f"waiting={waiting_count}, running={len(self.running)}"
             )
             self.pd_phase = 0
             self.pd_prefilled_count = 0
@@ -1182,6 +1198,16 @@ class Scheduler(SchedulerInterface):
             if skipped:
                 self.waiting.prepend_requests(skipped)
 
+            # Log token budget consumption after prefill loop
+            prefilled_this_call = target - remaining
+            tokens_used = self.max_num_scheduled_tokens - token_budget
+            logger.info(
+                f"[P/D] PREFILL done: prefilled_this_call={prefilled_this_call}, "
+                f"token_budget: {self.max_num_scheduled_tokens}->{token_budget} "
+                f"(used={tokens_used}), "
+                f"total_prefilled={self.pd_prefilled_count}/{target}"
+            )
+
         # ===== DECODE SCHEDULING (Phase 1 only) =====
         elif self.pd_phase == 1:
             # logger.info(
@@ -1261,6 +1287,17 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 req_index += 1
+
+            # Log token budget consumption after decode loop
+            decode_scheduled = len([r for r in scheduled_running_reqs
+                                    if r.request_id in self.pd_decoding_requests])
+            tokens_used = self.max_num_scheduled_tokens - token_budget
+            # logger.info(
+            #     f"[P/D] DECODE done: scheduled={decode_scheduled}, "
+            #     f"token_budget: {self.max_num_scheduled_tokens}->{token_budget} "
+            #     f"(used={tokens_used}), "
+            #     f"decoding_set={len(self.pd_decoding_requests)}"
+            # )
 
         # Construct scheduler output
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())

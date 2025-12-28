@@ -118,7 +118,6 @@ def run_dynamic_kstar_test(
     print(f"\nProcessing {len(test_prompts)} requests...")
     outputs = llm.generate(test_prompts, sampling_params)
     elapsed = time.perf_counter() - start_time
-
     # Collect output lengths and track k* evolution
     all_output_lengths = []
     for output in outputs:
