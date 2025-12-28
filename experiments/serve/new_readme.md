@@ -23,9 +23,9 @@ CUDA_VISIBLE_DEVICES=5 \
     VLLM_USE_PD_SCHEDULER=1 \
     VLLM_PD_ENABLE_DYNAMIC_KSTAR=0 \
     VLLM_PD_K_STAR_DYNAMIC=4 \
-    vllm serve Qwen/Qwen3-8B \
+    python -m vllm.entrypoints.cli.main serve Qwen/Qwen3-8B \
         --port 8000 \
-        --max-num-seqs 32 \
+        --max-num-seqs 64 \
         --gpu-memory-utilization 0.8 \
         --api-key "7355608"
 
@@ -35,7 +35,7 @@ CUDA_VISIBLE_DEVICES=6 \
     VLLM_PD_ENABLE_DYNAMIC_KSTAR=1 \
     vllm serve Qwen/Qwen3-8B \
         --port 8001 \
-        --max-num-seqs 32 \
+        --max-num-seqs 64 \
         --gpu-memory-utilization 0.8 \
         --api-key "7355608"
 
@@ -45,7 +45,6 @@ CUDA_VISIBLE_DEVICES=7 \
     VLLM_PD_ENABLE_DYNAMIC_KSTAR=0 \
     vllm serve Qwen/Qwen3-8B \
         --port 8003 \
-        --max-num-seqs 32 \
         --gpu-memory-utilization 0.8 \
         --api-key "7355608"
 ```
@@ -114,8 +113,7 @@ genai-bench excel \
 
 genai-bench plot \
   --experiments-folder ./experiment_results/genai \
-  --group-key none \
-  --preset multi_line_latency \
+  --group-key "" \
   --metrics-time-unit ms \
   --filter-criteria '{"model": "Qwen/Qwen3-8B"}'
 ```

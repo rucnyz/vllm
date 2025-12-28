@@ -974,17 +974,6 @@ class Scheduler(SchedulerInterface):
         has_waiting = len(self.waiting) > 0 or len(self.chunk_prefilling) > 0
         waiting_count = len(self.waiting) + len(self.chunk_prefilling)
 
-        # Log current state at the start of each schedule call
-        phase_names = {0: "INITIAL_PREFILL", 1: "DECODE", 2: "REFILL_PREFILL"}
-        logger.info(
-            f"[P/D] schedule_pd() called | phase={phase_names[self.pd_phase]}, "
-            f"waiting={waiting_count}, running={len(self.running)}, "
-            f"decoding={len(self.pd_decoding_requests)}, "
-            f"prefilled={self.pd_prefilled_count}, "
-            f"completed_decode={self.pd_completed_decode_count}, "
-            f"k*={self.pd_switch_threshold_k}, N={self.pd_batch_size_N}"
-        )
-
         # Store previous phase for logging
         prev_phase = self.pd_phase
 
