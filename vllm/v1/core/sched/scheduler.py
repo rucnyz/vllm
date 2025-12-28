@@ -961,9 +961,29 @@ class Scheduler(SchedulerInterface):
             return req.num_computed_tokens < req.num_prompt_tokens
 
         # ===== PHASE TRANSITION LOGIC =====
+        # Defensive cleanup: remove orphaned IDs from pd_decoding_requests
+        running_ids = {req.request_id for req in self.running}
+        orphaned_ids = self.pd_decoding_requests - running_ids
+        if orphaned_ids:
+            logger.warning(
+                f"[P/D] Cleaning up {len(orphaned_ids)} orphaned decoding IDs"
+            )
+            self.pd_decoding_requests -= orphaned_ids
+
         has_decoding_work = len(self.pd_decoding_requests) > 0
         has_waiting = len(self.waiting) > 0 or len(self.chunk_prefilling) > 0
         waiting_count = len(self.waiting) + len(self.chunk_prefilling)
+
+        # Log current state at the start of each schedule call
+        phase_names = {0: "INITIAL_PREFILL", 1: "DECODE", 2: "REFILL_PREFILL"}
+        logger.info(
+            f"[P/D] schedule_pd() called | phase={phase_names[self.pd_phase]}, "
+            f"waiting={waiting_count}, running={len(self.running)}, "
+            f"decoding={len(self.pd_decoding_requests)}, "
+            f"prefilled={self.pd_prefilled_count}, "
+            f"completed_decode={self.pd_completed_decode_count}, "
+            f"k*={self.pd_switch_threshold_k}, N={self.pd_batch_size_N}"
+        )
 
         # Store previous phase for logging
         prev_phase = self.pd_phase
@@ -998,16 +1018,29 @@ class Scheduler(SchedulerInterface):
 
         # Reset to initial state when idle: no decode work, no running, but has waiting
         if (not has_decoding_work and has_waiting and len(self.running) == 0):
+            logger.info(
+                f"[P/D] RESET triggered: phase {self.pd_phase} -> 0 | "
+                f"waiting={waiting_count}, running={len(self.running)}, "
+                f"decoding={len(self.pd_decoding_requests)}"
+            )
             self.pd_phase = 0
             self.pd_prefilled_count = 0
             self.pd_completed_decode_count = 0
+        elif has_waiting and not has_decoding_work:
+            # Debug: why reset is not triggering
+            logger.warning(
+                f"[P/D] STUCK? phase={self.pd_phase}, waiting={waiting_count}, "
+                f"running={len(self.running)}, decoding={len(self.pd_decoding_requests)}, "
+                f"prefilled_count={self.pd_prefilled_count}, "
+                f"completed_decode={self.pd_completed_decode_count}"
+            )
 
         # Log phase transitions for debugging
         if prev_phase != self.pd_phase:
-            phase_names = {0: "INITIAL_PREFILL", 1: "DECODE", 2: "REFILL_PREFILL"}
-            logger.debug(
-                f"[P/D] Phase transition: {phase_names[prev_phase]} -> "
-                f"{phase_names[self.pd_phase]} | "
+            phase_names_map = {0: "INITIAL_PREFILL", 1: "DECODE", 2: "REFILL_PREFILL"}
+            logger.info(
+                f"[P/D] >>> PHASE TRANSITION: {phase_names_map[prev_phase]} -> "
+                f"{phase_names_map[self.pd_phase]} | "
                 f"prefilled={self.pd_prefilled_count}, "
                 f"completed_decode={self.pd_completed_decode_count}, "
                 f"k*={self.pd_switch_threshold_k}, "
@@ -1022,6 +1055,10 @@ class Scheduler(SchedulerInterface):
             target = (self.pd_batch_size_N if self.pd_phase == 0
                       else self.pd_switch_threshold_k)
             remaining = target - self.pd_prefilled_count
+            logger.info(
+                f"[P/D] PREFILL phase: target={target}, remaining={remaining}, "
+                f"token_budget={token_budget}, waiting={waiting_count}"
+            )
 
             # Continue chunked prefills first
             if self.scheduler_config.enable_chunked_prefill:
@@ -1158,6 +1195,11 @@ class Scheduler(SchedulerInterface):
 
         # ===== DECODE SCHEDULING (Phase 1 only) =====
         elif self.pd_phase == 1:
+            # logger.info(
+            #     f"[P/D] DECODE phase: running={len(self.running)}, "
+            #     f"decoding_set={len(self.pd_decoding_requests)}, "
+            #     f"token_budget={token_budget}"
+            # )
             req_index = 0
             while req_index < len(self.running) and token_budget > 0:
                 request = self.running[req_index]
@@ -1263,6 +1305,15 @@ class Scheduler(SchedulerInterface):
             num_common_prefix_blocks=num_common_prefix_blocks,
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes())
+
+        # Log scheduling result summary
+        # logger.info(
+        #     f"[P/D] schedule_pd() result | "
+        #     f"new_reqs={len(scheduled_new_reqs)}, "
+        #     f"running_reqs={len(scheduled_running_reqs)}, "
+        #     f"total_tokens={total_num_scheduled_tokens}, "
+        #     f"finished={len(self.finished_req_ids)}"
+        # )
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -2445,6 +2496,12 @@ class Scheduler(SchedulerInterface):
         # Remove all requests from queues at once for better efficiency
         if running_requests_to_remove:
             self.running = remove_all(self.running, running_requests_to_remove)
+            # P/D scheduling: also remove from decoding set
+            for req in running_requests_to_remove:
+                self.pd_decoding_requests.discard(req.request_id)
+                logger.info(
+                    f"[P/D] Request aborted/finished externally: {req.request_id[:8]}..."
+                )
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
 
