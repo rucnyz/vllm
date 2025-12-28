@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -208,11 +209,36 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
+        # Scheduler mode selection via environment variable
+        # VLLM_USE_PD_SCHEDULER=1 (default): Use P/D competition scheduler
+        # VLLM_USE_PD_SCHEDULER=0: Use original vLLM scheduler
+        self.use_pd_scheduler = os.environ.get(
+            "VLLM_USE_PD_SCHEDULER", "1") == "1"
+
         # P/D competition scheduling state
         # N: batch size - number of requests to prefill before starting decode
         self.pd_batch_size_N = self.max_num_running_reqs
-        # k: switching threshold - after k decodes complete, prefill k new
-        self.pd_switch_threshold_k = max(1, self.pd_batch_size_N // 5)
+        # k*: optimal switching threshold computed from Proposition 1
+        # Parameters can be set via environment variables for profiling integration
+        self.pd_alpha_p = float(os.environ.get("VLLM_PD_ALPHA_P", "0.01"))
+        self.pd_alpha_d = float(os.environ.get("VLLM_PD_ALPHA_D", "0.001"))
+        self.pd_beta_d = float(os.environ.get("VLLM_PD_BETA_D", "0.0001"))
+        self.pd_p = float(os.environ.get("VLLM_PD_P", "0.01"))
+        # Allow direct k* override (0 means compute from Proposition 1)
+        self.pd_switch_threshold_k = int(os.environ.get("VLLM_PD_K_STAR", "0"))
+        if self.pd_switch_threshold_k <= 0:
+            self.pd_switch_threshold_k = self._compute_optimal_k()
+
+        # Log scheduler mode
+        if self.use_pd_scheduler:
+            logger.info(
+                f"[P/D Competition Scheduler] Initialized with: "
+                f"N={self.pd_batch_size_N}, k*={self.pd_switch_threshold_k}, "
+                f"α_p={self.pd_alpha_p}, α_d={self.pd_alpha_d}, "
+                f"β_d={self.pd_beta_d}, p={self.pd_p}"
+            )
+        else:
+            logger.info("[Scheduler] Using original vLLM scheduler")
 
         # Phase tracking:
         # Phase 0: Initial prefill - prefill N requests
@@ -228,7 +254,304 @@ class Scheduler(SchedulerInterface):
         # Track which requests are in decode phase
         self.pd_decoding_requests: set[str] = set()
 
+        # Online p estimation with EMA (batch-based update)
+        # Collect output lengths in a batch, then update p and k* together
+        self.pd_ema_alpha = float(os.environ.get("VLLM_PD_EMA_ALPHA", "0.2"))
+        self.pd_online_update_interval = int(
+            os.environ.get("VLLM_PD_UPDATE_INTERVAL", "32"))
+        self.pd_total_completed = 0  # Total completed requests
+        self.pd_batch_output_lengths: list[int] = []  # Collect output lengths
+        # Enable/disable dynamic k* updates (disable for fixed-k throughput tests)
+        self.pd_enable_dynamic_kstar = (
+            os.environ.get("VLLM_PD_ENABLE_DYNAMIC_KSTAR", "0") == "1")
+
         self.chunk_prefilling: list[Request] = []
+
+        # Timeline recording for P/D scheduling visualization
+        # Records real timestamps for each request's prefill/decode phases
+        self.pd_timeline_enabled = False
+        self.pd_timeline_data: dict[str, dict] = {}
+        # Format: {req_id: {
+        #   'prefill_start': float,
+        #   'prefill_end': float,
+        #   'decode_start': float,
+        #   'decode_end': float,
+        #   'input_tokens': int,
+        #   'output_tokens': int
+        # }}
+        self.pd_timeline_start_time: float = 0.0
+        self.pd_phase_transitions: list[tuple[float, int]] = []  # (time, phase)
+
+    def _compute_tau(self, j: int) -> float:
+        """
+        Compute expected time per completion with batch size j.
+        τ(j) = (α_d + β_d * j) / (1 - (1-p)^j)
+
+        From Equation (2) in the paper.
+        """
+        if j <= 0:
+            return float('inf')
+        numerator = self.pd_alpha_d + self.pd_beta_d * j
+        denominator = 1.0 - (1.0 - self.pd_p) ** j
+        if denominator <= 0:
+            return float('inf')
+        return numerator / denominator
+
+    def _compute_optimal_k(self) -> int:
+        """
+        Compute optimal switching threshold k* using Proposition 1.
+
+        k* is the smallest integer k satisfying:
+            k * τ(N-k) - Σ_{j=N-k+1}^{N} τ(j) >= α_p
+
+        This maximizes throughput = k / (E[T_d(k)] + E[T_p(k)])
+        """
+        N = self.pd_batch_size_N
+
+        # Search for smallest k satisfying the condition
+        for k in range(1, N + 1):
+            # Left side: k * τ(N-k)
+            lhs = k * self._compute_tau(N - k)
+
+            # Right side: Σ_{j=N-k+1}^{N} τ(j) + α_p
+            sum_tau = sum(self._compute_tau(j) for j in range(N - k + 1, N + 1))
+            rhs = sum_tau + self.pd_alpha_p
+
+            if lhs >= rhs:
+                return max(1, k)
+
+        # If no k satisfies the condition, use N/5 as fallback
+        return max(1, N // 5)
+
+    def set_pd_params(self, alpha_p: float = None, alpha_d: float = None,
+                      beta_d: float = None, p: float = None,
+                      k_star: int = None) -> None:
+        """
+        Dynamically update P/D competition scheduling parameters.
+
+        Args:
+            alpha_p: Fixed prefill overhead (seconds)
+            alpha_d: Fixed decode overhead per step (seconds)
+            beta_d: Per-request decode cost (seconds)
+            p: Per-step termination probability (1/avg_output_len)
+            k_star: Override k* directly (None = recompute from Proposition 1)
+        """
+        if alpha_p is not None:
+            self.pd_alpha_p = alpha_p
+        if alpha_d is not None:
+            self.pd_alpha_d = alpha_d
+        if beta_d is not None:
+            self.pd_beta_d = beta_d
+        if p is not None:
+            self.pd_p = p
+
+        # Recompute or set k*
+        if k_star is not None and k_star > 0:
+            self.pd_switch_threshold_k = k_star
+        else:
+            self.pd_switch_threshold_k = self._compute_optimal_k()
+
+        logger.info(
+            f"[P/D] Updated params: k*={self.pd_switch_threshold_k}, "
+            f"α_p={self.pd_alpha_p}, α_d={self.pd_alpha_d}, "
+            f"β_d={self.pd_beta_d}, p={self.pd_p}"
+        )
+
+    def get_pd_stats(self) -> dict:
+        """Get current P/D scheduling statistics for monitoring."""
+        return {
+            "phase": self.pd_phase,
+            "k_star": self.pd_switch_threshold_k,
+            "N": self.pd_batch_size_N,
+            "prefilled_count": self.pd_prefilled_count,
+            "completed_decode_count": self.pd_completed_decode_count,
+            "decoding_requests": len(self.pd_decoding_requests),
+            "waiting_requests": len(self.waiting),
+            "p": self.pd_p,
+            "total_completed": self.pd_total_completed,
+        }
+
+    def _update_p_online(self, output_tokens: int) -> None:
+        """
+        Collect output tokens and update p/k* in batches.
+
+        Instead of updating p on every request completion, we collect
+        output lengths and update p (with EMA) and k* together when
+        we have collected enough samples (pd_online_update_interval).
+
+        This batch-based approach provides more stable p estimates.
+
+        Note: Dynamic k* updates only happen if VLLM_PD_ENABLE_DYNAMIC_KSTAR=1.
+        For fixed-k throughput tests, set this to 0.
+        The environment variable is checked dynamically on each call to allow
+        toggling between dynamic and fixed k tests without restarting LLM.
+        """
+        # CRITICAL: Check environment variable dynamically (not cached value)
+        # This allows experiments to toggle dynamic updates between tests
+        if os.environ.get("VLLM_PD_ENABLE_DYNAMIC_KSTAR", "0") != "1":
+            return
+
+        # Collect output length
+        self.pd_batch_output_lengths.append(output_tokens)
+        self.pd_total_completed += 1
+
+        # Update p and k* when we have enough samples
+        if len(self.pd_batch_output_lengths) >= self.pd_online_update_interval:
+            # Compute batch mean output length
+            batch_mean_len = (sum(self.pd_batch_output_lengths) /
+                              len(self.pd_batch_output_lengths))
+            batch_p = 1.0 / batch_mean_len
+
+            # Update p with EMA using batch estimate
+            self.pd_p = (self.pd_ema_alpha * batch_p +
+                         (1 - self.pd_ema_alpha) * self.pd_p)
+
+            # Recompute k* with updated p
+            old_k = self.pd_switch_threshold_k
+            self.pd_switch_threshold_k = self._compute_optimal_k()
+
+            if old_k != self.pd_switch_threshold_k:
+                logger.info(
+                    f"[P/D] Online update: k* {old_k} -> "
+                    f"{self.pd_switch_threshold_k} "
+                    f"(p={self.pd_p:.4f}, batch_mean_len={batch_mean_len:.1f}, "
+                    f"completed={self.pd_total_completed})"
+                )
+
+            # Clear batch for next collection
+            self.pd_batch_output_lengths = []
+
+    def reset_pd_state(self, new_k: int | None = None) -> None:
+        """
+        Reset P/D scheduler state for a new test run.
+
+        This should be called between throughput tests to ensure fair comparison.
+        It resets:
+        - Phase state (back to initial prefill)
+        - Completion counters
+        - Online p estimation buffers
+        - Decoding request tracking
+
+        Args:
+            new_k: If provided, sets the new k* value. Otherwise keeps current.
+        """
+        # Reset phase state
+        self.pd_phase = 0
+        self.pd_prefilled_count = 0
+        self.pd_completed_decode_count = 0
+        self.pd_decoding_requests.clear()
+
+        # Reset online p estimation state
+        self.pd_total_completed = 0
+        self.pd_batch_output_lengths = []
+
+        # Reset timeline if enabled
+        if self.pd_timeline_enabled:
+            self.pd_timeline_data = {}
+            self.pd_phase_transitions = []
+            self.pd_timeline_start_time = time.monotonic()
+
+        # Update k* if provided
+        if new_k is not None:
+            old_k = self.pd_switch_threshold_k
+            self.pd_switch_threshold_k = new_k
+            # Also update environment variable for consistency
+            os.environ["VLLM_PD_K_STAR_DYNAMIC"] = str(new_k)
+            logger.info(f"[P/D] State reset: k* {old_k} -> {new_k}")
+        else:
+            logger.info(
+                f"[P/D] State reset: k*={self.pd_switch_threshold_k} (unchanged)"
+            )
+
+    def enable_pd_timeline(self, enable: bool = True) -> None:
+        """Enable or disable P/D timeline recording for visualization."""
+        self.pd_timeline_enabled = enable
+        if enable:
+            # Reset timeline data
+            self.pd_timeline_data = {}
+            self.pd_phase_transitions = []
+            self.pd_timeline_start_time = time.monotonic()
+            logger.info("[P/D Timeline] Recording enabled")
+        else:
+            logger.info("[P/D Timeline] Recording disabled")
+
+    def get_pd_timeline(self) -> dict:
+        """
+        Get recorded P/D timeline data for visualization.
+
+        Returns:
+            dict with:
+                - 'requests': dict of {req_id: {prefill_start, prefill_end,
+                              decode_start, decode_end, input_tokens, output_tokens}}
+                - 'phase_transitions': list of (time_ms, phase) tuples
+                - 'total_time_ms': total elapsed time in milliseconds
+        """
+        current_time = time.monotonic()
+        total_time = (current_time - self.pd_timeline_start_time) * 1000  # ms
+
+        return {
+            'requests': dict(self.pd_timeline_data),
+            'phase_transitions': list(self.pd_phase_transitions),
+            'total_time_ms': total_time,
+            'k_star': self.pd_switch_threshold_k,
+            'N': self.pd_batch_size_N,
+        }
+
+    def clear_pd_timeline(self) -> None:
+        """Clear recorded P/D timeline data."""
+        self.pd_timeline_data = {}
+        self.pd_phase_transitions = []
+        self.pd_timeline_start_time = time.monotonic()
+
+    def _record_prefill_start(self, req_id: str, num_prompt_tokens: int) -> None:
+        """Record prefill start time for a request."""
+        if not self.pd_timeline_enabled:
+            return
+        current_time = (time.monotonic() - self.pd_timeline_start_time) * 1000
+        if req_id not in self.pd_timeline_data:
+            self.pd_timeline_data[req_id] = {
+                'prefill_start': current_time,
+                'prefill_end': None,
+                'decode_start': None,
+                'decode_end': None,
+                'input_tokens': num_prompt_tokens,
+                'output_tokens': 0,
+            }
+        else:
+            self.pd_timeline_data[req_id]['prefill_start'] = current_time
+
+    def _record_prefill_end(self, req_id: str) -> None:
+        """Record prefill end time for a request."""
+        if not self.pd_timeline_enabled:
+            return
+        current_time = (time.monotonic() - self.pd_timeline_start_time) * 1000
+        if req_id in self.pd_timeline_data:
+            self.pd_timeline_data[req_id]['prefill_end'] = current_time
+
+    def _record_decode_start(self, req_id: str) -> None:
+        """Record decode start time for a request."""
+        if not self.pd_timeline_enabled:
+            return
+        current_time = (time.monotonic() - self.pd_timeline_start_time) * 1000
+        if (req_id in self.pd_timeline_data
+                and self.pd_timeline_data[req_id]['decode_start'] is None):
+            self.pd_timeline_data[req_id]['decode_start'] = current_time
+
+    def _record_decode_end(self, req_id: str, output_tokens: int) -> None:
+        """Record decode end time for a request."""
+        if not self.pd_timeline_enabled:
+            return
+        current_time = (time.monotonic() - self.pd_timeline_start_time) * 1000
+        if req_id in self.pd_timeline_data:
+            self.pd_timeline_data[req_id]['decode_end'] = current_time
+            self.pd_timeline_data[req_id]['output_tokens'] = output_tokens
+
+    def _record_phase_transition(self, new_phase: int) -> None:
+        """Record phase transition time."""
+        if not self.pd_timeline_enabled:
+            return
+        current_time = (time.monotonic() - self.pd_timeline_start_time) * 1000
+        self.pd_phase_transitions.append((current_time, new_phase))
 
     def schedule_simplify(self) -> SchedulerOutput:
         scheduled_new_reqs: list[Request] = []
@@ -513,7 +836,100 @@ class Scheduler(SchedulerInterface):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
-    def schedule(self) -> SchedulerOutput:
+    def _check_env_param_updates(self) -> None:
+        """
+        Check for dynamic parameter updates via environment variables.
+
+        This allows external processes to update scheduling parameters.
+        The scheduler checks this on each schedule() call.
+
+        Environment variables:
+        - VLLM_PD_RESET_STATE: Set to "1" to trigger state reset (auto-clears)
+        - VLLM_PD_ALPHA_P_DYNAMIC: Prefill overhead (seconds)
+        - VLLM_PD_ALPHA_D_DYNAMIC: Decode overhead per step (seconds)
+        - VLLM_PD_BETA_D_DYNAMIC: Per-request decode cost (seconds)
+        - VLLM_PD_P_DYNAMIC: Termination probability
+        - VLLM_PD_K_STAR_DYNAMIC: Override k* directly
+        """
+        # Check for state reset request (for fair throughput comparison)
+        if os.environ.get("VLLM_PD_RESET_STATE", "0") == "1":
+            # Get new k value if provided
+            new_k_str = os.environ.get("VLLM_PD_K_STAR_DYNAMIC", "")
+            new_k = int(new_k_str) if new_k_str else None
+            self.reset_pd_state(new_k)
+            # Clear the reset flag
+            os.environ["VLLM_PD_RESET_STATE"] = "0"
+            return  # Skip other updates after reset
+
+        # Check for timing parameter updates (from profiling)
+        # These are typically set once after profiling
+        params_updated = False
+
+        alpha_p_str = os.environ.get("VLLM_PD_ALPHA_P_DYNAMIC", "")
+        if alpha_p_str:
+            try:
+                new_alpha_p = float(alpha_p_str)
+                if new_alpha_p != self.pd_alpha_p:
+                    self.pd_alpha_p = new_alpha_p
+                    params_updated = True
+            except ValueError:
+                pass
+
+        alpha_d_str = os.environ.get("VLLM_PD_ALPHA_D_DYNAMIC", "")
+        if alpha_d_str:
+            try:
+                new_alpha_d = float(alpha_d_str)
+                if new_alpha_d != self.pd_alpha_d:
+                    self.pd_alpha_d = new_alpha_d
+                    params_updated = True
+            except ValueError:
+                pass
+
+        beta_d_str = os.environ.get("VLLM_PD_BETA_D_DYNAMIC", "")
+        if beta_d_str:
+            try:
+                new_beta_d = float(beta_d_str)
+                if new_beta_d != self.pd_beta_d:
+                    self.pd_beta_d = new_beta_d
+                    params_updated = True
+            except ValueError:
+                pass
+
+        # Check for dynamic p update
+        dynamic_p_str = os.environ.get("VLLM_PD_P_DYNAMIC", "")
+        if dynamic_p_str:
+            try:
+                new_p = float(dynamic_p_str)
+                if new_p > 0 and new_p != self.pd_p:
+                    self.pd_p = new_p
+                    params_updated = True
+            except ValueError:
+                pass
+
+        # Check for dynamic k* update
+        dynamic_k_str = os.environ.get("VLLM_PD_K_STAR_DYNAMIC", "")
+        if dynamic_k_str:
+            try:
+                new_k = int(dynamic_k_str)
+                if new_k > 0 and new_k != self.pd_switch_threshold_k:
+                    old_k = self.pd_switch_threshold_k
+                    self.pd_switch_threshold_k = new_k
+                    logger.info(
+                        f"[P/D] Dynamic k* update: {old_k} -> {new_k}"
+                    )
+            except ValueError:
+                pass
+        elif params_updated:
+            # If timing params changed but k* not explicitly set, recompute k*
+            old_k = self.pd_switch_threshold_k
+            self.pd_switch_threshold_k = self._compute_optimal_k()
+            if old_k != self.pd_switch_threshold_k:
+                logger.info(
+                    f"[P/D] Recomputed k* after param update: {old_k} -> "
+                    f"{self.pd_switch_threshold_k}"
+                )
+
+    def schedule_pd(self) -> SchedulerOutput:
         """
         P/D Competition Scheduler with batch-based switching:
 
@@ -525,6 +941,9 @@ class Scheduler(SchedulerInterface):
 
         k is the switching threshold (can be optimized later).
         """
+        # Check for dynamic parameter updates from environment
+        self._check_env_param_updates()
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -545,6 +964,9 @@ class Scheduler(SchedulerInterface):
         has_decoding_work = len(self.pd_decoding_requests) > 0
         has_waiting = len(self.waiting) > 0 or len(self.chunk_prefilling) > 0
         waiting_count = len(self.waiting) + len(self.chunk_prefilling)
+
+        # Store previous phase for logging
+        prev_phase = self.pd_phase
 
         if self.pd_phase == 0:
             # Initial prefill: switch to decode when N prefilled OR no more waiting
@@ -573,6 +995,21 @@ class Scheduler(SchedulerInterface):
                     or (not has_waiting and has_decoding_work)):
                 self.pd_phase = 1
                 self.pd_completed_decode_count = 0
+
+        # Log phase transitions for debugging
+        if prev_phase != self.pd_phase:
+            phase_names = {0: "INITIAL_PREFILL", 1: "DECODE", 2: "REFILL_PREFILL"}
+            logger.debug(
+                f"[P/D] Phase transition: {phase_names[prev_phase]} -> "
+                f"{phase_names[self.pd_phase]} | "
+                f"prefilled={self.pd_prefilled_count}, "
+                f"completed_decode={self.pd_completed_decode_count}, "
+                f"k*={self.pd_switch_threshold_k}, "
+                f"waiting={waiting_count}, "
+                f"decoding={len(self.pd_decoding_requests)}"
+            )
+            # Record phase transition for timeline visualization
+            self._record_phase_transition(self.pd_phase)
 
         # ===== PREFILL SCHEDULING (Phase 0 or Phase 2) =====
         if self.pd_phase in (0, 2):
@@ -618,6 +1055,9 @@ class Scheduler(SchedulerInterface):
                         self.pd_prefilled_count += 1
                         remaining -= 1
                         self.pd_decoding_requests.add(request.request_id)
+                        # Record prefill end and decode start for timeline
+                        self._record_prefill_end(request.request_id)
+                        self._record_decode_start(request.request_id)
                     else:
                         req_index += 1
 
@@ -672,6 +1112,10 @@ class Scheduler(SchedulerInterface):
                 request = self.waiting.pop_request()
                 self.running.append(request)
 
+                # Record prefill start for timeline
+                self._record_prefill_start(
+                    request.request_id, request.num_prompt_tokens)
+
                 if is_chunked:
                     self.chunk_prefilling.append(request)
                 else:
@@ -679,6 +1123,9 @@ class Scheduler(SchedulerInterface):
                     self.pd_prefilled_count += 1
                     remaining -= 1
                     self.pd_decoding_requests.add(request.request_id)
+                    # Record prefill end and decode start for timeline
+                    self._record_prefill_end(request.request_id)
+                    self._record_decode_start(request.request_id)
 
                 if self.log_stats:
                     request.record_event(
@@ -815,7 +1262,14 @@ class Scheduler(SchedulerInterface):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
-    def schedule_origin(self) -> SchedulerOutput:
+    def schedule(self) -> SchedulerOutput:
+        """Entry point for scheduling. Dispatches to P/D or default scheduler."""
+        if self.use_pd_scheduler:
+            return self.schedule_pd()
+        else:
+            return self._schedule_default()
+
+    def _schedule_default(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1739,6 +2193,14 @@ class Scheduler(SchedulerInterface):
                 if request.request_id in self.pd_decoding_requests:
                     self.pd_completed_decode_count += 1
                     self.pd_decoding_requests.discard(request.request_id)
+                    # Record decode end for timeline visualization
+                    output_tokens = (request.num_tokens - request.num_prompt_tokens
+                                     if hasattr(request, 'num_tokens') else 0)
+                    self._record_decode_end(request.request_id, output_tokens)
+
+                    # Online p estimation: update p with EMA
+                    if output_tokens > 0 and self.use_pd_scheduler:
+                        self._update_p_online(output_tokens)
 
                 kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
