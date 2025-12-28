@@ -996,6 +996,12 @@ class Scheduler(SchedulerInterface):
                 self.pd_phase = 1
                 self.pd_completed_decode_count = 0
 
+        # Reset to initial state when idle: no decode work, no running, but has waiting
+        if (not has_decoding_work and has_waiting and len(self.running) == 0):
+            self.pd_phase = 0
+            self.pd_prefilled_count = 0
+            self.pd_completed_decode_count = 0
+
         # Log phase transitions for debugging
         if prev_phase != self.pd_phase:
             phase_names = {0: "INITIAL_PREFILL", 1: "DECODE", 2: "REFILL_PREFILL"}
