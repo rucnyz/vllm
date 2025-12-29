@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -208,7 +209,622 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
+        # Scheduler mode selection via environment variable
+        # VLLM_USE_PD_SCHEDULER=1 (default): Use P/D competition scheduler
+        # VLLM_USE_PD_SCHEDULER=0: Use original vLLM scheduler
+        self.use_pd_scheduler = os.environ.get(
+            "VLLM_USE_PD_SCHEDULER", "1") == "1"
+
+        # P/D competition scheduling state
+        # N: batch size - number of requests to prefill before starting decode
+        self.pd_batch_size_N = self.max_num_running_reqs
+        # k*: optimal switching threshold computed from Proposition 1
+        # Hardware timing parameters (offline calibration via environment):
+        #   Prefill: T_p = α_p + β_p * L (L = input tokens)
+        #   Decode:  T_d = α_d + β_d * k (per decode step with batch size k)
+        self.pd_alpha_p = float(os.environ.get("VLLM_PD_ALPHA_P", "0.025"))
+        self.pd_beta_p = float(os.environ.get("VLLM_PD_BETA_P", "0.00013"))
+        self.pd_alpha_d = float(os.environ.get("VLLM_PD_ALPHA_D", "0.029"))
+        self.pd_beta_d = float(os.environ.get("VLLM_PD_BETA_D", "0.00021"))
+        # Workload parameter p: cold-start value assuming mean output length ~100
+        # Will be replaced by actual measurement after first N requests complete
+        self.pd_p = 0.01
+        # Allow direct k* override (0 means compute from Proposition 1)
+        self.pd_switch_threshold_k = int(os.environ.get("VLLM_PD_K_STAR", "0"))
+        if self.pd_switch_threshold_k <= 0:
+            self.pd_switch_threshold_k = self._compute_optimal_k()
+
+        # Log scheduler mode
+        if self.use_pd_scheduler:
+            logger.info(
+                f"[P/D Competition Scheduler] Initialized with: "
+                f"N={self.pd_batch_size_N}, k*={self.pd_switch_threshold_k}, "
+                f"α_p={self.pd_alpha_p}, β_p={self.pd_beta_p}, "
+                f"α_d={self.pd_alpha_d}, β_d={self.pd_beta_d}"
+            )
+        else:
+            logger.info("[Scheduler] Using original vLLM scheduler")
+
+        # Phase tracking:
+        # Phase 0: Initial prefill - prefill N requests
+        # Phase 1: Decode - decode until k requests complete
+        # Phase 2: Refill prefill - prefill k new requests (no decode)
+        # Then back to Phase 1
+        self.pd_phase = 0
+
+        # Counters
+        self.pd_prefilled_count = 0  # Prefills completed in current batch
+        self.pd_completed_decode_count = 0  # Decodes completed since last switch
+
+        # Track which requests are in decode phase
+        self.pd_decoding_requests: set[str] = set()
+
+        # Online p estimation with EMA (batch-based update)
+        # Update interval = batch size N (update once per batch cycle)
+        self.pd_ema_alpha = 0.2  # EMA smoothing factor
+        self.pd_online_update_interval = self.pd_batch_size_N
+        self.pd_total_completed = 0  # Total completed requests (all time)
+        self.pd_p_initialized = False  # First batch: direct assign, not EMA
+        # Batch accumulators (reset after each "p" update)
+        self.pd_batch_completed_count = 0  # Completed in current batch
+        self.pd_batch_total_output_tokens = 0  # Sum of output tokens in batch
+
+        self.chunk_prefilling: list[Request] = []
+
+        # Timeline recording (see end of class for methods)
+        self.pd_timeline_enabled = False
+        self.pd_timeline_data: dict[str, dict] = {}
+        self.pd_timeline_start_time: float = 0.0
+        self.pd_phase_transitions: list[tuple[float, int]] = []
+
+    # Phase name constants for logging
+    PD_PHASE_NAMES = {0: "INITIAL_PREFILL", 1: "DECODE", 2: "REFILL_PREFILL"}
+
+    def get_pd_stats(self) -> dict:
+        """Get current P/D scheduling statistics for monitoring."""
+        return {
+            "phase": self.pd_phase,
+            "k_star": self.pd_switch_threshold_k,
+            "N": self.pd_batch_size_N,
+            "prefilled_count": self.pd_prefilled_count,
+            "completed_decode_count": self.pd_completed_decode_count,
+            "decoding_requests": len(self.pd_decoding_requests),
+            "running_requests": len(self.running),
+            "waiting_requests": len(self.waiting),
+            "p": self.pd_p,
+            "total_completed": self.pd_total_completed,
+        }
+
+    def _compute_optimal_k(self) -> int:
+        """
+        Compute optimal switching threshold k* using Proposition 1.
+
+        k* is the smallest integer k satisfying:
+            k * τ(N-k) - Σ_{j=N-k+1}^{N} τ(j) >= α_p
+
+        This maximizes throughput = k / (E[T_d(k)] + E[T_p(k)])
+
+        Optimized: O(N) instead of O(N²) via τ precomputation + incremental sum.
+        """
+        N = self.pd_batch_size_N
+
+        # Precompute all τ values: τ[0], τ[1], ..., τ[N]
+        # τ(j) = (α_d + β_d * j) / (1 - (1-p)^j), τ[0] = inf
+        one_minus_p = 1.0 - self.pd_p
+        tau = []
+        power = 1.0  # (1-p)^j, updated incrementally
+        for j in range(N + 1):
+            if j == 0:
+                tau.append(float('inf'))
+            else:
+                power *= one_minus_p  # power = (1-p)^j
+                denom = 1.0 - power
+                if denom <= 0:
+                    tau.append(float('inf'))
+                else:
+                    tau.append((self.pd_alpha_d + self.pd_beta_d * j) / denom)
+
+        # Search with incremental sum: sum_tau accumulates τ[N-k+1] to τ[N]
+        sum_tau = 0.0
+        for k in range(1, N + 1):
+            # Incrementally add τ[N-k+1] to sum
+            sum_tau += tau[N - k + 1]
+
+            # LHS: k * τ[N-k]
+            lhs = k * tau[N - k]
+
+            # RHS: Σ τ[j] + α_p
+            rhs = sum_tau + self.pd_alpha_p
+
+            if lhs >= rhs:
+                return max(1, k)
+
+        # If no k satisfies the condition, use N/5 as fallback
+        return max(1, N // 5)
+
+    def _update_p_online(self, output_tokens: int) -> None:
+        """
+        Collect output tokens and update p/k* in batches (zero-overhead design).
+
+        Hot path (every request): Only two integer additions.
+        Cold path (every N requests): Environment check, p update, k* recompute.
+
+        Update modes (checked in cold path):
+        - VLLM_PD_K_STAR set: Use fixed k* from env (ignore p estimation)
+        - VLLM_PD_ENABLE_DYNAMIC_KSTAR=1: Auto-estimate p from output lengths
+        - Neither: No updates (use initial values)
+        """
+        # HOT PATH: Only integer operations (zero overhead)
+        self.pd_batch_completed_count += 1
+        self.pd_batch_total_output_tokens += output_tokens
+
+        # Check if we've reached the update interval
+        if self.pd_batch_completed_count < self.pd_online_update_interval:
+            return  # Fast exit - no expensive operations
+
+        # COLD PATH: Reached threshold, do the expensive operations
+        self.pd_total_completed += self.pd_batch_completed_count
+
+        # Priority 1: Check for explicit k* override from environment
+        k_str = os.environ.get("VLLM_PD_K_STAR", "")
+        if k_str:
+            try:
+                new_k = int(k_str)
+                if new_k > 0 and new_k != self.pd_switch_threshold_k:
+                    old_k = self.pd_switch_threshold_k
+                    self.pd_switch_threshold_k = new_k
+                    logger.info(f"[P/D] k* from env: {old_k} -> {new_k}")
+            except ValueError:
+                pass
+        else:
+            # No explicit k* set, compute from actual data
+            # First batch: always compute (initialize p and k*)
+            # Subsequent batches: only update if DYNAMIC_KSTAR=1
+            dynamic_mode = os.environ.get(
+                "VLLM_PD_ENABLE_DYNAMIC_KSTAR", "0") == "1"
+            should_update = not self.pd_p_initialized or dynamic_mode
+
+            if should_update and self.pd_batch_total_output_tokens > 0:
+                # Compute batch mean output length
+                batch_mean_len = (self.pd_batch_total_output_tokens /
+                                  self.pd_batch_completed_count)
+                batch_p = 1.0 / batch_mean_len
+
+                # First batch: direct assignment
+                # Subsequent batches: EMA smoothing (only if dynamic mode)
+                if not self.pd_p_initialized:
+                    self.pd_p = batch_p
+                    self.pd_p_initialized = True
+                else:
+                    self.pd_p = (self.pd_ema_alpha * batch_p +
+                                 (1 - self.pd_ema_alpha) * self.pd_p)
+
+                # Recompute k* with updated p
+                old_k = self.pd_switch_threshold_k
+                self.pd_switch_threshold_k = self._compute_optimal_k()
+
+                if old_k != self.pd_switch_threshold_k:
+                    logger.info(
+                        f"[P/D] k* update: {old_k} -> "
+                        f"{self.pd_switch_threshold_k} "
+                        f"(p={self.pd_p:.4f}, mean_len={batch_mean_len:.1f})"
+                    )
+
+        # Reset batch accumulators
+        self.pd_batch_completed_count = 0
+        self.pd_batch_total_output_tokens = 0
+
+    def _handle_phase_transition(self) -> None:
+        """
+        Handle P/D phase transitions based on current state.
+
+        Updates self.pd_phase based on:
+        - Phase 0 -> 1: When N prefilled or no more waiting
+        - Phase 1 -> 2: When k decoded AND k waiting available
+        - Phase 2 -> 1: When k prefilled or no more waiting
+        - Reset to 0: When idle (no decode work, no running, has waiting)
+        """
+        # Cleanup orphans only if there's a size mismatch (fast check first)
+        num_running = len(self.running)
+        if len(self.pd_decoding_requests) > num_running:
+            running_ids = {req.request_id for req in self.running}
+            orphaned_ids = self.pd_decoding_requests - running_ids
+            if orphaned_ids:
+                logger.warning("[P/D] Cleaning %d orphaned decoding IDs",
+                               len(orphaned_ids))
+                self.pd_decoding_requests -= orphaned_ids
+
+        num_pending_chunks = len(self.chunk_prefilling)
+        if num_pending_chunks > num_running:
+            running_set = set(self.running)
+            orphaned_chunks = [r for r in self.chunk_prefilling
+                               if r not in running_set]
+            if orphaned_chunks:
+                logger.warning("[P/D] Cleaning %d orphaned chunk_prefilling",
+                               len(orphaned_chunks))
+                for req in orphaned_chunks:
+                    self.chunk_prefilling.remove(req)
+                num_pending_chunks = len(self.chunk_prefilling)
+
+        has_decoding = len(self.pd_decoding_requests) > 0
+        waiting_count = len(self.waiting) + num_pending_chunks
+        has_waiting = waiting_count > 0
+        has_pending_chunks = num_pending_chunks > 0
+        prev_phase = self.pd_phase
+
+        if self.pd_phase == 0:
+            # Initial prefill -> decode when N prefilled OR no more waiting
+            # Must wait for all chunked prefills to complete
+            can_transition = not has_pending_chunks
+            if self.pd_prefilled_count >= self.pd_batch_size_N:
+                if can_transition:
+                    self.pd_phase = 1
+                    self.pd_completed_decode_count = 0
+                else:
+                    logger.info(
+                        f"[P/D] Phase 0: waiting for {num_pending_chunks} "
+                        f"chunked prefills to complete before decode"
+                    )
+            elif not has_waiting and has_decoding and can_transition:
+                # Adjust N to actual prefilled count
+                if self.pd_prefilled_count > 0:
+                    self._update_batch_size_n(self.pd_prefilled_count)
+                self.pd_phase = 1
+                self.pd_completed_decode_count = 0
+
+        elif self.pd_phase == 1:
+            # Decode -> prefill when k decoded AND k waiting
+            if (self.pd_completed_decode_count >= self.pd_switch_threshold_k
+                    and waiting_count >= self.pd_switch_threshold_k):
+                self.pd_phase = 2
+                self.pd_prefilled_count = 0
+            # RESET: All decode requests completed, go back to Phase 0
+            elif not has_decoding and has_waiting and len(self.running) == 0:
+                self._reset_pd_to_initial()
+
+        elif self.pd_phase == 2:
+            # Refill prefill -> decode when k prefilled OR no more waiting
+            # Must wait for all chunked prefills to complete
+            ready_to_decode = (
+                self.pd_prefilled_count >= self.pd_switch_threshold_k
+                or (not has_waiting and has_decoding))
+            if ready_to_decode:
+                if not has_pending_chunks:
+                    self.pd_phase = 1
+                    self.pd_completed_decode_count = 0
+                else:
+                    logger.info(
+                        f"[P/D] Phase 2: waiting for {num_pending_chunks} "
+                        f"chunked prefills to complete before decode"
+                    )
+
+        # Log phase transition
+        if prev_phase != self.pd_phase:
+            logger.info(
+                f"[P/D] {self.PD_PHASE_NAMES[prev_phase]} -> "
+                f"{self.PD_PHASE_NAMES[self.pd_phase]} | "
+                f"prefilled={self.pd_prefilled_count}, "
+                f"decoded={self.pd_completed_decode_count}, "
+                f"k*={self.pd_switch_threshold_k}"
+            )
+            self._record_phase_transition(self.pd_phase)
+
+    def _update_batch_size_n(self, new_n: int) -> None:
+        """Update batch size N and recompute k*."""
+        if new_n != self.pd_batch_size_N:
+            old_n, old_k = self.pd_batch_size_N, self.pd_switch_threshold_k
+            self.pd_batch_size_N = new_n
+            self.pd_switch_threshold_k = self._compute_optimal_k()
+            logger.info(
+                f"[P/D] N update: {old_n}->{new_n}, k*={old_k}->{self.pd_switch_threshold_k}"
+            )
+
+    def _reset_pd_to_initial(self) -> None:
+        """Reset P/D scheduler to initial state."""
+        old_n = self.pd_batch_size_N
+        self.pd_batch_size_N = self.max_num_running_reqs
+        self.pd_switch_threshold_k = self._compute_optimal_k()
+        logger.info(
+            f"[P/D] RESET: phase {self.pd_phase}->0 | "
+            f"N={old_n}->{self.pd_batch_size_N}, k*={self.pd_switch_threshold_k}"
+        )
+        self.pd_phase = 0
+        self.pd_prefilled_count = 0
+        self.pd_completed_decode_count = 0
+
+    def schedule_pd(self) -> SchedulerOutput:
+        """
+        P/D Competition Scheduler with batch-based switching:
+
+        Phase 0 (Initial Prefill): Prefill N requests
+        Phase 1 (Decode): Decode all requests until k complete
+        Phase 2 (Refill Prefill): Prefill k new requests (no decode)
+        Then back to Phase 1: Decode (N-k old + k new) until k complete
+        ...repeat...
+
+        k is the switching threshold (can be optimized later).
+        """
+        scheduled_new_reqs: list[Request] = []
+        scheduled_resumed_reqs: list[Request] = []
+        scheduled_running_reqs: list[Request] = []
+        preempted_reqs: list[Request] = []
+        effective_lookahead_tokens = 0
+        req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+        num_scheduled_tokens: dict[str, int] = {}
+        token_budget = self.max_num_scheduled_tokens
+        scheduled_encoder_inputs: dict[str, list[int]] = {}
+        scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        scheduled_timestamp = time.monotonic()
+
+        # Helper to check if request is in prefill phase
+        def is_prefill(req: Request) -> bool:
+            return req.num_computed_tokens < req.num_prompt_tokens
+
+        # Handle phase transitions
+        self._handle_phase_transition()
+
+        # ===== PREFILL SCHEDULING (Phase 0 or Phase 2) =====
+        if self.pd_phase in (0, 2):
+            target = (self.pd_batch_size_N if self.pd_phase == 0
+                      else self.pd_switch_threshold_k)
+            remaining = target - self.pd_prefilled_count
+
+            # Continue chunked prefills first
+            if self.scheduler_config.enable_chunked_prefill:
+                req_index = 0
+                while (req_index < len(self.chunk_prefilling)
+                       and token_budget > 0 and remaining > 0):
+                    request = self.chunk_prefilling[req_index]
+
+                    if not is_prefill(request):
+                        req_index += 1
+                        continue
+                    if request.request_id in num_scheduled_tokens:
+                        req_index += 1
+                        continue
+
+                    num_new_tokens = request.num_tokens - request.num_computed_tokens
+                    threshold = self.scheduler_config.long_prefill_token_threshold
+                    if 0 < threshold < num_new_tokens:
+                        num_new_tokens = threshold
+                    num_new_tokens = min(num_new_tokens, token_budget)
+                    if num_new_tokens <= 0:
+                        req_index += 1
+                        continue
+
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request, num_new_tokens,
+                        num_lookahead_tokens=effective_lookahead_tokens)
+                    if new_blocks is None:
+                        req_index += 1
+                        continue
+
+                    # Check if prefill completes
+                    will_complete = (request.num_tokens - request.num_computed_tokens
+                                     <= num_new_tokens)
+                    if will_complete:
+                        self.chunk_prefilling.remove(request)
+                        self.pd_prefilled_count += 1
+                        remaining -= 1
+                        self.pd_decoding_requests.add(request.request_id)
+                        # Record prefill end and decode start for timeline
+                        self._record_prefill_end(request.request_id)
+                        self._record_decode_start(request.request_id)
+                    else:
+                        req_index += 1
+
+                    scheduled_running_reqs.append(request)
+                    req_to_new_blocks[request.request_id] = new_blocks
+                    num_scheduled_tokens[request.request_id] = num_new_tokens
+                    token_budget -= num_new_tokens
+
+            # Schedule new prefills from waiting queue
+            skipped = create_request_queue(self.policy)
+            while self.waiting and token_budget > 0 and remaining > 0:
+                if len(self.running) >= self.max_num_running_reqs:
+                    break
+
+                request = self.waiting.peek_request()
+
+                num_external_computed_tokens = 0
+                if request.num_computed_tokens == 0:
+                    new_computed_blocks, num_local = (
+                        self.kv_cache_manager.get_computed_blocks(request))
+                    num_computed_tokens = num_local + num_external_computed_tokens
+                else:
+                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    num_local = 0
+                    num_computed_tokens = request.num_computed_tokens
+
+                num_new_tokens = request.num_tokens - num_computed_tokens
+                threshold = self.scheduler_config.long_prefill_token_threshold
+                if 0 < threshold < num_new_tokens:
+                    num_new_tokens = threshold
+
+                is_chunked = False
+                if (not self.scheduler_config.enable_chunked_prefill
+                        and num_new_tokens > token_budget):
+                    self.waiting.pop_request()
+                    skipped.prepend_request(request)
+                    continue
+                elif num_new_tokens > token_budget:
+                    is_chunked = True
+
+                num_new_tokens = min(num_new_tokens, token_budget)
+                if num_new_tokens <= 0:
+                    break
+
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    request, num_new_tokens + num_external_computed_tokens,
+                    num_local, new_computed_blocks,
+                    num_lookahead_tokens=effective_lookahead_tokens)
+                if new_blocks is None:
+                    break
+
+                request = self.waiting.pop_request()
+                self.running.append(request)
+
+                # Record prefill start for timeline
+                self._record_prefill_start(
+                    request.request_id, request.num_prompt_tokens)
+
+                if is_chunked:
+                    self.chunk_prefilling.append(request)
+                else:
+                    # Prefill completes in one step
+                    self.pd_prefilled_count += 1
+                    remaining -= 1
+                    self.pd_decoding_requests.add(request.request_id)
+                    # Record prefill end and decode start for timeline
+                    self._record_prefill_end(request.request_id)
+                    self._record_decode_start(request.request_id)
+
+                if self.log_stats:
+                    request.record_event(
+                        EngineCoreEventType.SCHEDULED, scheduled_timestamp)
+
+                if request.status == RequestStatus.WAITING:
+                    scheduled_new_reqs.append(request)
+                elif request.status == RequestStatus.PREEMPTED:
+                    scheduled_resumed_reqs.append(request)
+                else:
+                    raise RuntimeError(f"Invalid request status: {request.status}")
+
+                req_to_new_blocks[request.request_id] = (
+                    self.kv_cache_manager.get_blocks(request.request_id))
+                num_scheduled_tokens[request.request_id] = num_new_tokens
+                token_budget -= num_new_tokens
+                request.status = RequestStatus.RUNNING
+                request.num_computed_tokens = num_computed_tokens
+                if request.num_cached_tokens < 0:
+                    request.num_cached_tokens = num_computed_tokens
+
+            if skipped:
+                self.waiting.prepend_requests(skipped)
+
+        # ===== DECODE SCHEDULING (Phase 1 only) =====
+        elif self.pd_phase == 1:
+            req_index = 0
+            while req_index < len(self.running) and token_budget > 0:
+                request = self.running[req_index]
+
+                if request.request_id in num_scheduled_tokens:
+                    req_index += 1
+                    continue
+                if is_prefill(request):
+                    req_index += 1
+                    continue
+                # Only decode requests in pd_decoding_requests
+                if request.request_id not in self.pd_decoding_requests:
+                    req_index += 1
+                    continue
+
+                num_new_tokens = (request.num_tokens_with_spec
+                                  + request.num_output_placeholders
+                                  - request.num_computed_tokens)
+                threshold = self.scheduler_config.long_prefill_token_threshold
+                if 0 < threshold < num_new_tokens:
+                    num_new_tokens = threshold
+                num_new_tokens = min(num_new_tokens, token_budget)
+
+                max_total = min(request.num_prompt_tokens + request.max_tokens,
+                                self.max_model_len)
+                num_new_tokens = min(num_new_tokens,
+                                     max_total - 1 - request.num_computed_tokens)
+                if num_new_tokens == 0:
+                    req_index += 1
+                    continue
+
+                new_blocks = self.kv_cache_manager.allocate_slots(
+                    request, num_new_tokens,
+                    num_lookahead_tokens=self.num_lookahead_tokens)
+
+                if new_blocks is None:
+                    # Need to preempt
+                    if self.policy == SchedulingPolicy.PRIORITY:
+                        preempted_req = max(
+                            self.running, key=lambda r: (r.priority, r.arrival_time))
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens[
+                                preempted_req.request_id]
+                            req_to_new_blocks.pop(preempted_req.request_id)
+                            num_scheduled_tokens.pop(preempted_req.request_id)
+                            req_index -= 1
+                    else:
+                        preempted_req = self.running.pop()
+
+                    self.kv_cache_manager.free(preempted_req)
+                    self.encoder_cache_manager.free(preempted_req)
+                    preempted_req.status = RequestStatus.PREEMPTED
+                    preempted_req.num_computed_tokens = 0
+                    preempted_req.num_preemptions += 1
+                    # P/D scheduling: clean up tracking state
+                    self.pd_decoding_requests.discard(preempted_req.request_id)
+                    if preempted_req in self.chunk_prefilling:
+                        self.chunk_prefilling.remove(preempted_req)
+
+                    if self.log_stats:
+                        preempted_req.record_event(
+                            EngineCoreEventType.PREEMPTED, scheduled_timestamp)
+                    self.waiting.prepend_request(preempted_req)
+                    preempted_reqs.append(preempted_req)
+                    if preempted_req == request:
+                        break
+                    continue
+
+                scheduled_running_reqs.append(request)
+                req_to_new_blocks[request.request_id] = new_blocks
+                num_scheduled_tokens[request.request_id] = num_new_tokens
+                token_budget -= num_new_tokens
+                req_index += 1
+
+        # Construct scheduler output
+        total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+
+        num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
+        if self.running:
+            any_request = self.running[0]
+            num_common_prefix_blocks = (
+                self.kv_cache_manager.get_num_common_prefix_blocks(
+                    any_request.request_id))
+
+        new_reqs_data = [
+            NewRequestData.from_request(
+                req, req_to_new_blocks[req.request_id].get_block_ids())
+            for req in scheduled_new_reqs]
+
+        cached_reqs_data = self._make_cached_request_data(
+            scheduled_running_reqs, scheduled_resumed_reqs,
+            num_scheduled_tokens, scheduled_spec_decode_tokens, req_to_new_blocks)
+
+        self.prev_step_scheduled_req_ids.clear()
+        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+
+        scheduler_output = SchedulerOutput(
+            scheduled_new_reqs=new_reqs_data,
+            scheduled_cached_reqs=cached_reqs_data,
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
+            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_encoder_inputs=scheduled_encoder_inputs,
+            num_common_prefix_blocks=num_common_prefix_blocks,
+            finished_req_ids=self.finished_req_ids,
+            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes())
+
+        with record_function_or_nullcontext("schedule: update_after_schedule"):
+            self._update_after_schedule(scheduler_output)
+        return scheduler_output
+
     def schedule(self) -> SchedulerOutput:
+        """Entry point for scheduling. Dispatches to P/D or default scheduler."""
+        if self.use_pd_scheduler:
+            return self.schedule_pd()
+        else:
+            return self._schedule_default()
+
+    def _schedule_default(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -772,6 +1388,11 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
+        # P/D scheduling: clean up tracking state
+        self.pd_decoding_requests.discard(request.request_id)
+        if request in self.chunk_prefilling:
+            self.chunk_prefilling.remove(request)
+
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
 
@@ -1128,6 +1749,16 @@ class Scheduler(SchedulerInterface):
                 stopped = check_stop(request, self.max_model_len, pooler_output)
 
             if stopped:
+                # P/D scheduling: count completed decode requests
+                if request.request_id in self.pd_decoding_requests:
+                    self.pd_completed_decode_count += 1
+                    self.pd_decoding_requests.discard(request.request_id)
+                    # Record decode end and update p estimation
+                    output_tokens = request.num_tokens - request.num_prompt_tokens
+                    self._record_decode_end(request.request_id, output_tokens)
+                    if output_tokens > 0 and self.use_pd_scheduler:
+                        self._update_p_online(output_tokens)
+
                 kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -1365,6 +1996,11 @@ class Scheduler(SchedulerInterface):
         # Remove all requests from queues at once for better efficiency
         if running_requests_to_remove:
             self.running = remove_all(self.running, running_requests_to_remove)
+            # P/D scheduling: also remove from decoding set and chunk_prefilling
+            for req in running_requests_to_remove:
+                self.pd_decoding_requests.discard(req.request_id)
+                if req in self.chunk_prefilling:
+                    self.chunk_prefilling.remove(req)
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
 
@@ -1803,3 +2439,72 @@ class Scheduler(SchedulerInterface):
         self.failed_recving_kv_req_ids |= async_failed_req_ids
         # Return sync affected IDs to skip in update_from_output
         return sync_failed_req_ids
+
+    # =========================================================================
+    # P/D Timeline Recording (for visualization/debugging)
+    # =========================================================================
+
+    def enable_pd_timeline(self, enable: bool = True) -> None:
+        """Enable or disable P/D timeline recording for visualization."""
+        self.pd_timeline_enabled = enable
+        if enable:
+            self.pd_timeline_data = {}
+            self.pd_phase_transitions = []
+            self.pd_timeline_start_time = time.monotonic()
+            logger.info("[P/D Timeline] Recording enabled")
+        else:
+            logger.info("[P/D Timeline] Recording disabled")
+
+    def get_pd_timeline(self) -> dict:
+        """Get recorded P/D timeline data for visualization."""
+        current_time = time.monotonic()
+        total_time = (current_time - self.pd_timeline_start_time) * 1000
+        return {
+            'requests': dict(self.pd_timeline_data),
+            'phase_transitions': list(self.pd_phase_transitions),
+            'total_time_ms': total_time,
+            'k_star': self.pd_switch_threshold_k,
+            'N': self.pd_batch_size_N,
+        }
+
+    def _record_prefill_start(self, req_id: str, num_prompt_tokens: int) -> None:
+        if not self.pd_timeline_enabled:
+            return
+        current_time = (time.monotonic() - self.pd_timeline_start_time) * 1000
+        if req_id not in self.pd_timeline_data:
+            self.pd_timeline_data[req_id] = {
+                'prefill_start': current_time, 'prefill_end': None,
+                'decode_start': None, 'decode_end': None,
+                'input_tokens': num_prompt_tokens, 'output_tokens': 0,
+            }
+        else:
+            self.pd_timeline_data[req_id]['prefill_start'] = current_time
+
+    def _record_prefill_end(self, req_id: str) -> None:
+        if not self.pd_timeline_enabled:
+            return
+        current_time = (time.monotonic() - self.pd_timeline_start_time) * 1000
+        if req_id in self.pd_timeline_data:
+            self.pd_timeline_data[req_id]['prefill_end'] = current_time
+
+    def _record_decode_start(self, req_id: str) -> None:
+        if not self.pd_timeline_enabled:
+            return
+        current_time = (time.monotonic() - self.pd_timeline_start_time) * 1000
+        if (req_id in self.pd_timeline_data
+                and self.pd_timeline_data[req_id]['decode_start'] is None):
+            self.pd_timeline_data[req_id]['decode_start'] = current_time
+
+    def _record_decode_end(self, req_id: str, output_tokens: int) -> None:
+        if not self.pd_timeline_enabled:
+            return
+        current_time = (time.monotonic() - self.pd_timeline_start_time) * 1000
+        if req_id in self.pd_timeline_data:
+            self.pd_timeline_data[req_id]['decode_end'] = current_time
+            self.pd_timeline_data[req_id]['output_tokens'] = output_tokens
+
+    def _record_phase_transition(self, new_phase: int) -> None:
+        if not self.pd_timeline_enabled:
+            return
+        current_time = (time.monotonic() - self.pd_timeline_start_time) * 1000
+        self.pd_phase_transitions.append((current_time, new_phase))
