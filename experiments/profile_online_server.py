@@ -169,8 +169,11 @@ async def profile_prefill(client: VLLMAPIClient, prompts: list[str],
         print(f"  Real prompt lengths: {min_len}-{max_len} (insufficient diversity)")
         print("  Using synthetic prompts for accurate β_p estimation...")
 
-        # Generate prompts at target lengths: 100, 200, 500, 1000, 2000, 4000
-        target_lengths = [100, 200, 500, 1000, 2000, 4000]
+        # Generate prompts at diverse target lengths for accurate regression
+        # 20 data points from 50 to 10000 tokens
+        target_lengths = [50, 100, 150, 200, 300, 400, 500, 750, 1000,
+                          1250, 1500, 2000, 2500, 3000, 4000, 5000,
+                          6000, 7000, 8000, 10000]
         # Take longest prompt as base for better quality
         prompt_lengths.sort(key=lambda x: x[1], reverse=True)
         base_prompt = prompt_lengths[0][0]
@@ -222,12 +225,12 @@ async def profile_decode(client: VLLMAPIClient, prompts: list[str],
     Note: tokens_per_req=20 is sufficient for timing; no need for more tokens.
     """
     # Cap max batch to avoid overwhelming server
-    effective_max = min(max_batch, 64, len(prompts))
+    effective_max = min(max_batch, 128, len(prompts))
     print(f"\nProfiling decode (max_batch={effective_max}, "
           f"tokens={tokens_per_req}/req)...")
 
-    # Fewer batch sizes for faster profiling (still covers the range well)
-    batch_sizes = [1, 4, 8, 16, 32, 64]
+    # More batch sizes for accurate regression (15 data points)
+    batch_sizes = [1, 2, 4, 6, 8, 12, 16, 24, 32, 40, 48, 56, 64, 80, 96, 128]
     batch_sizes = [b for b in batch_sizes if b <= effective_max]
 
     results = {}
