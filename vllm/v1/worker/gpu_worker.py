@@ -914,6 +914,12 @@ class Worker(WorkerBase):
     def shutdown(self) -> None:
         if runner := getattr(self, "model_runner", None):
             runner.ensure_kv_transfer_shutdown()
+            # Save GPU timing data if profiling was enabled
+            import os
+            if os.environ.get("VLLM_PROFILE_GPU_TIME", "0") == "1":
+                output_file = os.environ.get(
+                    "VLLM_GPU_TIMING_FILE", "gpu_timing.json")
+                runner.save_gpu_timing_data(output_file)
         if self.profiler is not None:
             self.profiler.shutdown()
 

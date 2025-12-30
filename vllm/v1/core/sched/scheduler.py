@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadat
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.utils.profiling import cprofile
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     compute_encoder_budget,
@@ -277,6 +278,12 @@ class Scheduler(SchedulerInterface):
         self.pd_timeline_start_time: float = 0.0
         self.pd_phase_transitions: list[tuple[float, int]] = []
 
+        # Schedule statistics collection for analysis
+        self._schedule_stats_enabled = os.environ.get(
+            "VLLM_COLLECT_SCHEDULE_STATS", "0") == "1"
+        self._schedule_stats: list[dict] = []
+        self._schedule_stats_start_time: float | None = None  # Set on first record
+
     # Phase name constants for logging
     PD_PHASE_NAMES = {0: "INITIAL_PREFILL", 1: "DECODE", 2: "REFILL_PREFILL"}
 
@@ -295,6 +302,7 @@ class Scheduler(SchedulerInterface):
             "total_completed": self.pd_total_completed,
         }
 
+    # @cprofile("compute_optimal_k.prof")
     def _compute_optimal_k(self) -> int:
         """
         Compute optimal switching threshold k* using Proposition 1.
@@ -342,6 +350,7 @@ class Scheduler(SchedulerInterface):
         # If no k satisfies the condition, use N/5 as fallback
         return max(1, N // 5)
 
+    # @cprofile("update_p_online.prof")
     def _update_p_online(self, output_tokens: int) -> None:
         """
         Collect output tokens and update p/k* in batches (zero-overhead design).
@@ -414,6 +423,7 @@ class Scheduler(SchedulerInterface):
         self.pd_batch_completed_count = 0
         self.pd_batch_total_output_tokens = 0
 
+    # @cprofile("handle_phase_transition.prof")
     def _handle_phase_transition(self) -> None:
         """
         Handle P/D phase transitions based on current state.
@@ -819,10 +829,19 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self) -> SchedulerOutput:
         """Entry point for scheduling. Dispatches to P/D or default scheduler."""
+        if self._schedule_stats_enabled:
+            t_start = time.perf_counter()
+
         if self.use_pd_scheduler:
-            return self.schedule_pd()
+            output = self.schedule_pd()
         else:
-            return self._schedule_default()
+            output = self._schedule_default()
+
+        if self._schedule_stats_enabled:
+            t_end = time.perf_counter()
+            self._record_schedule_stats(output, t_end - t_start)
+
+        return output
 
     def _schedule_default(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -2143,6 +2162,12 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
+        # Save schedule stats if collection was enabled
+        if self._schedule_stats_enabled and self._schedule_stats:
+            stats_file = os.environ.get(
+                "VLLM_SCHEDULE_STATS_FILE", "schedule_stats.json")
+            self.save_schedule_stats(stats_file)
+
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
@@ -2508,3 +2533,113 @@ class Scheduler(SchedulerInterface):
             return
         current_time = (time.monotonic() - self.pd_timeline_start_time) * 1000
         self.pd_phase_transitions.append((current_time, new_phase))
+
+    # =========================================================================
+    # Schedule Statistics Collection (for performance analysis)
+    # =========================================================================
+
+    def _record_schedule_stats(
+        self, output: SchedulerOutput, elapsed_time: float
+    ) -> None:
+        """Record statistics for a single schedule() call."""
+        # Initialize start time on first call (after warmup/loading completes)
+        if self._schedule_stats_start_time is None:
+            self._schedule_stats_start_time = time.monotonic()
+
+        timestamp = time.monotonic() - self._schedule_stats_start_time
+
+        # Count prefill vs decode tokens
+        # Note: num_computed_tokens has already been updated by _update_after_schedule,
+        # so we need to subtract num_tokens to get the state BEFORE this scheduling step.
+        prefill_tokens = 0
+        decode_tokens = 0
+        for req_id, num_tokens in output.num_scheduled_tokens.items():
+            req = self.requests.get(req_id)
+            if req:
+                # Get the computed tokens BEFORE this step
+                computed_before = req.num_computed_tokens - num_tokens
+                if computed_before < req.num_prompt_tokens:
+                    # Was in prefill phase at the start of this step
+                    prefill_tokens += num_tokens
+                else:
+                    # Was in decode phase
+                    decode_tokens += num_tokens
+            else:
+                # Request not found (possibly finished), count as decode
+                decode_tokens += num_tokens
+
+        self._schedule_stats.append({
+            "timestamp": timestamp,
+            "elapsed_us": elapsed_time * 1e6,
+            "scheduler_type": "pd" if self.use_pd_scheduler else "default",
+            "phase": self.pd_phase if self.use_pd_scheduler else -1,
+            "total_tokens": output.total_num_scheduled_tokens,
+            "prefill_tokens": prefill_tokens,
+            "decode_tokens": decode_tokens,
+            "num_new_reqs": len(output.scheduled_new_reqs),
+            "num_running_reqs": len(self.running),
+            "num_waiting_reqs": len(self.waiting),
+            "num_scheduled_reqs": len(output.num_scheduled_tokens),
+            "k_star": self.pd_switch_threshold_k if self.use_pd_scheduler else 0,
+            "N": self.pd_batch_size_N if self.use_pd_scheduler else 0,
+        })
+
+    def save_schedule_stats(self, filepath: str = "schedule_stats.json") -> None:
+        """Save collected schedule statistics to a JSON file."""
+        import json
+        with open(filepath, "w") as f:
+            json.dump({
+                "stats": self._schedule_stats,
+                "summary": self.get_schedule_stats_summary(),
+            }, f, indent=2)
+        logger.info(f"[Schedule Stats] Saved {len(self._schedule_stats)} records to {filepath}")
+
+    def get_schedule_stats_summary(self) -> dict:
+        """Get summary statistics from collected data."""
+        if not self._schedule_stats:
+            return {}
+
+        total_tokens = [s["total_tokens"] for s in self._schedule_stats]
+        prefill_tokens = [s["prefill_tokens"] for s in self._schedule_stats]
+        decode_tokens = [s["decode_tokens"] for s in self._schedule_stats]
+        elapsed_us = [s["elapsed_us"] for s in self._schedule_stats]
+        num_scheduled = [s["num_scheduled_reqs"] for s in self._schedule_stats]
+
+        def safe_mean(lst):
+            return sum(lst) / len(lst) if lst else 0
+
+        def safe_percentile(lst, p):
+            if not lst:
+                return 0
+            sorted_lst = sorted(lst)
+            idx = int(len(sorted_lst) * p / 100)
+            return sorted_lst[min(idx, len(sorted_lst) - 1)]
+
+        return {
+            "num_schedule_calls": len(self._schedule_stats),
+            "total_tokens": {
+                "sum": sum(total_tokens),
+                "mean": safe_mean(total_tokens),
+                "p50": safe_percentile(total_tokens, 50),
+                "p99": safe_percentile(total_tokens, 99),
+            },
+            "prefill_tokens": {
+                "sum": sum(prefill_tokens),
+                "mean": safe_mean(prefill_tokens),
+            },
+            "decode_tokens": {
+                "sum": sum(decode_tokens),
+                "mean": safe_mean(decode_tokens),
+            },
+            "schedule_time_us": {
+                "mean": safe_mean(elapsed_us),
+                "p50": safe_percentile(elapsed_us, 50),
+                "p99": safe_percentile(elapsed_us, 99),
+            },
+            "batch_size": {
+                "mean": safe_mean(num_scheduled),
+                "p50": safe_percentile(num_scheduled, 50),
+                "p99": safe_percentile(num_scheduled, 99),
+            },
+            "empty_schedules": sum(1 for t in total_tokens if t == 0),
+        }

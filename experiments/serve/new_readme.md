@@ -21,8 +21,31 @@ export VLLM_PD_BETA_P=6.498792400220424e-06
 export VLLM_PD_ALPHA_D=0.004303444935141221
 export VLLM_PD_BETA_D=0.00023557651251992446
 
+export VLLM_PD_ALPHA_P=0.002528784356021418
+export VLLM_PD_BETA_P=6.498792400220424e-06
+export VLLM_PD_ALPHA_D=0.002303444935141221
+export VLLM_PD_BETA_D=0.00023557651251992446
+
+export VLLM_PD_ALPHA_P=0.002528784356021418
+export VLLM_PD_BETA_P=6.498792400220424e-06
+export VLLM_PD_ALPHA_D=0.001
+export VLLM_PD_BETA_D=0.00023557651251992446
 
 ## Step 1: Start two vLLM serve instances
+
+profile
+```shell
+VLLM_COLLECT_SCHEDULE_STATS=1 VLLM_SCHEDULE_STATS_FILE="results/pd5.json"  CUDA_VISIBLE_DEVICES=0 \
+    VLLM_USE_PD_SCHEDULER=1 \
+    VLLM_PD_ENABLE_DYNAMIC_KSTAR=1 \
+    vllm serve Qwen/Qwen3-8B \
+        --port 8124 \
+        --max-num-seqs 128 \
+        --gpu-memory-utilization 0.9 \
+        --api-key "7355608"
+        
+python analyze_schedule_stats.py results/pd4.json results/baseline.json --plot
+```
 
 ```shell
 # Terminal 1: Fixed k mode (port 8000)
@@ -37,11 +60,11 @@ CUDA_VISIBLE_DEVICES=6 \
         --api-key "7355608"
 
 # Terminal 2: Dynamic k* mode (port 8001)
-CUDA_VISIBLE_DEVICES=6 \
+CUDA_VISIBLE_DEVICES=0 \
     VLLM_USE_PD_SCHEDULER=1 \
     VLLM_PD_ENABLE_DYNAMIC_KSTAR=1 \
     vllm serve Qwen/Qwen3-8B \
-        --port 8001 \
+        --port 8124 \
         --max-num-seqs 128 \
         --gpu-memory-utilization 0.9 \
         --api-key "7355608"
@@ -81,7 +104,7 @@ genai-bench benchmark \
 genai-bench benchmark \
     --api-backend vllm \
     --api-key "7355608" \
-    --api-base http://localhost:8123 \
+    --api-base http://localhost:8124 \
     --api-model-name "Qwen/Qwen3-8B" \
     --model-tokenizer "Qwen/Qwen3-8B" \
     --task text-to-text \

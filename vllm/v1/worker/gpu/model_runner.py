@@ -111,6 +111,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.input_prep_event = None
             self.structured_outputs_event = None
 
+        # GPU timing profiling for P/D scheduler parameter estimation
+        import os
+        self._profile_gpu_time = os.environ.get(
+            "VLLM_PROFILE_GPU_TIME", "0") == "1"
+        if self._profile_gpu_time:
+            self._gpu_timing_start_event = torch.cuda.Event(enable_timing=True)
+            self._gpu_timing_end_event = torch.cuda.Event(enable_timing=True)
+            self._gpu_timing_data: list[dict] = []
+            self._gpu_timing_start_time = time.monotonic()
+            logger.info("[GPU Profiling] Enabled - collecting GPU execution times")
+
         if self.speculative_config is not None:
             self.do_spec_decode = True
             self.num_speculative_steps = self.speculative_config.num_speculative_tokens
@@ -921,6 +932,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_metadata = None
 
         # Run model.
+        # GPU timing: record start event
+        if self._profile_gpu_time:
+            self._gpu_timing_start_event.record()
+
         if cudagraph_mode == CUDAGraphMode.FULL:
             # Run CUDA graph.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -942,6 +957,37 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     input_ids=input_batch.input_ids,
                     positions=input_batch.positions,
                 )
+
+        # GPU timing: record end event and collect data
+        if self._profile_gpu_time:
+            self._gpu_timing_end_event.record()
+            self._gpu_timing_end_event.synchronize()
+            gpu_time_ms = self._gpu_timing_start_event.elapsed_time(
+                self._gpu_timing_end_event)
+
+            # Analyze batch composition
+            num_scheduled = input_batch.num_scheduled_tokens
+            num_reqs = input_batch.num_reqs
+            total_tokens = int(num_scheduled.sum())
+
+            # Count prefill vs decode tokens
+            # Prefill: num_scheduled_tokens > 1, Decode: num_scheduled_tokens == 1
+            prefill_tokens = int(sum(n for n in num_scheduled if n > 1))
+            decode_tokens = int(sum(1 for n in num_scheduled if n == 1))
+            num_prefill_reqs = int(sum(1 for n in num_scheduled if n > 1))
+            num_decode_reqs = num_reqs - num_prefill_reqs
+
+            self._gpu_timing_data.append({
+                "timestamp": time.monotonic() - self._gpu_timing_start_time,
+                "gpu_time_ms": gpu_time_ms,
+                "total_tokens": total_tokens,
+                "num_reqs": num_reqs,
+                "prefill_tokens": prefill_tokens,
+                "decode_tokens": decode_tokens,
+                "num_prefill_reqs": num_prefill_reqs,
+                "num_decode_reqs": num_decode_reqs,
+                "cudagraph_mode": cudagraph_mode.name,
+            })
 
         self.execute_model_state = hidden_states, input_batch, sampling_metadata
         return None
@@ -1004,3 +1050,33 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if self.use_async_scheduling:
             return async_output
         return async_output.get_output()
+
+    def get_gpu_timing_data(self) -> list[dict]:
+        """Return collected GPU timing data."""
+        if not self._profile_gpu_time:
+            return []
+        return self._gpu_timing_data
+
+    def save_gpu_timing_data(self, filepath: str) -> None:
+        """Save GPU timing data to JSON file for analysis."""
+        if not self._profile_gpu_time:
+            logger.warning("[GPU Profiling] Not enabled, no data to save")
+            return
+
+        if not self._gpu_timing_data:
+            logger.warning("[GPU Profiling] No timing data collected")
+            return
+
+        import json
+        with open(filepath, 'w') as f:
+            json.dump({
+                "metadata": {
+                    "model": self.model_config.model,
+                    "max_num_seqs": self.max_num_reqs,
+                    "max_num_tokens": self.max_num_tokens,
+                    "total_samples": len(self._gpu_timing_data),
+                },
+                "timing_data": self._gpu_timing_data,
+            }, f, indent=2)
+        logger.info(f"[GPU Profiling] Saved {len(self._gpu_timing_data)} "
+                    f"timing samples to {filepath}")
