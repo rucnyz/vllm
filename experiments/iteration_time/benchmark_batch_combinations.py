@@ -315,20 +315,21 @@ class BatchBenchmark:
             return None
 
         description = f"{num_decode}D(ctx={decode_context_len})"
-        self._cleanup_all_requests()
-
-        # Prepare decode requests
-        _, success = self._prepare_decode_requests(num_decode, decode_context_len)
-        if not success:
-            print(f"  Warning: Could not prepare {num_decode} decode requests "
-                  f"(max_num_seqs={self.config.max_num_seqs})")
-            return None
-
         times = []
 
         # Warmup + measurement
-        total_iters = self.config.num_warmup + self.config.num_iterations
-        for i in range(total_iters):
+        # Each iteration re-prepares decode requests to keep context length consistent
+        for i in range(self.config.num_warmup + self.config.num_iterations):
+            self._cleanup_all_requests()
+
+            # Prepare decode requests with fixed context length
+            _, success = self._prepare_decode_requests(num_decode, decode_context_len)
+            if not success:
+                print(f"  Warning: Could not prepare {num_decode} decode requests "
+                      f"(max_num_seqs={self.config.max_num_seqs})")
+                return None
+
+            # Run one step and measure
             num_d, num_p, total_tokens, elapsed = self._run_single_step()
 
             if i >= self.config.num_warmup and num_d > 0:
