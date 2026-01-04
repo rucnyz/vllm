@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import atexit
 import itertools
 import os
 import time
@@ -211,10 +212,10 @@ class Scheduler(SchedulerInterface):
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
         # Scheduler mode selection via environment variable
-        # VLLM_USE_PD_SCHEDULER=1 (default): Use P/D competition scheduler
-        # VLLM_USE_PD_SCHEDULER=0: Use original vLLM scheduler
+        # VLLM_USE_PD_SCHEDULER=1: Use P/D competition scheduler
+        # VLLM_USE_PD_SCHEDULER=0 (default): Use original vLLM scheduler
         self.use_pd_scheduler = os.environ.get(
-            "VLLM_USE_PD_SCHEDULER", "1") == "1"
+            "VLLM_USE_PD_SCHEDULER", "0") == "1"
 
         # P/D competition scheduling state
         # N: batch size - number of requests to prefill before starting decode
@@ -283,6 +284,12 @@ class Scheduler(SchedulerInterface):
             "VLLM_COLLECT_SCHEDULE_STATS", "0") == "1"
         self._schedule_stats: list[dict] = []
         self._schedule_stats_start_time: float | None = None  # Set on first record
+        self._schedule_stats_file = os.environ.get(
+            "VLLM_SCHEDULE_STATS_FILE", "schedule_stats.json")
+
+        # Register atexit handler to save stats on shutdown
+        if self._schedule_stats_enabled:
+            atexit.register(self._save_stats_on_exit)
 
     # Phase name constants for logging
     PD_PHASE_NAMES = {0: "INITIAL_PREFILL", 1: "DECODE", 2: "REFILL_PREFILL"}
@@ -2593,6 +2600,11 @@ class Scheduler(SchedulerInterface):
                 "summary": self.get_schedule_stats_summary(),
             }, f, indent=2)
         logger.info(f"[Schedule Stats] Saved {len(self._schedule_stats)} records to {filepath}")
+
+    def _save_stats_on_exit(self) -> None:
+        """Atexit handler to save stats when server shuts down."""
+        if self._schedule_stats:
+            self.save_schedule_stats(self._schedule_stats_file)
 
     def get_schedule_stats_summary(self) -> dict:
         """Get summary statistics from collected data."""
