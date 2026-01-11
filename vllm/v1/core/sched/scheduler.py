@@ -159,7 +159,7 @@ class Scheduler(SchedulerInterface):
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
         # requests so that they can free the cached states for those requests.
-        npm update -g @anthropic-ai/claude-code       # This is flushed at the end of each scheduling step.
+        # This is flushed at the end of each scheduling step.
         self.finished_req_ids: set[str] = set()
 
         # KV Connector: requests in process of async KV loading or recving
@@ -231,16 +231,22 @@ class Scheduler(SchedulerInterface):
         # Workload parameter p: cold-start value assuming mean output length ~100
         # Will be replaced by actual measurement after first N requests complete
         self.pd_p = 0.01
-        # Allow direct k* override (0 means compute from Proposition 1)
+        # k* as a ratio of N (default 0.5, i.e., k* = 0.5 * N)
+        # This makes k* adapt automatically when N changes
+        self.pd_k_ratio = float(os.environ.get("VLLM_PD_K_RATIO", "0.5"))
+        # Allow direct k* override (0 means use ratio-based computation)
         self.pd_switch_threshold_k = int(os.environ.get("VLLM_PD_K_STAR", "0"))
-        if self.pd_switch_threshold_k <= 0:
-            self.pd_switch_threshold_k = self._compute_optimal_k()
+        # Track whether k* is fixed or ratio-based
+        self.pd_k_use_ratio = (self.pd_switch_threshold_k <= 0)
+        if self.pd_k_use_ratio:
+            self.pd_switch_threshold_k = self._compute_k_from_ratio()
 
-        # Log scheduler mode
+        # Log scheduler mode (basic info first, adaptive info after variables are defined)
         if self.use_pd_scheduler:
+            k_mode = f"ratio={self.pd_k_ratio}" if self.pd_k_use_ratio else "optimal"
             logger.info(
                 f"[P/D Competition Scheduler] Initialized with: "
-                f"N={self.pd_batch_size_N}, k*={self.pd_switch_threshold_k}, "
+                f"N={self.pd_batch_size_N}, k*={self.pd_switch_threshold_k} ({k_mode}), "
                 f"α_p={self.pd_alpha_p}, β_p={self.pd_beta_p}, "
                 f"α_d={self.pd_alpha_d}, β_d={self.pd_beta_d}"
             )
@@ -271,6 +277,33 @@ class Scheduler(SchedulerInterface):
         self.pd_batch_completed_count = 0  # Completed in current batch
         self.pd_batch_total_output_tokens = 0  # Sum of output tokens in batch
 
+        # Adaptive KV cache threshold and N learning
+        # Track average output tokens with EMA for adaptive thresholds
+        self.pd_avg_output_tokens = 100.0  # Initial estimate (cold start)
+        self.pd_avg_output_tokens_initialized = False
+        # Batch accumulator for avg_output_tokens (update every N/10 completions)
+        self.pd_avg_output_batch_count = 0
+        self.pd_avg_output_batch_sum = 0
+        # Base reserve ratio (minimum fraction of KV cache to reserve for decode)
+        self.pd_base_kv_reserve = float(os.environ.get(
+            "VLLM_PD_BASE_KV_RESERVE", "0"))
+        # Safety margin multiplier for output token estimation
+        self.pd_output_margin = float(os.environ.get(
+            "VLLM_PD_OUTPUT_MARGIN", "0.5"))
+
+        # N RECOVERY cooldown to prevent frequent updates
+        self.pd_last_n_update_time = 0.0  # timestamp of last N update
+        self.pd_n_update_cooldown = float(os.environ.get(
+            "VLLM_PD_N_UPDATE_COOLDOWN", "2.0"))  # seconds
+
+        # Log adaptive settings (now that all variables are defined)
+        if self.use_pd_scheduler:
+            logger.info(
+                f"[P/D Adaptive] Initial: avg_output={self.pd_avg_output_tokens:.0f}, "
+                f"base_kv_reserve={self.pd_base_kv_reserve:.2f}, "
+                f"output_margin={self.pd_output_margin:.1f}"
+            )
+
         self.chunk_prefilling: list[Request] = []
 
         # Timeline recording (see end of class for methods)
@@ -278,6 +311,10 @@ class Scheduler(SchedulerInterface):
         self.pd_timeline_data: dict[str, dict] = {}
         self.pd_timeline_start_time: float = 0.0
         self.pd_phase_transitions: list[tuple[float, int]] = []
+
+        # N update history: (timestamp, old_N, new_N, reason)
+        self.pd_n_update_history: list[dict] = []
+        self._pd_start_time = time.monotonic()
 
         # Schedule statistics collection for analysis
         self._schedule_stats_enabled = os.environ.get(
@@ -299,6 +336,8 @@ class Scheduler(SchedulerInterface):
         return {
             "phase": self.pd_phase,
             "k_star": self.pd_switch_threshold_k,
+            "k_ratio": self.pd_k_ratio,
+            "k_use_ratio": self.pd_k_use_ratio,
             "N": self.pd_batch_size_N,
             "prefilled_count": self.pd_prefilled_count,
             "completed_decode_count": self.pd_completed_decode_count,
@@ -307,6 +346,9 @@ class Scheduler(SchedulerInterface):
             "waiting_requests": len(self.waiting),
             "p": self.pd_p,
             "total_completed": self.pd_total_completed,
+            "avg_output_tokens": self.pd_avg_output_tokens,
+            "adaptive_kv_threshold": self._compute_adaptive_kv_threshold(),
+            "adaptive_N": self._compute_adaptive_N(),
         }
 
     # @cprofile("compute_optimal_k.prof")
@@ -357,6 +399,164 @@ class Scheduler(SchedulerInterface):
         # If no k satisfies the condition, use N/5 as fallback
         return max(1, N // 5)
 
+    def _compute_k_from_ratio(self) -> int:
+        """
+        Compute k* as a ratio of N.
+
+        k* = pd_k_ratio * N
+
+        This makes k* automatically adapt when N changes (e.g., due to
+        adaptive N learning based on avg output tokens).
+
+        Returns:
+            int: k* value (at least 1)
+        """
+        k = int(self.pd_k_ratio * self.pd_batch_size_N)
+        return max(1, k)
+
+    def _record_n_update(self, old_n: int, new_n: int, reason: str) -> None:
+        """Record an N update event for trajectory tracking."""
+        if old_n == new_n:
+            return
+        timestamp = time.monotonic() - self._pd_start_time
+        self.pd_n_update_history.append({
+            "timestamp": timestamp,
+            "old_N": old_n,
+            "new_N": new_n,
+            "reason": reason,
+            "k_star": self.pd_switch_threshold_k,
+            "avg_output_tokens": self.pd_avg_output_tokens,
+        })
+
+    def _compute_adaptive_kv_threshold(self) -> float:
+        """
+        Compute adaptive KV cache threshold based on average output tokens.
+
+        The idea: Reserve enough KV cache space for decoding phase.
+        - If avg_output_tokens is high, reserve more space (higher threshold)
+        - If avg_output_tokens is low, can use more cache for prefill
+
+        Formula:
+        - expected_decode_blocks = N * avg_output_tokens * margin / block_size
+        - threshold = expected_decode_blocks / total_blocks + base_reserve
+
+        Returns:
+            float: KV cache threshold (fraction of total blocks to reserve)
+        """
+        if not hasattr(self.kv_cache_manager, 'block_pool'):
+            return 0.05  # Default fallback
+
+        total_blocks = self.kv_cache_manager.block_pool.num_gpu_blocks
+        if total_blocks <= 0:
+            return 0.05
+
+        # Expected blocks needed for decode phase
+        # Each request needs avg_output_tokens * margin for safety
+        tokens_per_block = self.block_size
+        expected_output_tokens = self.pd_avg_output_tokens * self.pd_output_margin
+
+        # For N decoding requests, total blocks needed
+        blocks_for_decode = (
+            self.pd_batch_size_N * expected_output_tokens / tokens_per_block
+        )
+
+        # Compute threshold: reserve this fraction of total blocks
+        reserve_ratio = blocks_for_decode / total_blocks
+
+        # Add base reserve and clamp to reasonable bounds [0.05, 0.6]
+        threshold = reserve_ratio + self.pd_base_kv_reserve
+        threshold = max(0.05, min(0.6, threshold))
+
+        return threshold
+
+    def _compute_adaptive_N(self) -> int:
+        """
+        Compute adaptive batch size N based on KV cache capacity and avg output.
+
+        The idea: N should be chosen such that:
+        - All N requests can be prefilled
+        - There's enough KV cache left for decode phase
+
+        Constraint:
+        - N * (avg_prompt + avg_output * margin) / block_size <= total_blocks * (1 - reserve)
+
+        Solving for N:
+        - N <= total_blocks * (1 - reserve) * block_size / (avg_prompt + avg_output * margin)
+
+        Returns:
+            int: Adaptive batch size N
+        """
+        if not hasattr(self.kv_cache_manager, 'block_pool'):
+            return self.max_num_running_reqs
+
+        total_blocks = self.kv_cache_manager.block_pool.num_gpu_blocks
+        if total_blocks <= 0:
+            return self.max_num_running_reqs
+
+        # Estimate average prompt tokens from running/waiting requests
+        avg_prompt_tokens = 512  # Default estimate
+        sample_requests = list(self.running)[:50] + list(self.waiting)[:50]
+        if sample_requests:
+            total_prompt = sum(r.num_prompt_tokens for r in sample_requests)
+            avg_prompt_tokens = total_prompt / len(sample_requests)
+
+        # Expected tokens per request (prompt + output with margin)
+        expected_output = self.pd_avg_output_tokens * self.pd_output_margin
+        tokens_per_request = avg_prompt_tokens + expected_output
+
+        # Available blocks (with base reserve for safety)
+        available_blocks = total_blocks * (1.0 - self.pd_base_kv_reserve)
+
+        # Compute adaptive N
+        blocks_per_request = tokens_per_request / self.block_size
+        adaptive_n = int(available_blocks / blocks_per_request)
+
+        # Clamp to reasonable bounds
+        min_n = max(16, self.max_num_running_reqs // 10)
+        max_n = self.max_num_running_reqs
+        adaptive_n = max(min_n, min(max_n, adaptive_n))
+
+        return adaptive_n
+
+    def _update_avg_output_tokens(self, output_tokens: int) -> None:
+        """
+        Update the running average of output tokens using batched EMA.
+
+        Instead of updating on every request completion (which causes
+        frequent N RECOVERY triggers), we batch updates and only apply
+        EMA when batch_count reaches N/10.
+
+        This is called when a request completes decoding.
+        """
+        # Accumulate in batch
+        self.pd_avg_output_batch_count += 1
+        self.pd_avg_output_batch_sum += output_tokens
+
+        # Determine update interval (N/10, minimum 10)
+        update_interval = max(10, self.pd_batch_size_N // 10)
+
+        # Check if we should update
+        if self.pd_avg_output_batch_count < update_interval:
+            return  # Not enough samples yet
+
+        # Compute batch average
+        batch_avg = self.pd_avg_output_batch_sum / self.pd_avg_output_batch_count
+
+        if not self.pd_avg_output_tokens_initialized:
+            # First batch: direct assignment
+            self.pd_avg_output_tokens = batch_avg
+            self.pd_avg_output_tokens_initialized = True
+        else:
+            # EMA update with batch average
+            self.pd_avg_output_tokens = (
+                self.pd_ema_alpha * batch_avg +
+                (1 - self.pd_ema_alpha) * self.pd_avg_output_tokens
+            )
+
+        # Reset batch accumulators
+        self.pd_avg_output_batch_count = 0
+        self.pd_avg_output_batch_sum = 0
+
     # @cprofile("update_p_online.prof")
     def _update_p_online(self, output_tokens: int) -> None:
         """
@@ -393,38 +593,54 @@ class Scheduler(SchedulerInterface):
             except ValueError:
                 pass
         else:
-            # No explicit k* set, compute from actual data
-            # First batch: always compute (initialize p and k*)
-            # Subsequent batches: only update if DYNAMIC_KSTAR=1
-            dynamic_mode = os.environ.get(
-                "VLLM_PD_ENABLE_DYNAMIC_KSTAR", "0") == "1"
-            should_update = not self.pd_p_initialized or dynamic_mode
+            # No explicit k* set
+            # If using ratio-based k*, no need to update based on p
+            # k* will be updated automatically when N changes
+            if self.pd_k_use_ratio:
+                # Still update p for stats/monitoring, but skip k* recomputation
+                if self.pd_batch_total_output_tokens > 0:
+                    batch_mean_len = (self.pd_batch_total_output_tokens /
+                                      self.pd_batch_completed_count)
+                    batch_p = 1.0 / batch_mean_len
+                    if not self.pd_p_initialized:
+                        self.pd_p = batch_p
+                        self.pd_p_initialized = True
+                    else:
+                        self.pd_p = (self.pd_ema_alpha * batch_p +
+                                     (1 - self.pd_ema_alpha) * self.pd_p)
+            else:
+                # Using optimal k* based on p, update as before
+                # First batch: always compute (initialize p and k*)
+                # Subsequent batches: only update if DYNAMIC_KSTAR=1
+                dynamic_mode = os.environ.get(
+                    "VLLM_PD_ENABLE_DYNAMIC_KSTAR", "0") == "1"
+                should_update = not self.pd_p_initialized or dynamic_mode
 
-            if should_update and self.pd_batch_total_output_tokens > 0:
-                # Compute batch mean output length
-                batch_mean_len = (self.pd_batch_total_output_tokens /
-                                  self.pd_batch_completed_count)
-                batch_p = 1.0 / batch_mean_len
+                if should_update and self.pd_batch_total_output_tokens > 0:
+                    # Compute batch mean output length
+                    batch_mean_len = (self.pd_batch_total_output_tokens /
+                                      self.pd_batch_completed_count)
+                    batch_p = 1.0 / batch_mean_len
 
-                # First batch: direct assignment
-                # Subsequent batches: EMA smoothing (only if dynamic mode)
-                if not self.pd_p_initialized:
-                    self.pd_p = batch_p
-                    self.pd_p_initialized = True
-                else:
-                    self.pd_p = (self.pd_ema_alpha * batch_p +
-                                 (1 - self.pd_ema_alpha) * self.pd_p)
+                    # First batch: direct assignment
+                    # Subsequent batches: EMA smoothing (only if dynamic mode)
+                    if not self.pd_p_initialized:
+                        self.pd_p = batch_p
+                        self.pd_p_initialized = True
+                    else:
+                        self.pd_p = (self.pd_ema_alpha * batch_p +
+                                     (1 - self.pd_ema_alpha) * self.pd_p)
 
-                # Recompute k* with updated p
-                old_k = self.pd_switch_threshold_k
-                self.pd_switch_threshold_k = self._compute_optimal_k()
+                    # Recompute k* with updated p
+                    old_k = self.pd_switch_threshold_k
+                    self.pd_switch_threshold_k = self._compute_optimal_k()
 
-                if old_k != self.pd_switch_threshold_k:
-                    logger.info(
-                        f"[P/D] k* update: {old_k} -> "
-                        f"{self.pd_switch_threshold_k} "
-                        f"(p={self.pd_p:.4f}, mean_len={batch_mean_len:.1f})"
-                    )
+                    if old_k != self.pd_switch_threshold_k:
+                        logger.info(
+                            f"[P/D] k* update: {old_k} -> "
+                            f"{self.pd_switch_threshold_k} "
+                            f"(p={self.pd_p:.4f}, mean_len={batch_mean_len:.1f})"
+                        )
 
         # Reset batch accumulators
         self.pd_batch_completed_count = 0
@@ -452,15 +668,23 @@ class Scheduler(SchedulerInterface):
                 self.pd_decoding_requests -= orphaned_ids
 
         num_pending_chunks = len(self.chunk_prefilling)
-        if num_pending_chunks > num_running:
+        if num_pending_chunks > 0:
             running_set = set(self.running)
+            # Clean up: 1) requests not in running, 2) requests that completed prefill
             orphaned_chunks = [r for r in self.chunk_prefilling
-                               if r not in running_set]
+                               if r not in running_set
+                               or r.num_computed_tokens >= r.num_prompt_tokens]
             if orphaned_chunks:
-                logger.warning("[P/D] Cleaning %d orphaned chunk_prefilling",
+                logger.warning("[P/D] Cleaning %d orphaned/completed chunk_prefilling",
                                len(orphaned_chunks))
                 for req in orphaned_chunks:
                     self.chunk_prefilling.remove(req)
+                    # If prefill completed, add to decoding set and count
+                    if (req in running_set
+                            and req.num_computed_tokens >= req.num_prompt_tokens
+                            and req.request_id not in self.pd_decoding_requests):
+                        self.pd_decoding_requests.add(req.request_id)
+                        self.pd_prefilled_count += 1
                 num_pending_chunks = len(self.chunk_prefilling)
 
         has_decoding = len(self.pd_decoding_requests) > 0
@@ -469,10 +693,23 @@ class Scheduler(SchedulerInterface):
         has_pending_chunks = num_pending_chunks > 0
         prev_phase = self.pd_phase
 
+        # Check if KV cache usage exceeds adaptive threshold
+        # The threshold is learned based on average output tokens:
+        # - Higher avg output tokens -> higher threshold (reserve more for decode)
+        # - Lower avg output tokens -> lower threshold (can use more for prefill)
+        # When threshold exceeded, allow phase transitions even with pending chunks
+        # to prevent deadlock - chunks will continue after decode frees memory
+        kv_cache_full = False
+        adaptive_threshold = self._compute_adaptive_kv_threshold()
+        if hasattr(self.kv_cache_manager, 'block_pool'):
+            total_blocks = self.kv_cache_manager.block_pool.num_gpu_blocks
+            free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+            kv_cache_full = free_blocks < total_blocks * adaptive_threshold
+
         if self.pd_phase == 0:
             # Initial prefill -> decode when N prefilled OR no more waiting
-            # Must wait for all chunked prefills to complete
-            can_transition = not has_pending_chunks
+            # When KV cache is full, allow transition even with pending chunks
+            can_transition = not has_pending_chunks or kv_cache_full
             if self.pd_prefilled_count >= self.pd_batch_size_N:
                 if can_transition:
                     self.pd_phase = 1
@@ -482,12 +719,54 @@ class Scheduler(SchedulerInterface):
                         f"[P/D] Phase 0: waiting for {num_pending_chunks} "
                         f"chunked prefills to complete before decode"
                     )
+            # KV cache full escape - transition to decode to free memory
+            # Use adaptive N based on avg output tokens to prevent preemptions
+            # IMPORTANT: Proactively preempt chunk_prefilling requests to free KV
+            # cache. These requests cannot continue in Phase 1, and if we let them
+            # sit idle, they will be preempted anyway when decode needs more space.
+            # Better to free them now (proactive) than later (reactive).
+            elif kv_cache_full and has_decoding:
+                adaptive_n = self._compute_adaptive_N()
+                min_n = max(16, self.max_num_running_reqs // 10)
+                # Use the smaller of adaptive_n and current prefilled_count
+                # to ensure we don't oversubscribe KV cache
+                new_n = min(adaptive_n, self.pd_prefilled_count)
+                if new_n >= min_n:
+                    self._update_batch_size_n(new_n, "kv_escape")
+
+                # Proactively preempt chunk_prefilling requests
+                # They hold KV cache but can't progress in Phase 1
+                preempted_chunks = 0
+                preempted_tokens = 0
+                for req in list(self.chunk_prefilling):
+                    preempted_tokens += req.num_computed_tokens
+                    self.kv_cache_manager.free(req)
+                    if hasattr(self, 'encoder_cache_manager'):
+                        self.encoder_cache_manager.free(req)
+                    req.status = RequestStatus.PREEMPTED
+                    req.num_computed_tokens = 0
+                    req.num_preemptions += 1
+                    self.running.remove(req)
+                    self.waiting.prepend_request(req)
+                    preempted_chunks += 1
+                self.chunk_prefilling.clear()
+
+                logger.info(
+                    f"[P/D] KV cache threshold ({adaptive_threshold:.2%}) escape: "
+                    f"phase 0->1 with {self.pd_prefilled_count} prefilled, "
+                    f"{waiting_count} waiting, adaptive_N={adaptive_n}, "
+                    f"avg_output={self.pd_avg_output_tokens:.1f}, "
+                    f"preempted_chunks={preempted_chunks} "
+                    f"(freed {preempted_tokens} computed tokens)"
+                )
+                self.pd_phase = 1
+                self.pd_completed_decode_count = 0
             elif not has_waiting and has_decoding and can_transition:
                 # Adjust N to actual prefilled count, but keep a minimum
                 # to avoid cold-start degradation (min 10% of max or 16)
                 min_n = max(16, self.max_num_running_reqs // 10)
                 if self.pd_prefilled_count >= min_n:
-                    self._update_batch_size_n(self.pd_prefilled_count)
+                    self._update_batch_size_n(self.pd_prefilled_count, "cold_start")
                 # If prefilled count is too low, don't adjust N down
                 # This prevents cold-start from permanently reducing batch size
                 self.pd_phase = 1
@@ -500,30 +779,68 @@ class Scheduler(SchedulerInterface):
                 self.pd_phase = 2
                 self.pd_prefilled_count = 0
             # RESET: All decode requests completed, go back to Phase 0
-            elif not has_decoding and has_waiting and len(self.running) == 0:
+            # Note: running may still have chunked prefill requests that will
+            # continue in Phase 0. We only check has_decoding (pd_decoding_requests)
+            # instead of len(running)==0 to allow this.
+            elif not has_decoding and has_waiting:
                 self._reset_pd_to_initial()
             # RECOVERY: If N was reduced during cold start but queue is now full,
-            # restore N to max to utilize full batching capacity
-            elif (self.pd_batch_size_N < self.max_num_running_reqs
-                  and waiting_count >= self.max_num_running_reqs // 2):
+            # restore N to adaptive value (not max) to prevent oversubscription
+            # Added cooldown check to prevent frequent N updates
+            elif (self.pd_batch_size_N < self._compute_adaptive_N()
+                  and waiting_count >= self.max_num_running_reqs // 2
+                  and (time.monotonic() - self.pd_last_n_update_time
+                       >= self.pd_n_update_cooldown)):
                 old_n = self.pd_batch_size_N
-                self.pd_batch_size_N = self.max_num_running_reqs
-                # Also restore k* if it was computed from N
-                if not os.environ.get("VLLM_PD_K_STAR"):
+                # Use adaptive N to account for learned avg output tokens
+                self.pd_batch_size_N = self._compute_adaptive_N()
+                # Also restore k* using ratio or optimal
+                if self.pd_k_use_ratio:
+                    self.pd_switch_threshold_k = self._compute_k_from_ratio()
+                else:
                     self.pd_switch_threshold_k = self._compute_optimal_k()
+                # Record N update time and trajectory
+                self.pd_last_n_update_time = time.monotonic()
+                self._record_n_update(old_n, self.pd_batch_size_N, "recovery")
                 logger.info(
                     f"[P/D] N RECOVERY: {old_n} -> {self.pd_batch_size_N} "
-                    f"(queue filled, k*={self.pd_switch_threshold_k})"
+                    f"(queue filled, k*={self.pd_switch_threshold_k}, "
+                    f"avg_out={self.pd_avg_output_tokens:.1f})"
                 )
 
         elif self.pd_phase == 2:
             # Refill prefill -> decode when k prefilled OR no more waiting
-            # Must wait for all chunked prefills to complete
+            # OR KV cache is full (to prevent deadlock)
             ready_to_decode = (
                 self.pd_prefilled_count >= self.pd_switch_threshold_k
-                or (not has_waiting and has_decoding))
+                or (not has_waiting and has_decoding)
+                or kv_cache_full)  # KV cache full escape
             if ready_to_decode:
-                if not has_pending_chunks:
+                # When KV cache is full, must transition even with pending chunks
+                # to free memory. Proactively preempt them to free KV cache.
+                # Otherwise, wait for chunked prefills to complete.
+                if not has_pending_chunks or kv_cache_full:
+                    # Proactively preempt chunk_prefilling if KV is full
+                    if kv_cache_full and has_pending_chunks:
+                        preempted_chunks = 0
+                        preempted_tokens = 0
+                        for req in list(self.chunk_prefilling):
+                            preempted_tokens += req.num_computed_tokens
+                            self.kv_cache_manager.free(req)
+                            if hasattr(self, 'encoder_cache_manager'):
+                                self.encoder_cache_manager.free(req)
+                            req.status = RequestStatus.PREEMPTED
+                            req.num_computed_tokens = 0
+                            req.num_preemptions += 1
+                            self.running.remove(req)
+                            self.waiting.prepend_request(req)
+                            preempted_chunks += 1
+                        self.chunk_prefilling.clear()
+                        logger.info(
+                            f"[P/D] Phase 2->1: preempted {preempted_chunks} "
+                            f"chunks (freed {preempted_tokens} computed tokens, "
+                            f"KV full)"
+                        )
                     self.pd_phase = 1
                     self.pd_completed_decode_count = 0
                 else:
@@ -539,28 +856,49 @@ class Scheduler(SchedulerInterface):
                 f"{self.PD_PHASE_NAMES[self.pd_phase]} | "
                 f"prefilled={self.pd_prefilled_count}, "
                 f"decoded={self.pd_completed_decode_count}, "
-                f"k*={self.pd_switch_threshold_k}"
+                f"k*={self.pd_switch_threshold_k}, N={self.pd_batch_size_N}, "
+                f"avg_out={self.pd_avg_output_tokens:.1f}, "
+                f"kv_thresh={adaptive_threshold:.2%}"
             )
             self._record_phase_transition(self.pd_phase)
 
-    def _update_batch_size_n(self, new_n: int) -> None:
-        """Update batch size N and recompute k*."""
+    def _update_batch_size_n(self, new_n: int, reason: str = "update") -> None:
+        """Update batch size N and recompute k* (ratio-based or optimal)."""
         if new_n != self.pd_batch_size_N:
             old_n, old_k = self.pd_batch_size_N, self.pd_switch_threshold_k
             self.pd_batch_size_N = new_n
-            self.pd_switch_threshold_k = self._compute_optimal_k()
+            # Use ratio-based k* if enabled, otherwise use optimal k*
+            if self.pd_k_use_ratio:
+                self.pd_switch_threshold_k = self._compute_k_from_ratio()
+            else:
+                self.pd_switch_threshold_k = self._compute_optimal_k()
+            # Record N update time and trajectory
+            self.pd_last_n_update_time = time.monotonic()
+            self._record_n_update(old_n, new_n, reason)
             logger.info(
                 f"[P/D] N update: {old_n}->{new_n}, k*={old_k}->{self.pd_switch_threshold_k}"
             )
 
     def _reset_pd_to_initial(self) -> None:
-        """Reset P/D scheduler to initial state."""
+        """Reset P/D scheduler to initial state with adaptive N."""
         old_n = self.pd_batch_size_N
-        self.pd_batch_size_N = self.max_num_running_reqs
-        self.pd_switch_threshold_k = self._compute_optimal_k()
+        # Use adaptive N if we have learned avg output tokens
+        if self.pd_avg_output_tokens_initialized:
+            self.pd_batch_size_N = self._compute_adaptive_N()
+        else:
+            self.pd_batch_size_N = self.max_num_running_reqs
+        # Use ratio-based k* if enabled, otherwise use optimal k*
+        if self.pd_k_use_ratio:
+            self.pd_switch_threshold_k = self._compute_k_from_ratio()
+        else:
+            self.pd_switch_threshold_k = self._compute_optimal_k()
+        # Record N update time and trajectory
+        self.pd_last_n_update_time = time.monotonic()
+        self._record_n_update(old_n, self.pd_batch_size_N, "reset")
         logger.info(
             f"[P/D] RESET: phase {self.pd_phase}->0 | "
-            f"N={old_n}->{self.pd_batch_size_N}, k*={self.pd_switch_threshold_k}"
+            f"N={old_n}->{self.pd_batch_size_N}, k*={self.pd_switch_threshold_k}, "
+            f"avg_out={self.pd_avg_output_tokens:.1f}"
         )
         self.pd_phase = 0
         self.pd_prefilled_count = 0
@@ -604,10 +942,13 @@ class Scheduler(SchedulerInterface):
             remaining = target - self.pd_prefilled_count
 
             # Continue chunked prefills first
+            # Note: We don't check `remaining > 0` here because we must continue
+            # all existing chunked prefills to prevent deadlock. The `remaining`
+            # counter only limits NEW prefills from the waiting queue.
             if self.scheduler_config.enable_chunked_prefill:
                 req_index = 0
                 while (req_index < len(self.chunk_prefilling)
-                       and token_budget > 0 and remaining > 0):
+                       and token_budget > 0):
                     request = self.chunk_prefilling[req_index]
 
                     if not is_prefill(request):
@@ -634,7 +975,8 @@ class Scheduler(SchedulerInterface):
                         continue
 
                     # Check if prefill completes
-                    will_complete = (request.num_tokens - request.num_computed_tokens
+                    # Use num_prompt_tokens (not num_tokens) to match is_prefill() logic
+                    will_complete = (request.num_prompt_tokens - request.num_computed_tokens
                                      <= num_new_tokens)
                     if will_complete:
                         self.chunk_prefilling.remove(request)
@@ -844,6 +1186,7 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
+            preempted_req_ids={req.request_id for req in preempted_reqs},
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes())
 
@@ -1796,11 +2139,13 @@ class Scheduler(SchedulerInterface):
                 if request.request_id in self.pd_decoding_requests:
                     self.pd_completed_decode_count += 1
                     self.pd_decoding_requests.discard(request.request_id)
-                    # Record decode end and update p estimation
+                    # Record decode end and update p/avg_output estimation
                     output_tokens = request.num_tokens - request.num_prompt_tokens
                     self._record_decode_end(request.request_id, output_tokens)
                     if output_tokens > 0 and self.use_pd_scheduler:
                         self._update_p_online(output_tokens)
+                        # Update average output tokens for adaptive KV threshold
+                        self._update_avg_output_tokens(output_tokens)
 
                 kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
@@ -2592,6 +2937,17 @@ class Scheduler(SchedulerInterface):
                 # Request not found (possibly finished), count as decode
                 decode_tokens += num_tokens
 
+        # Count preemption statistics
+        num_preempted_reqs = 0
+        preempted_tokens = 0
+        if output.preempted_req_ids:
+            num_preempted_reqs = len(output.preempted_req_ids)
+            for req_id in output.preempted_req_ids:
+                req = self.requests.get(req_id)
+                if req:
+                    # This is the number of tokens that need to be re-prefilled
+                    preempted_tokens += req.num_prompt_tokens
+
         self._schedule_stats.append({
             "timestamp": timestamp,
             "elapsed_us": elapsed_time * 1e6,
@@ -2605,7 +2961,13 @@ class Scheduler(SchedulerInterface):
             "num_waiting_reqs": len(self.waiting),
             "num_scheduled_reqs": len(output.num_scheduled_tokens),
             "k_star": self.pd_switch_threshold_k if self.use_pd_scheduler else 0,
+            "k_ratio": self.pd_k_ratio if self.use_pd_scheduler else 0,
             "N": self.pd_batch_size_N if self.use_pd_scheduler else 0,
+            "num_preempted_reqs": num_preempted_reqs,
+            "preempted_tokens": preempted_tokens,
+            # Adaptive scheduling values
+            "avg_output_tokens": self.pd_avg_output_tokens if self.use_pd_scheduler else 0,
+            "adaptive_kv_threshold": self._compute_adaptive_kv_threshold() if self.use_pd_scheduler else 0,
         })
 
     def save_schedule_stats(self, filepath: str = "schedule_stats.json") -> None:
@@ -2615,6 +2977,7 @@ class Scheduler(SchedulerInterface):
             json.dump({
                 "stats": self._schedule_stats,
                 "summary": self.get_schedule_stats_summary(),
+                "n_update_history": self.pd_n_update_history if self.use_pd_scheduler else [],
             }, f, indent=2)
         logger.info(f"[Schedule Stats] Saved {len(self._schedule_stats)} records to {filepath}")
 
@@ -2633,6 +2996,8 @@ class Scheduler(SchedulerInterface):
         decode_tokens = [s["decode_tokens"] for s in self._schedule_stats]
         elapsed_us = [s["elapsed_us"] for s in self._schedule_stats]
         num_scheduled = [s["num_scheduled_reqs"] for s in self._schedule_stats]
+        num_preempted = [s.get("num_preempted_reqs", 0) for s in self._schedule_stats]
+        preempted_tokens = [s.get("preempted_tokens", 0) for s in self._schedule_stats]
 
         def safe_mean(lst):
             return sum(lst) / len(lst) if lst else 0
@@ -2671,4 +3036,22 @@ class Scheduler(SchedulerInterface):
                 "p99": safe_percentile(num_scheduled, 99),
             },
             "empty_schedules": sum(1 for t in total_tokens if t == 0),
+            "preemption": {
+                "total_preempted_reqs": sum(num_preempted),
+                "total_preempted_tokens": sum(preempted_tokens),
+                "schedules_with_preemption": sum(1 for n in num_preempted if n > 0),
+                "preemption_rate": sum(1 for n in num_preempted if n > 0) / len(num_preempted) if num_preempted else 0,
+            },
+            "n_updates": {
+                "total_updates": len(self.pd_n_update_history) if self.use_pd_scheduler else 0,
+                "by_reason": self._count_n_updates_by_reason() if self.use_pd_scheduler else {},
+            },
         }
+
+    def _count_n_updates_by_reason(self) -> dict:
+        """Count N updates grouped by reason."""
+        counts: dict[str, int] = {}
+        for update in self.pd_n_update_history:
+            reason = update.get("reason", "unknown")
+            counts[reason] = counts.get(reason, 0) + 1
+        return counts
