@@ -51,7 +51,7 @@ import numpy as np
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from experiments.pd_experiment_utils import (
+from experiments.archive.pd_experiment_utils import (
     load_dataset_prompts,
     DEFAULT_OUTPUT_DIR,
 )

@@ -18,7 +18,23 @@ Download the following text file (used for generation of synthetic conversations
 
 ```bash
 wget https://www.gutenberg.org/ebooks/1184.txt.utf-8
+wget https://www.gutenberg.org/ebooks/1183.txt.utf-8
+wget https://www.gutenberg.org/ebooks/1182.txt.utf-8
+wget https://www.gutenberg.org/ebooks/1181.txt.utf-8
+wget https://www.gutenberg.org/ebooks/1180.txt.utf-8
+wget https://www.gutenberg.org/ebooks/1179.txt.utf-8
+wget https://www.gutenberg.org/ebooks/1178.txt.utf-8
+wget https://www.gutenberg.org/ebooks/1177.txt.utf-8
+wget https://www.gutenberg.org/ebooks/1176.txt.utf-8
 mv 1184.txt.utf-8 pg1184.txt
+mv 1183.txt.utf-8 pg1183.txt
+mv 1182.txt.utf-8 pg1182.txt
+mv 1181.txt.utf-8 pg1181.txt
+mv 1180.txt.utf-8 pg1180.txt
+mv 1179.txt.utf-8 pg1179.txt
+mv 1178.txt.utf-8 pg1178.txt
+mv 1177.txt.utf-8 pg1177.txt
+mv 1176.txt.utf-8 pg1176.txt
 ```
 
 The filename `pg1184.txt` is used in `generate_multi_turn.json` (see `"text_files"`).

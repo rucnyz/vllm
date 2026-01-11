@@ -159,7 +159,7 @@ class Scheduler(SchedulerInterface):
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
         # requests so that they can free the cached states for those requests.
-        # This is flushed at the end of each scheduling step.
+        npm update -g @anthropic-ai/claude-code       # This is flushed at the end of each scheduling step.
         self.finished_req_ids: set[str] = set()
 
         # KV Connector: requests in process of async KV loading or recving
@@ -483,9 +483,13 @@ class Scheduler(SchedulerInterface):
                         f"chunked prefills to complete before decode"
                     )
             elif not has_waiting and has_decoding and can_transition:
-                # Adjust N to actual prefilled count
-                if self.pd_prefilled_count > 0:
+                # Adjust N to actual prefilled count, but keep a minimum
+                # to avoid cold-start degradation (min 10% of max or 16)
+                min_n = max(16, self.max_num_running_reqs // 10)
+                if self.pd_prefilled_count >= min_n:
                     self._update_batch_size_n(self.pd_prefilled_count)
+                # If prefilled count is too low, don't adjust N down
+                # This prevents cold-start from permanently reducing batch size
                 self.pd_phase = 1
                 self.pd_completed_decode_count = 0
 
@@ -498,6 +502,19 @@ class Scheduler(SchedulerInterface):
             # RESET: All decode requests completed, go back to Phase 0
             elif not has_decoding and has_waiting and len(self.running) == 0:
                 self._reset_pd_to_initial()
+            # RECOVERY: If N was reduced during cold start but queue is now full,
+            # restore N to max to utilize full batching capacity
+            elif (self.pd_batch_size_N < self.max_num_running_reqs
+                  and waiting_count >= self.max_num_running_reqs // 2):
+                old_n = self.pd_batch_size_N
+                self.pd_batch_size_N = self.max_num_running_reqs
+                # Also restore k* if it was computed from N
+                if not os.environ.get("VLLM_PD_K_STAR"):
+                    self.pd_switch_threshold_k = self._compute_optimal_k()
+                logger.info(
+                    f"[P/D] N RECOVERY: {old_n} -> {self.pd_batch_size_N} "
+                    f"(queue filled, k*={self.pd_switch_threshold_k})"
+                )
 
         elif self.pd_phase == 2:
             # Refill prefill -> decode when k prefilled OR no more waiting

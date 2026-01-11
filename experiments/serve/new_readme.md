@@ -53,6 +53,7 @@ python analyze_schedule_stats.py results/pd4.json results/baseline.json --plot
 CUDA_VISIBLE_DEVICES=6 \
     VLLM_USE_PD_SCHEDULER=1 \
     VLLM_PD_ENABLE_DYNAMIC_KSTAR=0 \
+    VLLM_PD_K_STAR = 16 \
     python -m vllm.entrypoints.cli.main serve Qwen/Qwen3-8B \
         --port 8000 \
         --max-num-seqs 128 \
@@ -75,7 +76,17 @@ CUDA_VISIBLE_DEVICES=2 \
     VLLM_PD_ENABLE_DYNAMIC_KSTAR=0 \
     vllm serve Qwen/Qwen3-8B \
         --port 8124 \
-        --max-num-seqs 128 \
+        --gpu-memory-utilization 0.9 \
+        --api-key "7355608"
+        
+        
+CUDA_VISIBLE_DEVICES=2 \
+VLLM_COLLECT_SCHEDULE_STATS=1 \
+VLLM_SCHEDULE_STATS_FILE=/scratch/yuzhou/zwf/vllm/schedule_stats.json \
+    VLLM_USE_PD_SCHEDULER=0 \
+    VLLM_PD_ENABLE_DYNAMIC_KSTAR=0 \
+    vllm serve Qwen/Qwen3-8B \
+        --port 8000 \
         --gpu-memory-utilization 0.9 \
         --api-key "7355608"
 ```
@@ -100,6 +111,20 @@ genai-bench benchmark \
     --max-requests-per-run 500 \
     --num-concurrency 128
 
+genai-bench benchmark \
+    --api-backend vllm \
+    --api-key "7355608" \
+    --api-base http://localhost:8000 \
+    --api-model-name "Qwen/Qwen3-8B" \
+    --model-tokenizer "Qwen/Qwen3-8B" \
+    --task text-to-text \
+    --experiment-base-dir ./experiment_results/genai/short_in_long_out \
+    --traffic-scenario "N(128,32)/(1024,128)" \
+    --max-time-per-run 60 \
+    --max-requests-per-run 500 \
+    --num-concurrency 128
+    
+    
 # Test dynamic k* (port 8001)
 genai-bench benchmark \
     --api-backend vllm \
@@ -125,6 +150,34 @@ genai-bench benchmark \
     --task text-to-text \
     --experiment-base-dir ./experiment_results/genai/baseline \
     --dataset-path ./experiments/serve/alpaca_prompts.csv \
+    --dataset-prompt-column prompt \
+    --max-time-per-run 60 \
+    --max-requests-per-run 500 \
+    --num-concurrency 128
+
+genai-bench benchmark \
+    --api-backend vllm \
+    --api-key "7355608" \
+    --api-base http://localhost:8124 \
+    --api-model-name "Qwen/Qwen3-8B" \
+    --model-tokenizer "Qwen/Qwen3-8B" \
+    --task text-to-text \
+    --experiment-base-dir ./experiment_results/genai/baseline \
+    --dataset-path ./serve/alpaca_prompts.csv \
+    --dataset-prompt-column prompt \
+    --max-time-per-run 60 \
+    --max-requests-per-run 500 \
+    --num-concurrency 128
+
+genai-bench benchmark \
+    --api-backend vllm \
+    --api-key "7355608" \
+    --api-base http://localhost:8000 \
+    --api-model-name "Qwen/Qwen3-8B" \
+    --model-tokenizer "Qwen/Qwen3-8B" \
+    --task text-to-text \
+    --experiment-base-dir ./experiment_results/genai/baseline \
+    --dataset-path /scratch/yuzhou/zwf/vllm/benchmarks/multi_turn/generated_conversations.json \
     --dataset-prompt-column prompt \
     --max-time-per-run 60 \
     --max-requests-per-run 500 \

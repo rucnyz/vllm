@@ -1,7 +1,7 @@
 
-# download dataset: download_gutenberg.py
-# generate multi-turn conversations: generate_conversations_only.py
-# use the converted dataset: generated_conversations.json
+download dataset: download_gutenberg.py
+generate multi-turn conversations: generate_conversations_only.py
+use the converted dataset: generated_conversations.json
 
 
 
@@ -18,6 +18,6 @@ python benchmark_serving_multi_turn_threaded.py \
     --input-file generated_conversations.json \
     --num-clients 1024
 
-# use plot_schedule_stats.py to plot the schedule stats
+use plot_schedule_stats.py to plot the schedule stats
 
 

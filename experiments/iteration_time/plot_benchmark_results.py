@@ -540,6 +540,231 @@ def plot_slope_analysis(
     return fig, ax
 
 
+def extract_data_by_ratio(
+    results: list[dict],
+    target_ratios: list[float] = [0.25, 0.50, 0.75],
+    tolerance: float = 0.10,
+) -> dict[float, dict]:
+    """
+    Extract mixed batch data grouped by decode ratio.
+
+    Args:
+        results: List of benchmark results
+        target_ratios: Target decode ratios to group by (e.g., 0.25 = 25%)
+        tolerance: How close a point needs to be to a target ratio to be included
+
+    Returns:
+        Dict mapping target_ratio -> {x: [], y: [], yerr: [], labels: [], actual_ratios: []}
+    """
+    mixed_by_ratio: dict[float, dict] = {
+        ratio: {"x": [], "y": [], "yerr": [], "labels": [], "actual_ratios": []}
+        for ratio in target_ratios
+    }
+
+    for r in results:
+        num_decode = r["num_decode"]
+        num_prefill = r["num_prefill"]
+        prefill_size = r["prefill_chunk_size"]
+        total_tokens = r["total_tokens"]
+        mean_time = r["mean_time_ms"]
+        std_time = r["std_time_ms"]
+
+        # Only process mixed batch results
+        if num_decode > 0 and num_prefill >= 1:
+            # Calculate decode ratio: decode tokens / total tokens
+            decode_ratio = num_decode / total_tokens
+
+            # Find closest target ratio within tolerance
+            for target_ratio in target_ratios:
+                if abs(decode_ratio - target_ratio) <= tolerance:
+                    mixed_by_ratio[target_ratio]["x"].append(total_tokens)
+                    mixed_by_ratio[target_ratio]["y"].append(mean_time)
+                    mixed_by_ratio[target_ratio]["yerr"].append(std_time)
+                    mixed_by_ratio[target_ratio]["labels"].append(
+                        f"{num_decode}D{prefill_size}P"
+                    )
+                    mixed_by_ratio[target_ratio]["actual_ratios"].append(decode_ratio)
+                    break  # Only assign to one ratio group
+
+    # Convert to numpy arrays and sort by x
+    for ratio, data in mixed_by_ratio.items():
+        if data["x"]:
+            indices = np.argsort(data["x"])
+            data["x"] = np.array(data["x"])[indices]
+            data["y"] = np.array(data["y"])[indices]
+            data["yerr"] = np.array(data["yerr"])[indices]
+            data["labels"] = [data["labels"][i] for i in indices]
+            data["actual_ratios"] = [data["actual_ratios"][i] for i in indices]
+        else:
+            data["x"] = np.array([])
+            data["y"] = np.array([])
+            data["yerr"] = np.array([])
+
+    return mixed_by_ratio
+
+
+def plot_ratio_analysis(
+    pure_prefill: dict,
+    pure_decode: dict,
+    mixed_by_ratio: dict[float, dict],
+    config: dict,
+    output_path: str,
+    target_ratios: list[float] = [0.25, 0.50, 0.75],
+):
+    """
+    Plot mixed batch data grouped by decode ratio (percentage).
+
+    Each target ratio (e.g., 25%, 50%, 75%) is plotted as a separate line,
+    showing how execution time changes with total tokens at fixed decode ratios.
+    """
+    fig, ax = plt.subplots(figsize=(14, 9))
+
+    # Color map for different ratios
+    ratio_colors = {
+        0.25: "#3498db",  # Blue
+        0.50: "#e74c3c",  # Red
+        0.75: "#9b59b6",  # Purple
+    }
+    # Fallback colors for custom ratios
+    cmap = plt.cm.tab10
+    default_colors = [cmap(i) for i in range(10)]
+
+    # Plot pure prefill as reference
+    prefill_slope = None
+    if pure_prefill["x"].size > 0:
+        ax.errorbar(
+            pure_prefill["x"],
+            pure_prefill["y"],
+            yerr=pure_prefill["yerr"],
+            fmt="o--",
+            color="gray",
+            linewidth=1.5,
+            markersize=6,
+            capsize=3,
+            alpha=0.7,
+            label="Pure Prefill (0% decode)",
+        )
+        if len(pure_prefill["x"]) >= 2:
+            prefill_slope, _ = np.polyfit(pure_prefill["x"], pure_prefill["y"], 1)
+            last_x = pure_prefill["x"][-1]
+            last_y = pure_prefill["y"][-1]
+            ax.annotate(
+                f"slope={prefill_slope:.4f}",
+                (last_x, last_y),
+                textcoords="offset points",
+                xytext=(10, 0),
+                fontsize=8,
+                color="gray",
+            )
+
+    # Plot pure decode as reference (100% decode)
+    decode_slope = None
+    if pure_decode["x"].size > 0:
+        ax.errorbar(
+            pure_decode["x"],
+            pure_decode["y"],
+            yerr=pure_decode["yerr"],
+            fmt="s--",
+            color="black",
+            linewidth=1.5,
+            markersize=6,
+            capsize=3,
+            alpha=0.7,
+            label="Pure Decode (100% decode)",
+        )
+        if len(pure_decode["x"]) >= 2:
+            decode_slope, _ = np.polyfit(pure_decode["x"], pure_decode["y"], 1)
+            last_x = pure_decode["x"][-1]
+            last_y = pure_decode["y"][-1]
+            ax.annotate(
+                f"slope={decode_slope:.4f}",
+                (last_x, last_y),
+                textcoords="offset points",
+                xytext=(10, 0),
+                fontsize=8,
+                color="black",
+            )
+
+    # Plot each ratio group
+    for i, ratio in enumerate(sorted(target_ratios)):
+        data = mixed_by_ratio.get(ratio, {"x": np.array([])})
+        if len(data["x"]) == 0:
+            continue
+
+        color = ratio_colors.get(ratio, default_colors[i % len(default_colors)])
+        percentage = int(ratio * 100)
+
+        ax.errorbar(
+            data["x"],
+            data["y"],
+            yerr=data["yerr"],
+            fmt="^-",
+            color=color,
+            linewidth=2,
+            markersize=8,
+            capsize=4,
+            label=f"{percentage}% Decode",
+        )
+
+        # Calculate and display slope
+        if len(data["x"]) >= 2:
+            x_arr = np.array(data["x"])
+            y_arr = np.array(data["y"])
+            slope, _ = np.polyfit(x_arr, y_arr, 1)
+            last_x = x_arr[-1]
+            last_y = y_arr[-1]
+            ax.annotate(
+                f"slope={slope:.4f}",
+                (last_x, last_y),
+                textcoords="offset points",
+                xytext=(10, 0),
+                fontsize=8,
+                color=color,
+            )
+
+    ax.set_xlabel("Total Tokens", fontsize=12)
+    ax.set_ylabel("Execution Time (ms)", fontsize=12)
+
+    model_name = config.get("model", "Unknown")
+    ax.set_title(
+        f"Decode Ratio Analysis: Execution Time vs Total Tokens\n"
+        f"Model: {model_name}",
+        fontsize=14,
+    )
+
+    ax.legend(loc="upper left", fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+
+    # Save with ratio suffix
+    ratio_path = output_path.replace(".png", "_ratio_analysis.png")
+    plt.savefig(ratio_path, dpi=150, bbox_inches="tight")
+    print(f"Ratio analysis plot saved to {ratio_path}")
+
+    # Print ratio summary
+    print("\nDecode Ratio Analysis Summary:")
+    print("-" * 50)
+    if prefill_slope is not None:
+        print(f"  Pure Prefill (0%):   slope = {prefill_slope:.6f} ms/token")
+    for ratio in sorted(target_ratios):
+        data = mixed_by_ratio.get(ratio, {"x": np.array([])})
+        if len(data["x"]) >= 2:
+            x_arr = np.array(data["x"])
+            y_arr = np.array(data["y"])
+            slope, _ = np.polyfit(x_arr, y_arr, 1)
+            percentage = int(ratio * 100)
+            avg_actual = np.mean(data["actual_ratios"]) * 100 if data["actual_ratios"] else ratio * 100
+            print(f"  ~{percentage}% Decode (avg={avg_actual:.1f}%): slope = {slope:.6f} ms/token, "
+                  f"{len(data['x'])} points")
+    if decode_slope is not None:
+        print(f"  Pure Decode (100%):  slope = {decode_slope:.6f} ms/token")
+
+    return fig, ax
+
+
 def plot_throughput(
     pure_prefill: dict,
     pure_decode: dict,
@@ -666,6 +891,24 @@ def main():
         default=True,
         help="Generate slope analysis plot showing how decode ratio affects slope",
     )
+    parser.add_argument(
+        "--ratio-analysis",
+        action="store_true",
+        default=False,
+        help="Generate ratio analysis plot (25%%, 50%%, 75%% decode ratio curves)",
+    )
+    parser.add_argument(
+        "--target-ratios",
+        type=str,
+        default="0.25,0.50,0.75",
+        help="Comma-separated target decode ratios for ratio analysis (default: 0.25,0.50,0.75)",
+    )
+    parser.add_argument(
+        "--ratio-tolerance",
+        type=float,
+        default=0.10,
+        help="Tolerance for matching decode ratios (default: 0.10 = ±10%%)",
+    )
     args = parser.parse_args()
 
     # Handle annotate flag
@@ -706,6 +949,18 @@ def main():
     if args.slope_analysis:
         plot_slope_analysis(
             pure_prefill, pure_decode, mixed_by_decode, config, args.output
+        )
+
+    if args.ratio_analysis:
+        target_ratios = [float(x) for x in args.target_ratios.split(",")]
+        mixed_by_ratio = extract_data_by_ratio(
+            results, target_ratios=target_ratios, tolerance=args.ratio_tolerance
+        )
+        print(f"  Ratio groups: {len(mixed_by_ratio)} "
+              f"({[f'{int(r*100)}%' for r in sorted(target_ratios)]})")
+        plot_ratio_analysis(
+            pure_prefill, pure_decode, mixed_by_ratio, config, args.output,
+            target_ratios=target_ratios
         )
 
     plt.show()
