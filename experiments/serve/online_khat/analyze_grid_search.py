@@ -123,31 +123,85 @@ def collect_grid_results(exp_dir: Path) -> Dict:
     }
 
 
-def find_optimal_configs(data: Dict) -> Dict:
-    """找到每个 scenario 和 scheduler 的最优配置"""
+def find_optimal_configs(data: Dict, verbose: bool = True) -> Dict:
+    """找到每个 scenario 和 scheduler 的最优配置
+
+    Args:
+        data: 网格搜索数据
+        verbose: 是否打印详细的选择过程
+    """
     optimal = {}
 
     for scenario in data["scenarios"]:
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Scenario: {scenario} - 最优配置选择过程")
+            print(f"{'='*60}")
+
         optimal[scenario] = {}
         results = data["results"].get(scenario, {})
 
         for scheduler in ["baseline", "pd"]:
-            best_key = None
-            best_throughput = 0
+            if verbose:
+                print(f"\n  [{scheduler.upper()}] 调度器配置排名 (按吞吐量降序):")
+                print(f"  {'排名':<6} {'TB':<8} {'BS':<8} {'Throughput':<15} {'Output Tput':<15} {'Mean ITL':<12}")
+                print(f"  {'-'*65}")
 
+            # 收集所有配置的吞吐量
+            config_throughputs = []
             for (tb, bs), sched_results in results.items():
                 if scheduler in sched_results:
                     tp = sched_results[scheduler].get("throughput", 0)
-                    if tp > best_throughput:
-                        best_throughput = tp
-                        best_key = (tb, bs)
+                    output_tp = sched_results[scheduler].get("output_throughput", 0)
+                    mean_itl = sched_results[scheduler].get("mean_itl_ms", 0)
+                    config_throughputs.append({
+                        "tb": tb,
+                        "bs": bs,
+                        "throughput": tp,
+                        "output_throughput": output_tp,
+                        "mean_itl_ms": mean_itl,
+                        "metrics": sched_results[scheduler]
+                    })
 
-            if best_key:
+            # 按吞吐量排序
+            config_throughputs.sort(key=lambda x: x["throughput"], reverse=True)
+
+            if verbose:
+                for rank, cfg in enumerate(config_throughputs, 1):
+                    marker = " ★" if rank == 1 else ""
+                    print(f"  {rank:<6} {cfg['tb']:<8} {cfg['bs']:<8} {cfg['throughput']:<15.2f} {cfg['output_throughput']:<15.2f} {cfg['mean_itl_ms']:<12.2f}{marker}")
+
+            if config_throughputs:
+                best = config_throughputs[0]
                 optimal[scenario][scheduler] = {
-                    "tb": best_key[0],
-                    "bs": best_key[1],
-                    "metrics": results[best_key][scheduler]
+                    "tb": best["tb"],
+                    "bs": best["bs"],
+                    "metrics": best["metrics"],
+                    "rank_info": config_throughputs  # 保存排名信息
                 }
+
+                if verbose and len(config_throughputs) > 1:
+                    second = config_throughputs[1]
+                    gap = (best["throughput"] - second["throughput"]) / second["throughput"] * 100 if second["throughput"] > 0 else 0
+                    print(f"\n  → 最优: TB={best['tb']}, BS={best['bs']}, Throughput={best['throughput']:.2f}")
+                    print(f"  → 与第二名差距: +{gap:.2f}%")
+
+        # 对比 baseline 和 pd 的最优配置
+        if verbose and "baseline" in optimal[scenario] and "pd" in optimal[scenario]:
+            b_opt = optimal[scenario]["baseline"]
+            p_opt = optimal[scenario]["pd"]
+            b_tp = b_opt["metrics"]["throughput"]
+            p_tp = p_opt["metrics"]["throughput"]
+
+            print(f"\n  {'─'*60}")
+            print(f"  最优配置对比:")
+            print(f"    Baseline: TB={b_opt['tb']}, BS={b_opt['bs']} → {b_tp:.2f} req/s")
+            print(f"    PD:       TB={p_opt['tb']}, BS={p_opt['bs']} → {p_tp:.2f} req/s")
+
+            if b_tp > 0:
+                improvement = (p_tp - b_tp) / b_tp * 100
+                winner = "PD" if improvement > 0 else "Baseline"
+                print(f"    结论: {winner} 胜出 ({improvement:+.2f}%)")
 
     return optimal
 
@@ -232,6 +286,7 @@ def plot_heatmaps(data: Dict, output_dir: Path):
         plt.suptitle(f'{scenario}: PD vs Baseline Improvement', fontsize=14, fontweight='bold')
         plt.tight_layout()
 
+        plt.show()
         output_path = output_dir / f"heatmap_{scenario}.png"
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
@@ -320,6 +375,7 @@ def plot_optimal_comparison(optimal: Dict, output_dir: Path):
 
     plt.suptitle('Optimal Configuration Comparison: Baseline vs PD Scheduler', fontsize=14, fontweight='bold')
     plt.tight_layout()
+    plt.show()
     output_path = output_dir / "optimal_comparison.png"
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()

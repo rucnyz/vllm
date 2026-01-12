@@ -855,7 +855,7 @@ def main():
     parser.add_argument(
         "--input", "-i",
         type=str,
-        default="results.json",
+        default="results3.json",
         help="Input JSON file with benchmark results",
     )
     parser.add_argument(

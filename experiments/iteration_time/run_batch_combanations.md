@@ -24,3 +24,7 @@ python benchmark_batch_combinations.py \
     --num-warmup 5 \
     --num-iterations 20 \
     --output-json results.json
+
+```shell
+python plot_benchmark_results.py results2.json
+```
