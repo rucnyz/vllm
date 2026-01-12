@@ -16,6 +16,8 @@ import argparse
 from typing import List, Tuple
 import json
 from datetime import datetime
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 def create_attention_inputs(
@@ -142,6 +144,106 @@ def benchmark_scenario(
     }
 
 
+def plot_results(results: List[dict], output_path: str, gpu_name: str):
+    """绘制 benchmark 结果图表，计算斜率"""
+    # 提取数据
+    pure_decode = next(r for r in results if r['scenario'] == 'pure_decode')
+    pure_decode_time = pure_decode['avg_time_ms']
+
+    # 收集 mixed 场景数据 (只取 10%, 20%, 40%, 80%)
+    prefill_pcts = []
+    slowdowns = []
+    times = []
+
+    for pct in [10, 20, 40, 80]:
+        scenario_name = f"mixed_{pct}pct_prefill"
+        mixed = next((r for r in results if r['scenario'] == scenario_name), None)
+        if mixed:
+            prefill_pcts.append(pct)
+            slowdowns.append(mixed['avg_time_ms'] / pure_decode_time)
+            times.append(mixed['avg_time_ms'])
+
+    # 计算线性回归斜率
+    fit_x = np.linspace(0, 100, 100)
+    if len(prefill_pcts) >= 2:
+        pcts_arr = np.array(prefill_pcts)
+        slowdowns_arr = np.array(slowdowns)
+        times_arr = np.array(times)
+
+        # 斜率计算: y = slope * x + intercept
+        slope_slowdown, intercept_slowdown = np.polyfit(pcts_arr, slowdowns_arr, 1)
+        slope_time, intercept_time = np.polyfit(pcts_arr, times_arr, 1)
+
+        print(f"\n{'='*70}")
+        print(f"LINEAR REGRESSION (Mixed scenarios: 10%, 20%, 40%, 80%)")
+        print(f"{'='*70}")
+        print(f"Slowdown slope:    {slope_slowdown:.4f}x per 1% prefill increase")
+        print(f"Time slope:        {slope_time:.4f} ms per 1% prefill increase")
+        print(f"Slowdown at 50%:   {slope_slowdown * 50 + intercept_slowdown:.2f}x (predicted)")
+    else:
+        slope_slowdown = slope_time = intercept_slowdown = intercept_time = 0
+
+    # 创建图表
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # 图1: Slowdown vs Prefill Percentage
+    ax1 = axes[0]
+    ax1.plot(prefill_pcts, slowdowns, 'bo-', linewidth=2, markersize=10, label='Measured')
+
+    # 画拟合线
+    if len(prefill_pcts) >= 2:
+        fit_x = np.linspace(0, 100, 100)
+        fit_y = slope_slowdown * fit_x + intercept_slowdown
+        ax1.plot(fit_x, fit_y, 'r--', linewidth=1.5, alpha=0.7,
+                label=f'Linear fit (slope={slope_slowdown:.3f})')
+
+    ax1.set_xlabel('Prefill Percentage (%)', fontsize=12)
+    ax1.set_ylabel('Slowdown (vs Pure Decode)', fontsize=12)
+    ax1.set_title(f'FlashAttention Slowdown vs Prefill Ratio\n({gpu_name})', fontsize=14)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim(0, 90)
+    ax1.legend(loc='upper left')
+
+    # 标注关键点
+    for pct, sd in zip(prefill_pcts, slowdowns):
+        ax1.annotate(f'{sd:.2f}x', (pct, sd), textcoords="offset points",
+                    xytext=(0, 10), ha='center', fontsize=10, fontweight='bold')
+
+    # 图2: Kernel Time vs Prefill Percentage
+    ax2 = axes[1]
+    ax2.plot(prefill_pcts, times, 'go-', linewidth=2, markersize=10, label='Measured')
+
+    # 画拟合线
+    if len(prefill_pcts) >= 2:
+        fit_y = slope_time * fit_x + intercept_time
+        ax2.plot(fit_x, fit_y, 'r--', linewidth=1.5, alpha=0.7,
+                label=f'Linear fit (slope={slope_time:.4f} ms/%)')
+
+    ax2.set_xlabel('Prefill Percentage (%)', fontsize=12)
+    ax2.set_ylabel('Kernel Time (ms)', fontsize=12)
+    ax2.set_title(f'FlashAttention Kernel Time vs Prefill Ratio\n({gpu_name})', fontsize=14)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlim(0, 90)
+    ax2.legend(loc='upper left')
+
+    # 标注关键点
+    for pct, t in zip(prefill_pcts, times):
+        ax2.annotate(f'{t:.2f}ms', (pct, t), textcoords="offset points",
+                    xytext=(0, 10), ha='center', fontsize=10, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"\nPlot saved to {output_path}")
+
+    return {
+        "slope_slowdown": slope_slowdown,
+        "slope_time_ms": slope_time,
+        "intercept_slowdown": intercept_slowdown,
+        "intercept_time_ms": intercept_time,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="FlashAttention Microbenchmark")
     parser.add_argument("--batch-size", type=int, default=512,
@@ -221,22 +323,23 @@ def main():
     results.append(result)
     print(f"  Time: {result['avg_time_ms']:.3f} ms, Tokens/s: {result['tokens_per_sec']:.0f}")
 
-    # Scenario 4: Mixed (10% prefill + 90% decode)
-    num_prefill = max(1, args.batch_size // 10)
-    num_decode = args.batch_size - num_prefill
-    print(f"\n=== Scenario 4: Mixed ({num_prefill} prefill + {num_decode} decode) ===")
-    result = benchmark_scenario(
-        "mixed_10pct_prefill",
-        query_lens=[args.prefill_len] * num_prefill + [1] * num_decode,
-        context_lens=[args.context_len] * args.batch_size,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        head_size=args.head_size,
-        warmup=args.warmup,
-        repeat=args.repeat,
-    )
-    results.append(result)
-    print(f"  Time: {result['avg_time_ms']:.3f} ms, Tokens/s: {result['tokens_per_sec']:.0f}")
+    # Scenario 4-7: Mixed with varying prefill percentages (10%, 20%, 40%, 80%)
+    for pct in [10, 20, 40, 80]:
+        num_prefill = max(1, args.batch_size * pct // 100)
+        num_decode = args.batch_size - num_prefill
+        print(f"\n=== Scenario: Mixed {pct}% ({num_prefill} prefill + {num_decode} decode) ===")
+        result = benchmark_scenario(
+            f"mixed_{pct}pct_prefill",
+            query_lens=[args.prefill_len] * num_prefill + [1] * num_decode,
+            context_lens=[args.context_len] * args.batch_size,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            head_size=args.head_size,
+            warmup=args.warmup,
+            repeat=args.repeat,
+        )
+        results.append(result)
+        print(f"  Time: {result['avg_time_ms']:.3f} ms, Tokens/s: {result['tokens_per_sec']:.0f}")
 
     # Summary
     print("\n" + "="*70)
@@ -250,33 +353,51 @@ def main():
     # Analysis: Compare mixed vs pure_decode
     pure_decode = next(r for r in results if r['scenario'] == 'pure_decode')
     mixed_1 = next(r for r in results if r['scenario'] == 'mixed_1prefill')
-    mixed_10 = next(r for r in results if r['scenario'] == 'mixed_10pct_prefill')
 
     print("\n" + "="*70)
-    print("ANALYSIS: Mixed vs Pure Decode")
+    print("ANALYSIS: Mixed vs Pure Decode (slowdown ratio)")
     print("="*70)
-    print(f"Pure Decode time:        {pure_decode['avg_time_ms']:.3f} ms")
-    print(f"Mixed (1 prefill) time:  {mixed_1['avg_time_ms']:.3f} ms "
-          f"({mixed_1['avg_time_ms']/pure_decode['avg_time_ms']:.2f}x slower)")
-    print(f"Mixed (10% prefill) time: {mixed_10['avg_time_ms']:.3f} ms "
-          f"({mixed_10['avg_time_ms']/pure_decode['avg_time_ms']:.2f}x slower)")
+    print(f"{'Scenario':<25} {'Time(ms)':<12} {'Slowdown':<10}")
+    print("-"*70)
+    print(f"{'pure_decode':<25} {pure_decode['avg_time_ms']:<12.3f} {'1.00x':<10}")
+    print(f"{'mixed_1prefill':<25} {mixed_1['avg_time_ms']:<12.3f} "
+          f"{mixed_1['avg_time_ms']/pure_decode['avg_time_ms']:.2f}x")
+
+    analysis = {
+        "pure_decode_time_ms": pure_decode['avg_time_ms'],
+        "mixed_1prefill_slowdown": mixed_1['avg_time_ms'] / pure_decode['avg_time_ms'],
+    }
+
+    for pct in [10, 20, 40, 80]:
+        scenario_name = f"mixed_{pct}pct_prefill"
+        mixed = next((r for r in results if r['scenario'] == scenario_name), None)
+        if mixed:
+            slowdown = mixed['avg_time_ms'] / pure_decode['avg_time_ms']
+            print(f"{scenario_name:<25} {mixed['avg_time_ms']:<12.3f} {slowdown:.2f}x")
+            analysis[f"mixed_{pct}pct_slowdown"] = slowdown
 
     # Save results
+    gpu_name = torch.cuda.get_device_name()
     if args.output:
         output_data = {
             "timestamp": datetime.now().isoformat(),
             "args": vars(args),
-            "gpu": torch.cuda.get_device_name(),
+            "gpu": gpu_name,
             "results": results,
-            "analysis": {
-                "pure_decode_time_ms": pure_decode['avg_time_ms'],
-                "mixed_1prefill_slowdown": mixed_1['avg_time_ms'] / pure_decode['avg_time_ms'],
-                "mixed_10pct_slowdown": mixed_10['avg_time_ms'] / pure_decode['avg_time_ms'],
-            }
+            "analysis": analysis,
         }
         with open(args.output, "w") as f:
             json.dump(output_data, f, indent=2)
         print(f"\nResults saved to {args.output}")
+
+        # 生成图表
+        plot_path = args.output.replace('.json', '.png')
+        slope_info = plot_results(results, plot_path, gpu_name)
+
+        # 更新 JSON 添加斜率信息
+        output_data["slope_analysis"] = slope_info
+        with open(args.output, "w") as f:
+            json.dump(output_data, f, indent=2)
 
 
 if __name__ == "__main__":
