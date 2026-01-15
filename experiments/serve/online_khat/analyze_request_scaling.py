@@ -137,20 +137,19 @@ def compute_improvements(data: Dict) -> Dict:
 
 
 def plot_throughput_scaling(data: Dict, output_dir: Path):
-    """绘制吞吐量随 request 数量变化的图"""
+    """绘制吞吐量随 request 数量和时间变化的图"""
     if not HAS_MATPLOTLIB:
         return
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
     request_counts = data["request_counts"]
 
+    # 图1: 按 request 数量
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     for idx, (metric, ylabel) in enumerate([
         ("throughput", "Request Throughput (req/s)"),
         ("output_throughput", "Output Throughput (tok/s)")
     ]):
         ax = axes[idx]
-
         for config_name, label, color, marker in [
             ("pd_optimal", "PD Scheduler (optimal TB/BS)", "#3498db", "o"),
             ("baseline_same", "Baseline (same TB/BS)", "#2ecc71", "s"),
@@ -160,14 +159,12 @@ def plot_throughput_scaling(data: Dict, output_dir: Path):
                      for rc in request_counts]
             ax.plot(request_counts, values, marker=marker, label=label,
                    color=color, linewidth=2, markersize=8)
-
         ax.set_xlabel('Number of Requests')
         ax.set_ylabel(ylabel)
         ax.set_title(ylabel)
         ax.legend()
         ax.grid(True, alpha=0.3)
         ax.set_xscale('log')
-
     plt.suptitle('Throughput vs Number of Requests', fontsize=14, fontweight='bold')
     plt.tight_layout()
     output_path = output_dir / "throughput_scaling.png"
@@ -175,16 +172,43 @@ def plot_throughput_scaling(data: Dict, output_dir: Path):
     plt.close()
     print(f"Saved: {output_path}")
 
+    # 图2: 按 duration
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    for idx, (metric, ylabel) in enumerate([
+        ("throughput", "Request Throughput (req/s)"),
+        ("output_throughput", "Output Throughput (tok/s)")
+    ]):
+        ax = axes[idx]
+        for config_name, label, color, marker in [
+            ("pd_optimal", "PD Scheduler (optimal TB/BS)", "#3498db", "o"),
+            ("baseline_same", "Baseline (same TB/BS)", "#2ecc71", "s"),
+            ("baseline_default", "Baseline (default TB/BS)", "#e74c3c", "^"),
+        ]:
+            durations = [data["configs"][config_name].get(rc, {}).get("duration", 0)
+                        for rc in request_counts]
+            values = [data["configs"][config_name].get(rc, {}).get(metric, 0)
+                     for rc in request_counts]
+            ax.plot(durations, values, marker=marker, label=label,
+                   color=color, linewidth=2, markersize=8)
+        ax.set_xlabel('Duration (seconds)')
+        ax.set_ylabel(ylabel)
+        ax.set_title(ylabel)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    plt.suptitle('Throughput vs Duration', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    output_path = output_dir / "throughput_vs_duration.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {output_path}")
+
 
 def plot_latency_scaling(data: Dict, output_dir: Path):
-    """绘制延迟随 request 数量变化的图"""
+    """绘制延迟随 request 数量和时间变化的图"""
     if not HAS_MATPLOTLIB:
         return
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
     request_counts = data["request_counts"]
-
     metrics = [
         ("mean_itl_ms", "Mean ITL (ms)"),
         ("p99_itl_ms", "P99 ITL (ms)"),
@@ -192,9 +216,10 @@ def plot_latency_scaling(data: Dict, output_dir: Path):
         ("p99_ttft_ms", "P99 TTFT (ms)"),
     ]
 
+    # 图1: 按 request 数量
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     for idx, (metric, ylabel) in enumerate(metrics):
         ax = axes[idx // 2, idx % 2]
-
         for config_name, label, color, marker in [
             ("pd_optimal", "PD Scheduler", "#3498db", "o"),
             ("baseline_same", "Baseline (same)", "#2ecc71", "s"),
@@ -204,14 +229,12 @@ def plot_latency_scaling(data: Dict, output_dir: Path):
                      for rc in request_counts]
             ax.plot(request_counts, values, marker=marker, label=label,
                    color=color, linewidth=2, markersize=8)
-
         ax.set_xlabel('Number of Requests')
         ax.set_ylabel(ylabel)
         ax.set_title(ylabel)
         ax.legend()
         ax.grid(True, alpha=0.3)
         ax.set_xscale('log')
-
     plt.suptitle('Latency vs Number of Requests (lower is better)', fontsize=14, fontweight='bold')
     plt.tight_layout()
     output_path = output_dir / "latency_scaling.png"
@@ -219,15 +242,42 @@ def plot_latency_scaling(data: Dict, output_dir: Path):
     plt.close()
     print(f"Saved: {output_path}")
 
+    # 图2: 按 duration
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    for idx, (metric, ylabel) in enumerate(metrics):
+        ax = axes[idx // 2, idx % 2]
+        for config_name, label, color, marker in [
+            ("pd_optimal", "PD Scheduler", "#3498db", "o"),
+            ("baseline_same", "Baseline (same)", "#2ecc71", "s"),
+            ("baseline_default", "Baseline (default)", "#e74c3c", "^"),
+        ]:
+            durations = [data["configs"][config_name].get(rc, {}).get("duration", 0)
+                        for rc in request_counts]
+            values = [data["configs"][config_name].get(rc, {}).get(metric, 0)
+                     for rc in request_counts]
+            ax.plot(durations, values, marker=marker, label=label,
+                   color=color, linewidth=2, markersize=8)
+        ax.set_xlabel('Duration (seconds)')
+        ax.set_ylabel(ylabel)
+        ax.set_title(ylabel)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    plt.suptitle('Latency vs Duration (lower is better)', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    output_path = output_dir / "latency_vs_duration.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {output_path}")
+
 
 def plot_improvement_scaling(data: Dict, improvements: Dict, output_dir: Path):
-    """绘制 PD 相对 baseline 的改进百分比随 request 数量变化"""
+    """绘制 PD 相对 baseline 的改进百分比随 request 数量和时间变化"""
     if not HAS_MATPLOTLIB:
         return
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
     request_counts = data["request_counts"]
+    durations = [data["configs"]["pd_optimal"].get(rc, {}).get("duration", 0)
+                for rc in request_counts]
 
     metrics = [
         ("throughput", "Throughput Improvement (%)", True),
@@ -236,19 +286,16 @@ def plot_improvement_scaling(data: Dict, improvements: Dict, output_dir: Path):
         ("mean_ttft_ms", "Mean TTFT Improvement (%)", False),
     ]
 
+    # 图1: 按 request 数量
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     for idx, (metric, ylabel, higher_better) in enumerate(metrics):
         ax = axes[idx // 2, idx % 2]
-
-        # vs same TB/BS
         vs_same = [improvements["vs_same"].get(rc, {}).get(metric, 0) for rc in request_counts]
         ax.plot(request_counts, vs_same, marker="o", label="PD vs Baseline (same TB/BS)",
                color="#3498db", linewidth=2, markersize=8)
-
-        # vs default TB/BS
         vs_default = [improvements["vs_default"].get(rc, {}).get(metric, 0) for rc in request_counts]
         ax.plot(request_counts, vs_default, marker="s", label="PD vs Baseline (default TB/BS)",
                color="#e74c3c", linewidth=2, markersize=8)
-
         ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
         ax.set_xlabel('Number of Requests')
         ax.set_ylabel(ylabel)
@@ -256,15 +303,38 @@ def plot_improvement_scaling(data: Dict, improvements: Dict, output_dir: Path):
         ax.legend()
         ax.grid(True, alpha=0.3)
         ax.set_xscale('log')
-
-        # 填充正负区域
         ax.fill_between(request_counts, 0, vs_same, alpha=0.1, color="#3498db")
         ax.fill_between(request_counts, 0, vs_default, alpha=0.1, color="#e74c3c")
-
     plt.suptitle('PD Scheduler Improvement vs Baseline (positive = PD better)',
                 fontsize=14, fontweight='bold')
     plt.tight_layout()
     output_path = output_dir / "improvement_scaling.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {output_path}")
+
+    # 图2: 按 duration
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    for idx, (metric, ylabel, higher_better) in enumerate(metrics):
+        ax = axes[idx // 2, idx % 2]
+        vs_same = [improvements["vs_same"].get(rc, {}).get(metric, 0) for rc in request_counts]
+        ax.plot(durations, vs_same, marker="o", label="PD vs Baseline (same TB/BS)",
+               color="#3498db", linewidth=2, markersize=8)
+        vs_default = [improvements["vs_default"].get(rc, {}).get(metric, 0) for rc in request_counts]
+        ax.plot(durations, vs_default, marker="s", label="PD vs Baseline (default TB/BS)",
+               color="#e74c3c", linewidth=2, markersize=8)
+        ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+        ax.set_xlabel('Duration (seconds)')
+        ax.set_ylabel(ylabel)
+        ax.set_title(ylabel)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        ax.fill_between(durations, 0, vs_same, alpha=0.1, color="#3498db")
+        ax.fill_between(durations, 0, vs_default, alpha=0.1, color="#e74c3c")
+    plt.suptitle('PD Scheduler Improvement vs Baseline (positive = PD better)',
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    output_path = output_dir / "improvement_vs_duration.png"
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Saved: {output_path}")

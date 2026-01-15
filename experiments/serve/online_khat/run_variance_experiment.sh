@@ -1,14 +1,14 @@
 #!/bin/bash
 
-# Output Length 方差实验脚本
-# 验证假设: Output length 方差越大, PD scheduler 表现越好
+# Output Length variance experiment script
+# Hypothesis: Higher output length variance leads to better PD scheduler performance
 #
-# 用法: ./run_variance_experiment.sh [MAX_GPUS]
+# Usage: ./run_variance_experiment.sh [MAX_GPUS]
 #
-# 实验设计:
-#   - 三个 scenario (in1024_out128, in128_out1024, in512_out512)
-#   - 不同的 RANDOM_RANGE_RATIO (0, 0.25, 0.5, 0.75, 0.9)
-#   - 对比三种配置: PD optimal, Baseline same, Baseline default
+# Experiment design:
+#   - Three scenarios (in1024_out128, in128_out1024, in512_out512)
+#   - Different RANDOM_RANGE_RATIO values (0, 0.25, 0.5, 0.75, 0.9)
+#   - Compare three configs: PD optimal, Baseline same, Baseline default
 
 set -e
 
@@ -52,7 +52,12 @@ mkdir -p "$OUTPUT_DIR"
 # 初始化环境
 init_experiment_env
 WORKER_PIDS=()
-setup_cleanup $BASE_PORT
+cleanup() {
+    for pid in "${WORKER_PIDS[@]}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+}
+trap cleanup EXIT INT TERM HUP
 
 echo "========================================"
 echo "Output Length 方差实验"
@@ -62,6 +67,7 @@ echo ""
 
 # 检测并选择 GPU
 select_gpus $MAX_GPUS
+
 echo ""
 echo "实验配置:"
 echo "  MODEL: $MODEL"
@@ -178,15 +184,21 @@ EOF
         unset VLLM_PD_K_RATIO
     fi
 
+    # 等待 GPU 内存可用
+    if ! wait_for_gpu_memory $gpu_id 60; then
+        echo "[GPU $gpu_id] GPU 内存不可用，跳过: ${config_name}"
+        return 1
+    fi
+
     # 启动服务
     VLLM_SCHEDULE_STATS_FILE="${result_dir}/${config_name}_stats.json" \
     vllm serve $serve_args > "$log_file" 2>&1 &
 
     local server_pid=$!
 
-    if ! wait_for_server $port $server_pid; then
+    if ! wait_for_server $port $server_pid 180 "$log_file"; then
         echo "[GPU $gpu_id] 服务启动失败"
-        kill_server $server_pid
+        kill_server $server_pid $gpu_id
         return 1
     fi
 
@@ -208,12 +220,14 @@ EOF
         >> "$log_file" 2>&1
 
     local bench_status=$?
-    kill_server $server_pid
+    kill_server $server_pid $gpu_id
 
     if [ $bench_status -eq 0 ]; then
         echo "[GPU $gpu_id] 完成: ${config_name} ratio=${ratio} ${scenario_name}"
     else
-        echo "[GPU $gpu_id] 失败: ${config_name} ratio=${ratio} ${scenario_name}"
+        echo "[GPU $gpu_id] 失败: ${config_name} ratio=${ratio} ${scenario_name} (退出码: $bench_status)"
+        echo "  日志文件最后 15 行:"
+        tail -15 "$log_file" | sed 's/^/  /'
     fi
 
     return $bench_status

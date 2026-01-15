@@ -29,7 +29,7 @@ MAX_CONCURRENCY=${MAX_CONCURRENCY:-2048}
 RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO:-0.5}
 NUM_WARMUP_REQUESTS=${NUM_WARMUP_REQUESTS:-20}
 K_RATIO=${K_RATIO:-0.8}
-BASE_PORT=${BASE_PORT:-8200}
+BASE_PORT=${BASE_PORT:-8100}
 SKIP_PD=${SKIP_PD:-0}
 DEBUG=${DEBUG:-0}
 
@@ -62,7 +62,12 @@ mkdir -p "$OUTPUT_DIR"
 # 初始化环境
 init_experiment_env
 WORKER_PIDS=()
-setup_cleanup $BASE_PORT
+cleanup() {
+    for pid in "${WORKER_PIDS[@]}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+}
+trap cleanup EXIT INT TERM HUP
 
 echo "========================================"
 echo "Request 数量扩展实验"

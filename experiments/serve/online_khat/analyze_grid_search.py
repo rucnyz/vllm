@@ -108,8 +108,8 @@ def collect_grid_results(exp_dir: Path) -> Dict:
                 if key not in results[scenario]:
                     results[scenario][key] = {}
 
-                # 加载 baseline 和 pd 结果
-                for scheduler in ["baseline", "pd"]:
+                # 加载 baseline, pd, v0, v0_chunked 结果
+                for scheduler in ["baseline", "pd", "v0", "v0_chunked"]:
                     bench_file = scenario_dir / f"bench_{scheduler}.json"
                     bench_result = load_bench_result(bench_file)
                     if bench_result:
@@ -123,85 +123,31 @@ def collect_grid_results(exp_dir: Path) -> Dict:
     }
 
 
-def find_optimal_configs(data: Dict, verbose: bool = True) -> Dict:
-    """找到每个 scenario 和 scheduler 的最优配置
-
-    Args:
-        data: 网格搜索数据
-        verbose: 是否打印详细的选择过程
-    """
+def find_optimal_configs(data: Dict) -> Dict:
+    """找到每个 scenario 和 scheduler 的最优配置"""
     optimal = {}
 
     for scenario in data["scenarios"]:
-        if verbose:
-            print(f"\n{'='*60}")
-            print(f"Scenario: {scenario} - 最优配置选择过程")
-            print(f"{'='*60}")
-
         optimal[scenario] = {}
         results = data["results"].get(scenario, {})
 
-        for scheduler in ["baseline", "pd"]:
-            if verbose:
-                print(f"\n  [{scheduler.upper()}] 调度器配置排名 (按吞吐量降序):")
-                print(f"  {'排名':<6} {'TB':<8} {'BS':<8} {'Throughput':<15} {'Output Tput':<15} {'Mean ITL':<12}")
-                print(f"  {'-'*65}")
+        for scheduler in ["baseline", "pd", "v0", "v0_chunked"]:
+            best_key = None
+            best_throughput = 0
 
-            # 收集所有配置的吞吐量
-            config_throughputs = []
             for (tb, bs), sched_results in results.items():
                 if scheduler in sched_results:
                     tp = sched_results[scheduler].get("throughput", 0)
-                    output_tp = sched_results[scheduler].get("output_throughput", 0)
-                    mean_itl = sched_results[scheduler].get("mean_itl_ms", 0)
-                    config_throughputs.append({
-                        "tb": tb,
-                        "bs": bs,
-                        "throughput": tp,
-                        "output_throughput": output_tp,
-                        "mean_itl_ms": mean_itl,
-                        "metrics": sched_results[scheduler]
-                    })
+                    if tp > best_throughput:
+                        best_throughput = tp
+                        best_key = (tb, bs)
 
-            # 按吞吐量排序
-            config_throughputs.sort(key=lambda x: x["throughput"], reverse=True)
-
-            if verbose:
-                for rank, cfg in enumerate(config_throughputs, 1):
-                    marker = " ★" if rank == 1 else ""
-                    print(f"  {rank:<6} {cfg['tb']:<8} {cfg['bs']:<8} {cfg['throughput']:<15.2f} {cfg['output_throughput']:<15.2f} {cfg['mean_itl_ms']:<12.2f}{marker}")
-
-            if config_throughputs:
-                best = config_throughputs[0]
+            if best_key:
                 optimal[scenario][scheduler] = {
-                    "tb": best["tb"],
-                    "bs": best["bs"],
-                    "metrics": best["metrics"],
-                    "rank_info": config_throughputs  # 保存排名信息
+                    "tb": best_key[0],
+                    "bs": best_key[1],
+                    "metrics": results[best_key][scheduler]
                 }
-
-                if verbose and len(config_throughputs) > 1:
-                    second = config_throughputs[1]
-                    gap = (best["throughput"] - second["throughput"]) / second["throughput"] * 100 if second["throughput"] > 0 else 0
-                    print(f"\n  → 最优: TB={best['tb']}, BS={best['bs']}, Throughput={best['throughput']:.2f}")
-                    print(f"  → 与第二名差距: +{gap:.2f}%")
-
-        # 对比 baseline 和 pd 的最优配置
-        if verbose and "baseline" in optimal[scenario] and "pd" in optimal[scenario]:
-            b_opt = optimal[scenario]["baseline"]
-            p_opt = optimal[scenario]["pd"]
-            b_tp = b_opt["metrics"]["throughput"]
-            p_tp = p_opt["metrics"]["throughput"]
-
-            print(f"\n  {'─'*60}")
-            print(f"  最优配置对比:")
-            print(f"    Baseline: TB={b_opt['tb']}, BS={b_opt['bs']} → {b_tp:.2f} req/s")
-            print(f"    PD:       TB={p_opt['tb']}, BS={p_opt['bs']} → {p_tp:.2f} req/s")
-
-            if b_tp > 0:
-                improvement = (p_tp - b_tp) / b_tp * 100
-                winner = "PD" if improvement > 0 else "Baseline"
-                print(f"    结论: {winner} 胜出 ({improvement:+.2f}%)")
 
     return optimal
 
@@ -286,7 +232,6 @@ def plot_heatmaps(data: Dict, output_dir: Path):
         plt.suptitle(f'{scenario}: PD vs Baseline Improvement', fontsize=14, fontweight='bold')
         plt.tight_layout()
 
-        plt.show()
         output_path = output_dir / f"heatmap_{scenario}.png"
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
@@ -294,7 +239,7 @@ def plot_heatmaps(data: Dict, output_dir: Path):
 
 
 def plot_optimal_comparison(optimal: Dict, output_dir: Path):
-    """绘制最优配置对比图 - 每个指标单独一个子图"""
+    """绘制最优配置对比图 - 每个指标单独一个子图，支持 v0, baseline, pd 三个调度器"""
     if not HAS_MATPLOTLIB:
         return
 
@@ -318,38 +263,57 @@ def plot_optimal_comparison(optimal: Dict, output_dir: Path):
     if n_scenarios == 1:
         axes = axes.reshape(1, -1)
 
-    width = 0.35
+    # 调度器配置: (key, color, label)
+    schedulers = [
+        ("v0", '#e74c3c', 'V0'),
+        ("v0_chunked", '#e67e22', 'V0+Chunk'),
+        ("baseline", '#2ecc71', 'Baseline'),
+        ("pd", '#3498db', 'PD'),
+    ]
 
     for i, scenario in enumerate(scenarios):
-        baseline_opt = optimal[scenario].get("baseline", {})
-        pd_opt = optimal[scenario].get("pd", {})
+        # 获取各调度器的最优配置
+        sched_opts = {s[0]: optimal[scenario].get(s[0], {}) for s in schedulers}
 
-        if not baseline_opt or not pd_opt:
+        # 过滤掉没有数据的调度器
+        available_scheds = [(key, color, label) for key, color, label in schedulers if sched_opts.get(key)]
+
+        if len(available_scheds) < 2:
             continue
 
         for j, (metric, ylabel, higher_better) in enumerate(metrics_to_plot):
             ax = axes[i, j]
 
-            b_val = baseline_opt["metrics"].get(metric, 0)
-            p_val = pd_opt["metrics"].get(metric, 0)
+            # 收集各调度器的值
+            values = []
+            colors = []
+            labels = []
+            for key, color, label in available_scheds:
+                opt = sched_opts[key]
+                val = opt["metrics"].get(metric, 0)
+                values.append(val)
+                colors.append(color)
+                labels.append(f'{label}\nTB={opt["tb"]}\nBS={opt["bs"]}')
 
-            x = np.arange(2)
-            colors = ['#2ecc71', '#3498db']
-            bars = ax.bar(x, [b_val, p_val], width=0.6, color=colors)
+            x = np.arange(len(values))
+            width = 0.6 if len(values) <= 3 else 0.4
+            bars = ax.bar(x, values, width=width, color=colors)
 
-            # 计算改进百分比
-            if b_val > 0:
+            # 计算 PD 相对 baseline 的改进
+            baseline_val = sched_opts.get("baseline", {}).get("metrics", {}).get(metric, 0)
+            pd_val = sched_opts.get("pd", {}).get("metrics", {}).get(metric, 0)
+            if baseline_val > 0 and pd_val > 0:
                 if higher_better:
-                    improvement = (p_val - b_val) / b_val * 100
+                    improvement = (pd_val - baseline_val) / baseline_val * 100
                 else:
-                    improvement = (b_val - p_val) / b_val * 100
-                imp_str = f"{improvement:+.1f}%"
+                    improvement = (baseline_val - pd_val) / baseline_val * 100
+                imp_str = f"PD vs Base: {improvement:+.1f}%"
             else:
-                imp_str = "N/A"
+                imp_str = ""
+                improvement = 0
 
             ax.set_xticks(x)
-            ax.set_xticklabels([f'Baseline\nTB={baseline_opt["tb"]}\nBS={baseline_opt["bs"]}',
-                               f'PD\nTB={pd_opt["tb"]}\nBS={pd_opt["bs"]}'], fontsize=8)
+            ax.set_xticklabels(labels, fontsize=7)
             ax.set_ylabel(ylabel.split('(')[1].replace(')', '') if '(' in ylabel else '')
 
             # 第一行显示指标名称作为标题
@@ -360,22 +324,22 @@ def plot_optimal_comparison(optimal: Dict, output_dir: Path):
             if j == 0:
                 ax.set_ylabel(f'{scenario}\n{ylabel.split("(")[1].replace(")", "")}' if '(' in ylabel else scenario, fontsize=9)
 
-            # 在柱子上方标注数值和改进
-            for bar, val in zip(bars, [b_val, p_val]):
+            # 在柱子上方标注数值
+            for bar, val in zip(bars, values):
                 ax.annotate(f'{val:.1f}', xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
-                           ha='center', va='bottom', fontsize=8)
+                           ha='center', va='bottom', fontsize=7)
 
             # 标注改进百分比
-            ax.annotate(imp_str, xy=(0.5, 0.95), xycoords='axes fraction',
-                       ha='center', va='top', fontsize=9, fontweight='bold',
-                       color='green' if improvement > 0 else 'red' if improvement < 0 else 'gray')
+            if imp_str:
+                ax.annotate(imp_str, xy=(0.5, 0.95), xycoords='axes fraction',
+                           ha='center', va='top', fontsize=8, fontweight='bold',
+                           color='green' if improvement > 0 else 'red' if improvement < 0 else 'gray')
 
             ax.grid(axis='y', alpha=0.3)
             ax.set_ylim(bottom=0)
 
-    plt.suptitle('Optimal Configuration Comparison: Baseline vs PD Scheduler', fontsize=14, fontweight='bold')
+    plt.suptitle('Optimal Configuration Comparison: V0 / V0+Chunk / Baseline / PD', fontsize=14, fontweight='bold')
     plt.tight_layout()
-    plt.show()
     output_path = output_dir / "optimal_comparison.png"
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -383,7 +347,7 @@ def plot_optimal_comparison(optimal: Dict, output_dir: Path):
 
 
 def generate_report(data: Dict, optimal: Dict) -> str:
-    """生成文本分析报告"""
+    """生成文本分析报告，支持 v0, v0_chunked, baseline, pd 四个调度器"""
     lines = []
     lines.append("=" * 80)
     lines.append("TB × BS 网格搜索分析报告")
@@ -399,19 +363,37 @@ def generate_report(data: Dict, optimal: Dict) -> str:
         lines.append(f"Scenario: {scenario}")
         lines.append("=" * 80)
 
+        v0_opt = optimal[scenario].get("v0", {})
+        v0_chunked_opt = optimal[scenario].get("v0_chunked", {})
         baseline_opt = optimal[scenario].get("baseline", {})
         pd_opt = optimal[scenario].get("pd", {})
 
-        if baseline_opt and pd_opt:
+        # 收集可用的调度器
+        available = []
+        if v0_opt:
+            available.append(("v0", v0_opt))
+        if v0_chunked_opt:
+            available.append(("v0_chunked", v0_chunked_opt))
+        if baseline_opt:
+            available.append(("baseline", baseline_opt))
+        if pd_opt:
+            available.append(("pd", pd_opt))
+
+        if len(available) >= 2:
             lines.append("")
             lines.append("最优配置:")
-            lines.append(f"  Baseline: TB={baseline_opt['tb']}, BS={baseline_opt['bs']}")
-            lines.append(f"  PD:       TB={pd_opt['tb']}, BS={pd_opt['bs']}")
+            for name, opt in available:
+                lines.append(f"  {name:>10}: TB={opt['tb']}, BS={opt['bs']}")
             lines.append("")
 
             # 对比关键指标
-            lines.append(f"{'Metric':<25} {'Baseline':<15} {'PD':<15} {'Improvement':<15}")
-            lines.append("-" * 70)
+            header = f"{'Metric':<25}"
+            for name, _ in available:
+                header += f" {name:<15}"
+            if baseline_opt and pd_opt:
+                header += f" {'PD vs Base':<15}"
+            lines.append(header)
+            lines.append("-" * (25 + 15 * len(available) + (15 if baseline_opt and pd_opt else 0)))
 
             metrics_compare = [
                 ("throughput", "Throughput (req/s)", True),
@@ -424,28 +406,50 @@ def generate_report(data: Dict, optimal: Dict) -> str:
             ]
 
             for metric, name, higher_better in metrics_compare:
-                b_val = baseline_opt["metrics"].get(metric, 0)
-                p_val = pd_opt["metrics"].get(metric, 0)
+                row = f"{name:<25}"
+                for sched_name, opt in available:
+                    val = opt["metrics"].get(metric, 0)
+                    row += f" {val:<15.2f}"
 
-                if b_val > 0:
-                    if higher_better:
-                        improvement = (p_val - b_val) / b_val * 100
+                # 计算 PD vs Baseline 改进
+                if baseline_opt and pd_opt:
+                    b_val = baseline_opt["metrics"].get(metric, 0)
+                    p_val = pd_opt["metrics"].get(metric, 0)
+                    if b_val > 0:
+                        if higher_better:
+                            improvement = (p_val - b_val) / b_val * 100
+                        else:
+                            improvement = (b_val - p_val) / b_val * 100
+                        imp_str = f"{improvement:+.2f}%"
                     else:
-                        improvement = (b_val - p_val) / b_val * 100
-                    imp_str = f"{improvement:+.2f}%"
-                else:
-                    imp_str = "N/A"
+                        imp_str = "N/A"
+                    row += f" {imp_str:<15}"
 
-                lines.append(f"{name:<25} {b_val:<15.2f} {p_val:<15.2f} {imp_str:<15}")
+                lines.append(row)
 
-            # 判断胜负
-            b_tp = baseline_opt["metrics"].get("throughput", 0)
-            p_tp = pd_opt["metrics"].get("throughput", 0)
-            winner = "PD Scheduler" if p_tp > b_tp else "Baseline"
-            improvement = (p_tp - b_tp) / b_tp * 100 if b_tp > 0 else 0
+            # 判断胜负 (基于吞吐量)
+            throughputs = {name: opt["metrics"].get("throughput", 0) for name, opt in available}
+            winner = max(throughputs, key=throughputs.get)
+            best_tp = throughputs[winner]
 
             lines.append("")
-            lines.append(f"结论: {winner} 在吞吐量上胜出 ({improvement:+.2f}%)")
+            lines.append(f"结论: {winner.upper()} 在吞吐量上胜出 ({best_tp:.2f} req/s)")
+
+            # 如果有 v0，显示 v1 baseline 相对 v0 的改进
+            if v0_opt and baseline_opt:
+                v0_tp = v0_opt["metrics"].get("throughput", 0)
+                b_tp = baseline_opt["metrics"].get("throughput", 0)
+                if v0_tp > 0:
+                    imp = (b_tp - v0_tp) / v0_tp * 100
+                    lines.append(f"  Baseline vs V0: {imp:+.2f}%")
+
+            # 如果有 v0，显示 PD 相对 v0 的改进
+            if v0_opt and pd_opt:
+                v0_tp = v0_opt["metrics"].get("throughput", 0)
+                p_tp = pd_opt["metrics"].get("throughput", 0)
+                if v0_tp > 0:
+                    imp = (p_tp - v0_tp) / v0_tp * 100
+                    lines.append(f"  PD vs V0: {imp:+.2f}%")
 
         lines.append("")
 
@@ -454,21 +458,22 @@ def generate_report(data: Dict, optimal: Dict) -> str:
     lines.append("总体结论")
     lines.append("=" * 80)
 
-    pd_wins = 0
-    baseline_wins = 0
+    wins = {"v0": 0, "v0_chunked": 0, "baseline": 0, "pd": 0}
     for scenario in data["scenarios"]:
-        baseline_opt = optimal[scenario].get("baseline", {})
-        pd_opt = optimal[scenario].get("pd", {})
-        if baseline_opt and pd_opt:
-            b_tp = baseline_opt["metrics"].get("throughput", 0)
-            p_tp = pd_opt["metrics"].get("throughput", 0)
-            if p_tp > b_tp:
-                pd_wins += 1
-            else:
-                baseline_wins += 1
+        available = {}
+        for sched in ["v0", "v0_chunked", "baseline", "pd"]:
+            opt = optimal[scenario].get(sched, {})
+            if opt:
+                available[sched] = opt["metrics"].get("throughput", 0)
 
-    lines.append(f"PD Scheduler 胜出: {pd_wins}/{len(data['scenarios'])} scenarios")
-    lines.append(f"Baseline 胜出: {baseline_wins}/{len(data['scenarios'])} scenarios")
+        if available:
+            winner = max(available, key=available.get)
+            wins[winner] += 1
+
+    total = len(data['scenarios'])
+    for sched in ["v0", "v0_chunked", "baseline", "pd"]:
+        if wins[sched] > 0 or sched in ["baseline", "pd"]:
+            lines.append(f"{sched.upper()} 胜出: {wins[sched]}/{total} scenarios")
     lines.append("")
 
     return "\n".join(lines)
