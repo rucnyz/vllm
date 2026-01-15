@@ -121,7 +121,9 @@ update_progress() {
 init_experiment_env() {
     local venv_path=${1:-"/scratch/yuzhou/aproj/vllm/.venv"}
     ulimit -n 65535 2>/dev/null || true
-    [ -f "${venv_path}/bin/activate" ] && source "${venv_path}/bin/activate"
+    if [ -f "${venv_path}/bin/activate" ]; then
+        source "${venv_path}/bin/activate"
+    fi
 }
 
 # 打印实验结果统计
