@@ -109,8 +109,15 @@ def collect_grid_results(exp_dir: Path) -> Dict:
                     results[scenario][key] = {}
 
                 # 加载 baseline, pd, v0, v0_chunked 结果
-                for scheduler in ["baseline", "pd", "v0", "v0_chunked"]:
-                    bench_file = scenario_dir / f"bench_{scheduler}.json"
+                # 文件名映射: scheduler_name -> file_suffix
+                scheduler_file_map = {
+                    "baseline": "baseline",
+                    "pd": "pd",
+                    "v0": "default_v0",  # bench_default_v0.json
+                    "v0_chunked": "default_v0_chunked",  # bench_default_v0_chunked.json
+                }
+                for scheduler, file_suffix in scheduler_file_map.items():
+                    bench_file = scenario_dir / f"bench_{file_suffix}.json"
                     bench_result = load_bench_result(bench_file)
                     if bench_result:
                         results[scenario][key][scheduler] = extract_metrics(bench_result)
