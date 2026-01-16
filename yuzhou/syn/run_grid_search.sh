@@ -34,7 +34,7 @@ TB_VALUES=(4096 6144 8192 10240 14336 16384)
 SCENARIOS=("128 1024" "1024 128" "512 512")
 
 # 输出目录
-OUTPUT_DIR="${SCRIPT_DIR}/../outputs/grid_search_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="${SCRIPT_DIR}/../outputs/grid_search_Con_${MAX_CONCURRENCY}_Prompts_${NUM_PROMPTS}"
 mkdir -p "$OUTPUT_DIR"
 
 # 初始化环境
