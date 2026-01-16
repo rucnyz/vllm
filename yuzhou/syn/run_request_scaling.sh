@@ -56,7 +56,7 @@ else
 fi
 
 # 输出目录
-OUTPUT_DIR="${SCRIPT_DIR}/request_scaling_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="${SCRIPT_DIR}/../outputs/request_scaling_${MAX_CONCURRENCY}_Prompts_${NUM_PROMPTS}"
 mkdir -p "$OUTPUT_DIR"
 
 # 初始化环境

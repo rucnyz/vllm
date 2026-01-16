@@ -20,7 +20,7 @@ source "${SCRIPT_DIR}/common.sh"
 # 实验参数
 MAX_GPUS=${1:-4}
 MODEL=${MODEL:-"Qwen/Qwen3-8B"}
-NUM_PROMPTS=${NUM_PROMPTS:-5000}
+NUM_PROMPTS=${NUM_PROMPTS:-4000}
 MAX_CONCURRENCY=${MAX_CONCURRENCY:-2048}
 NUM_WARMUP_REQUESTS=${NUM_WARMUP_REQUESTS:-20}
 K_RATIO=${K_RATIO:-0.8}
@@ -46,7 +46,7 @@ OPTIMAL_PD_BS["in512_out512"]=1024
 SCENARIOS=("1024 128 in1024_out128" "128 1024 in128_out1024" "512 512 in512_out512")
 
 # 输出目录
-OUTPUT_DIR="${SCRIPT_DIR}/variance_experiment_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="${SCRIPT_DIR}/../outputs/variance_experiment_${MAX_CONCURRENCY}_Prompts_${NUM_PROMPTS}"
 mkdir -p "$OUTPUT_DIR"
 
 # 初始化环境
