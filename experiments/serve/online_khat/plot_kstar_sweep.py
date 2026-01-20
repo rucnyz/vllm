@@ -2,7 +2,7 @@
 """
 K* 参数扫描结果可视化脚本
 支持两种数据源:
-  - schedule: 调度统计文件 (baseline.json, fixed*.json) - 来自 VLLM_COLLECT_SCHEDULE_STATS
+  - schedule: 调度统计文件 (baseline_stats.json, fixed*_stats.json) - 来自 VLLM_COLLECT_SCHEDULE_STATS
   - bench: Benchmark 结果文件 (bench_baseline.json, bench_fixed*.json) - 来自 vllm bench serve
 
 用法示例:
@@ -245,9 +245,9 @@ def load_schedule_data(results_dir: Path, args) -> tuple[dict, dict, dict, dict]
     dynamic_results = {}
     kratio_results = {}  # K ratio 结果 (自适应 N)
 
-    # 加载 fixed*.json (固定 K* 模式)
-    for filepath in results_dir.glob("fixed*.json"):
-        match = re.search(r'fixed(\d+)\.json', filepath.name)
+    # 加载 fixed*_stats.json 或 fixed*.json (固定 K* 模式)
+    for filepath in results_dir.glob("fixed*_stats.json"):
+        match = re.search(r'fixed(\d+)_stats\.json', filepath.name)
         if match:
             k_star = int(match.group(1))
             if k_star < args.k_min:
@@ -262,9 +262,9 @@ def load_schedule_data(results_dir: Path, args) -> tuple[dict, dict, dict, dict]
             k_star_results[k_star] = metrics
             print(f"Loaded K*={k_star}: throughput={metrics['overall_throughput_tps']:.0f} tok/s")
 
-    # 加载 kratio_*.json (K ratio 模式，自适应 N)
-    for filepath in results_dir.glob("kratio_*.json"):
-        match = re.search(r'kratio_(\d+)_(\d+)\.json', filepath.name)
+    # 加载 kratio_*_stats.json (K ratio 模式，自适应 N)
+    for filepath in results_dir.glob("kratio_*_stats.json"):
+        match = re.search(r'kratio_(\d+)_(\d+)_stats\.json', filepath.name)
         if match:
             # 0_5 -> 0.5
             ratio = float(f"{match.group(1)}.{match.group(2)}")
@@ -276,8 +276,10 @@ def load_schedule_data(results_dir: Path, args) -> tuple[dict, dict, dict, dict]
             kratio_results[ratio] = metrics
             print(f"Loaded K ratio={ratio}: throughput={metrics['overall_throughput_tps']:.0f} tok/s")
 
-    # 加载 baseline
-    baseline_path = results_dir / "baseline.json"
+    # 加载 baseline (支持 baseline_stats.json 或 baseline.json)
+    baseline_path = results_dir / "baseline_stats.json"
+    if not baseline_path.exists():
+        baseline_path = results_dir / "baseline.json"
     if baseline_path.exists():
         data = load_json(baseline_path)
         if data is not None and "stats" in data:
@@ -2333,7 +2335,7 @@ def main():
     if mode == "schedule":
         k_star_results, baseline_metrics, dynamic_results, kratio_results = load_schedule_data(results_dir, args)
         if not k_star_results and not kratio_results:
-            print("No fixed*.json or kratio_*.json files found!")
+            print("No fixed*_stats.json or kratio_*_stats.json files found!")
             return
         plot_schedule_mode(k_star_results, baseline_metrics, dynamic_results, output_path, args.no_show, kratio_results)
 

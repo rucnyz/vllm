@@ -5,7 +5,7 @@
 #
 # 用法: ./run_benchmark_unified.sh [MAX_BATCH_SIZE] [OUTPUT_DIR] [NUM_PROMPTS]
 #   MAX_BATCH_SIZE: Baseline 的 max_num_seqs，为空使用 vLLM 默认值
-#   OUTPUT_DIR: 结果保存目录，默认当前目录
+#   OUTPUT_DIR: 结果保存目录，默认 ../outputs/
 #   NUM_PROMPTS: 每个实验的 prompt 数量，默认 5000
 #
 # 环境变量 (可选):
@@ -19,9 +19,8 @@
 #   RUN_BASELINE: 是否运行 baseline，默认 1
 #   RUN_KSTAR: 是否运行固定 K* 扫描 (需要 PD_MAX_BATCH_SIZE)，默认 1
 #   RUN_KRATIO: 是否运行 K ratio 扫描 (自适应 N)，默认 1
-#   RUN_CHUNKED: 是否运行 chunked prefill 测试，默认 0
 #   SKIP_EXISTING: 跳过已有结果的测试 (检测 bench_*.json)，默认 0
-#   TOKEN_BUDGET_DEFAULT: Baseline/Chunked 的 max_num_batched_tokens，默认 8192
+#   TOKEN_BUDGET_DEFAULT: Baseline 的 max_num_batched_tokens，默认 8192
 #   TOKEN_BUDGET_PD: P/D Scheduler 的 max_num_batched_tokens，默认 16384
 #   PD_MAX_NUM_SEQS: K Ratio 模式的 max_num_seqs，默认 2048
 #
@@ -35,8 +34,6 @@
 #   # 固定 K* 扫描 (需要指定 PD_MAX_BATCH_SIZE)
 #   PD_MAX_BATCH_SIZE=1152 RUN_KRATIO=0 ./run_benchmark_unified.sh
 #
-#   # 只运行 baseline 和 chunked prefill
-#   RUN_KSTAR=0 RUN_KRATIO=0 RUN_CHUNKED=1 ./run_benchmark_unified.sh
 #
 #   # 自定义 token budget (分别设置默认调度器和 P/D 调度器)
 #   TOKEN_BUDGET_DEFAULT=4096 TOKEN_BUDGET_PD=8192 ./run_benchmark_unified.sh
@@ -86,7 +83,6 @@ K_RATIO_VALUES=(${K_RATIO_VALUES:-"0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9"})
 RUN_BASELINE=${RUN_BASELINE:-1}    # 运行 baseline (默认调度器)
 RUN_KSTAR=${RUN_KSTAR:-0}          # 运行 K* 扫描 (固定 K* 模式)
 RUN_KRATIO=${RUN_KRATIO:-1}        # 运行 K ratio 扫描 (自适应 N 模式)
-RUN_CHUNKED=${RUN_CHUNKED:-0}      # 运行 chunked prefill 对比
 SKIP_EXISTING=${SKIP_EXISTING:-0}  # 跳过已有结果 (检测 bench_*.json)
 
 # Warmup 配置
@@ -94,7 +90,7 @@ NUM_WARMUP_REQUESTS=${NUM_WARMUP_REQUESTS:-20}  # 预热请求数
 
 # Token Budget 参数 (max_num_batched_tokens)
 # 分别为默认调度器和 P/D 调度器设置不同的 token budget
-TOKEN_BUDGET_DEFAULT=${TOKEN_BUDGET_DEFAULT:-}   # Baseline/Chunked 使用 (schedule_default)
+TOKEN_BUDGET_DEFAULT=${TOKEN_BUDGET_DEFAULT:-}   # Baseline 使用 (schedule_default)
 TOKEN_BUDGET_PD=${TOKEN_BUDGET_PD:-10752}             # P/D Scheduler 使用 (schedule_pd)
 
 # P/D Scheduler max_num_seqs 参数 (K Ratio 模式使用)
@@ -102,9 +98,9 @@ PD_MAX_NUM_SEQS=${PD_MAX_NUM_SEQS:-1408}
 
 # 输出目录 (必须在 MAX_CONCURRENCY 和 NUM_PROMPTS 之后定义)
 if [ -n "$PD_MAX_BATCH_SIZE" ]; then
-    OUTPUT_BASE_DIR=${2:-"${SCRIPT_DIR}/bs${PD_MAX_BATCH_SIZE}_c${MAX_CONCURRENCY}_n${NUM_PROMPTS}"}
+    OUTPUT_BASE_DIR=${2:-"${SCRIPT_DIR}/../outputs/bs${PD_MAX_BATCH_SIZE}_c${MAX_CONCURRENCY}_n${NUM_PROMPTS}"}
 else
-    OUTPUT_BASE_DIR=${2:-"${SCRIPT_DIR}/bsAuto_max${PD_MAX_NUM_SEQS}_tb${TOKEN_BUDGET_PD}"}
+    OUTPUT_BASE_DIR=${2:-"${SCRIPT_DIR}/../outputs/bsAuto_max${PD_MAX_NUM_SEQS}_tb${TOKEN_BUDGET_PD}"}
 fi
 
 # ========================================
@@ -122,6 +118,31 @@ scenarios=(
 # 创建输出根目录
 mkdir -p "$OUTPUT_BASE_DIR"
 
+# 保存实验配置
+cat > "${OUTPUT_BASE_DIR}/experiment_config.json" << EOF
+{
+    "model": "${MODEL}",
+    "num_prompts": ${NUM_PROMPTS},
+    "num_warmup_requests": ${NUM_WARMUP_REQUESTS},
+    "max_concurrency": ${MAX_CONCURRENCY},
+    "random_range_ratio": ${RANDOM_RANGE_RATIO},
+    "cuda_devices": "${CUDA_DEVICES}",
+    "port": ${PORT},
+    "max_batch_size_baseline": "${MAX_BATCH_SIZE:-null}",
+    "pd_max_batch_size": "${PD_MAX_BATCH_SIZE:-null}",
+    "pd_max_num_seqs": ${PD_MAX_NUM_SEQS},
+    "token_budget_default": "${TOKEN_BUDGET_DEFAULT:-null}",
+    "token_budget_pd": ${TOKEN_BUDGET_PD},
+    "k_star_values": [$(IFS=,; echo "${K_STAR_VALUES[*]}")],
+    "k_ratio_values": [$(echo "${K_RATIO_VALUES[*]}" | sed 's/ /, /g')],
+    "scenarios": ["128 1024", "1024 128", "512 512"],
+    "run_baseline": ${RUN_BASELINE},
+    "run_kstar": ${RUN_KSTAR},
+    "run_kratio": ${RUN_KRATIO},
+    "timestamp": "$(date -Iseconds)"
+}
+EOF
+
 echo "========================================"
 echo "统一 Benchmark 脚本"
 echo "========================================"
@@ -136,7 +157,7 @@ echo "  MODEL: $MODEL"
 echo "  PORT: $PORT"
 echo "  MAX_CONCURRENCY: $MAX_CONCURRENCY"
 echo "  RANDOM_RANGE_RATIO: $RANDOM_RANGE_RATIO"
-echo "  TOKEN_BUDGET_DEFAULT: $TOKEN_BUDGET_DEFAULT (Baseline/Chunked)"
+echo "  TOKEN_BUDGET_DEFAULT: $TOKEN_BUDGET_DEFAULT (Baseline)"
 echo "  TOKEN_BUDGET_PD: $TOKEN_BUDGET_PD (P/D Scheduler)"
 echo "  PD_MAX_NUM_SEQS: $PD_MAX_NUM_SEQS (K Ratio 模式)"
 echo ""
@@ -148,7 +169,6 @@ else
     echo "  RUN_KSTAR: $RUN_KSTAR (需要设置 PD_MAX_BATCH_SIZE)"
 fi
 echo "  RUN_KRATIO: $RUN_KRATIO (K ratio 值: ${K_RATIO_VALUES[*]})"
-echo "  RUN_CHUNKED: $RUN_CHUNKED"
 echo "  SKIP_EXISTING: $SKIP_EXISTING"
 echo "========================================"
 
@@ -323,20 +343,7 @@ for scenario in "${scenarios[@]}"; do
     fi
 
     # ----------------------------------------
-    # 2. Chunked Prefill 测试
-    # ----------------------------------------
-    if [ "$RUN_CHUNKED" = "1" ]; then
-        # 构建可选参数
-        CHUNKED_ARGS="--enable-chunked-prefill"
-        [ -n "$MAX_BATCH_SIZE" ] && CHUNKED_ARGS="$CHUNKED_ARGS --max-num-seqs $MAX_BATCH_SIZE"
-        [ -n "$TOKEN_BUDGET_DEFAULT" ] && CHUNKED_ARGS="$CHUNKED_ARGS --max-num-batched-tokens $TOKEN_BUDGET_DEFAULT"
-
-        start_vllm_and_benchmark "Chunked Prefill" "chunked" "chunked" \
-            "" "$CHUNKED_ARGS"
-    fi
-
-    # ----------------------------------------
-    # 3. PD Scheduler 固定 K* 测试 (需要 PD_MAX_BATCH_SIZE)
+    # 2. PD Scheduler 固定 K* 测试 (需要 PD_MAX_BATCH_SIZE)
     # ----------------------------------------
     if [ "$RUN_KSTAR" = "1" ] && [ -n "$PD_MAX_BATCH_SIZE" ] && [ ${#K_STAR_VALUES[@]} -gt 0 ]; then
         KSTAR_ARGS="--max-num-seqs $PD_MAX_BATCH_SIZE --max-num-batched-tokens $TOKEN_BUDGET_PD"
@@ -349,7 +356,7 @@ for scenario in "${scenarios[@]}"; do
     fi
 
     # ----------------------------------------
-    # 4. PD Scheduler K Ratio 测试 (自适应 N, k = ratio * N)
+    # 3. PD Scheduler K Ratio 测试 (自适应 N, k = ratio * N)
     # ----------------------------------------
     if [ "$RUN_KRATIO" = "1" ]; then
         KRATIO_ARGS="--max-num-seqs $PD_MAX_NUM_SEQS --max-num-batched-tokens $TOKEN_BUDGET_PD"
@@ -375,12 +382,12 @@ echo "========================================"
 echo "结果保存在: ${OUTPUT_BASE_DIR}/"
 echo ""
 echo "目录结构:"
+echo "  experiment_config.json (实验配置)"
 for scenario in "${scenarios[@]}"; do
     read -r input_len output_len <<< "$scenario"
     name="in${input_len}_out${output_len}"
     echo "  - ${name}/"
     echo "      调度统计: baseline.json"
-    [ "$RUN_CHUNKED" = "1" ] && echo "                chunked.json"
     if [ "$RUN_KSTAR" = "1" ] && [ -n "$PD_MAX_BATCH_SIZE" ]; then
         echo "                fixed*.json (固定 K* sweep)"
     fi

@@ -1,0 +1,11 @@
+kratio|512|512|0.1
+kratio|512|512|0.2
+kratio|512|512|0.3
+kratio|512|512|0.4
+kratio|512|512|0.5
+kratio|512|512|0.6
+kratio|512|512|0.7
+kratio|512|512|0.8
+kratio|512|512|0.9
+ratio_auto|512|512
+dynamic|512|512
