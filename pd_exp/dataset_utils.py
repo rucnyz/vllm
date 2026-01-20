@@ -7,6 +7,7 @@ and applying chat templates.
 
 import json
 import os
+import random
 import warnings
 from typing import Optional
 
@@ -252,13 +253,14 @@ def load_longbench_prompts(
     Load prompts from THUDM/LongBench-v2 dataset.
 
     This dataset contains long-context tasks, ideal for testing prefill-heavy
-    scenarios.
+    scenarios. Long contexts are split into chunks of [min_input_len, max_input_len]
+    tokens, each chunk paired with the same question.
 
     Args:
         max_samples: Maximum number of samples to load.
         tokenizer: Optional tokenizer for accurate token counting.
-        min_input_len: Minimum input length in tokens (filter shorter samples).
-        max_input_len: Maximum input length in tokens (filter longer samples).
+        min_input_len: Minimum input length in tokens.
+        max_input_len: Maximum input length in tokens.
 
     Returns:
         Tuple of (prompts, input_lengths, output_lengths).
@@ -267,7 +269,8 @@ def load_longbench_prompts(
         raise ImportError("Please install datasets: pip install datasets")
 
     print(f"Loading THUDM/LongBench-v2 from HuggingFace...")
-    print(f"  Input length filter: [{min_input_len}, {max_input_len}] tokens")
+    print(f"  Input length range: [{min_input_len}, {max_input_len}] tokens")
+    print(f"  Long contexts will be chunked with random sizes in this range")
     dataset = load_dataset("THUDM/LongBench-v2", split="train")
 
     prompts = []
@@ -275,10 +278,10 @@ def load_longbench_prompts(
     output_lengths = []
 
     use_tokenizer = tokenizer is not None
-    filtered_short = 0
-    filtered_long = 0
+    total_chunks = 0
+    original_samples = 0
 
-    for i, item in enumerate(dataset):
+    for item in dataset:
         if len(prompts) >= max_samples:
             break
 
@@ -292,41 +295,100 @@ def load_longbench_prompts(
         if not context or not question:
             continue
 
-        # Build the prompt: context + question + choices
+        original_samples += 1
+
+        # Build the question suffix (fixed part)
         choices_text = ""
         if choice_a or choice_b or choice_c or choice_d:
             choices_text = f"\n\nA. {choice_a}\nB. {choice_b}\nC. {choice_c}\nD. {choice_d}"
+        question_suffix = f"\n\nQuestion: {question}{choices_text}\n\nAnswer:"
 
-        input_text = f"{context}\n\nQuestion: {question}{choices_text}\n\nAnswer:"
-
-        # Calculate input length
+        # Calculate suffix length
         if use_tokenizer:
-            input_len = len(tokenizer.encode(input_text))
+            suffix_len = len(tokenizer.encode(question_suffix))
         else:
-            input_len = int(len(input_text.split()) * WORD_TO_TOKEN_RATIO)
+            suffix_len = int(len(question_suffix.split()) * WORD_TO_TOKEN_RATIO)
 
-        # Filter by input length range
-        if input_len < min_input_len:
-            filtered_short += 1
+        # Minimum context length needed
+        min_context_len = min_input_len - suffix_len
+        max_context_len = max_input_len - suffix_len
+
+        if min_context_len < 100:
             continue
-        if input_len > max_input_len:
-            filtered_long += 1
-            continue
 
-        # Output is just the answer (A/B/C/D), very short
-        output_len = 5  # Single letter answer
+        # Tokenize context for chunking with random sizes
+        if use_tokenizer:
+            context_tokens = tokenizer.encode(context)
+            context_len = len(context_tokens)
 
-        prompts.append(input_text)
-        input_lengths.append(input_len)
-        output_lengths.append(output_len)
+            # Split context into chunks with random sizes
+            chunks = []
+            pos = 0
+            while pos < context_len:
+                # Randomly pick chunk size for this iteration
+                target_context_len = random.randint(min_context_len, max_context_len)
+                end = min(pos + target_context_len, context_len)
+                chunk_tokens = context_tokens[pos:end]
+
+                # Only add if chunk is large enough
+                if len(chunk_tokens) >= min_context_len:
+                    chunk_text = tokenizer.decode(chunk_tokens)
+                    chunks.append(chunk_text)
+
+                pos = end
+        else:
+            # Word-based chunking with random sizes
+            words = context.split()
+            min_words_per_chunk = int(min_context_len / WORD_TO_TOKEN_RATIO)
+            max_words_per_chunk = int(max_context_len / WORD_TO_TOKEN_RATIO)
+
+            chunks = []
+            pos = 0
+            while pos < len(words):
+                # Randomly pick chunk size for this iteration
+                words_per_chunk = random.randint(min_words_per_chunk, max_words_per_chunk)
+                end = min(pos + words_per_chunk, len(words))
+                chunk_words = words[pos:end]
+
+                # Only add if chunk is large enough
+                if len(chunk_words) >= min_words_per_chunk:
+                    chunk_text = ' '.join(chunk_words)
+                    chunks.append(chunk_text)
+
+                pos = end
+
+        # Create samples from chunks
+        for chunk in chunks:
+            if len(prompts) >= max_samples:
+                break
+
+            input_text = f"{chunk}{question_suffix}"
+
+            # Calculate input length
+            if use_tokenizer:
+                input_len = len(tokenizer.encode(input_text))
+            else:
+                input_len = int(len(input_text.split()) * WORD_TO_TOKEN_RATIO)
+
+            # Filter by input length range
+            if input_len < min_input_len or input_len > max_input_len:
+                continue
+
+            # Output is just the answer (A/B/C/D), very short
+            output_len = 5
+
+            prompts.append(input_text)
+            input_lengths.append(input_len)
+            output_lengths.append(output_len)
+            total_chunks += 1
 
         # Progress indicator
-        if len(prompts) % 500 == 0:
-            print(f"  Loaded {len(prompts)} samples...")
+        if len(prompts) % 1000 == 0 and len(prompts) > 0:
+            print(f"  Loaded {len(prompts)} samples from {original_samples} original contexts...")
 
     print(f"Loaded {len(prompts)} prompts from LongBench-v2")
-    print(f"  Filtered (input < {min_input_len}): {filtered_short}")
-    print(f"  Filtered (input > {max_input_len}): {filtered_long}")
+    print(f"  Original contexts: {original_samples}")
+    print(f"  Total chunks created: {total_chunks}")
     if len(prompts) > 0:
         print(f"  Average input length: {np.mean(input_lengths):.1f} tokens")
         print(f"  Average output length: {np.mean(output_lengths):.1f} tokens")
@@ -494,6 +556,117 @@ def load_processbench_prompts(
         print(f"Step-by-step mode: {step_by_step}")
 
     return prompts, input_lengths, output_lengths
+
+
+def load_wildchat_conversations(
+    max_conversations: int = 500,
+    tokenizer=None,
+    min_turns: int = 8,
+) -> list[dict]:
+    """
+    Load multi-turn conversations from allenai/WildChat-1M dataset.
+
+    This dataset contains real multi-turn conversations, ideal for testing
+    prefix cache effectiveness. Each conversation with n turns generates
+    n requests, where each subsequent request shares a prefix with previous ones.
+
+    Args:
+        max_conversations: Maximum number of conversations to load.
+        tokenizer: Optional tokenizer for token counting.
+        min_turns: Minimum number of turns required (filter shorter conversations).
+
+    Returns:
+        List of conversations in format:
+        [{"id": "conv_id", "messages": [{"role": "user/assistant", "content": "..."}]}]
+
+    Note:
+        This format is compatible with vLLM's multi-turn benchmark:
+        python benchmarks/multi_turn/benchmark_serving_multi_turn_threaded.py
+    """
+    if not HF_AVAILABLE:
+        raise ImportError("Please install datasets: pip install datasets")
+
+    print(f"Loading allenai/WildChat-1M from HuggingFace...")
+    print(f"  min_turns filter: {min_turns}")
+    # Use streaming to avoid loading entire dataset
+    dataset = load_dataset("allenai/WildChat-1M", split="train", streaming=True)
+
+    conversations = []
+    processed_count = 0
+    filtered_count = 0
+
+    for item in dataset:
+        if len(conversations) >= max_conversations:
+            break
+
+        processed_count += 1
+        conv_data = item.get('conversation', [])
+        turn_count = item.get('turn', 0)
+
+        # Filter by minimum turns
+        if turn_count < min_turns:
+            filtered_count += 1
+            continue
+
+        # Extract messages
+        messages = []
+        for msg in conv_data:
+            role = msg.get('role', '')
+            content = msg.get('content', '').strip()
+
+            if role in ('user', 'assistant') and content:
+                messages.append({"role": role, "content": content})
+
+        # Validate conversation structure
+        if len(messages) < min_turns * 2 - 1:  # At least min_turns user messages
+            filtered_count += 1
+            continue
+
+        # Ensure conversation starts with user
+        if messages and messages[0]['role'] != 'user':
+            messages = messages[1:]
+
+        # Ensure alternating user/assistant pattern
+        valid_messages = []
+        expected_role = 'user'
+        for msg in messages:
+            if msg['role'] == expected_role:
+                valid_messages.append(msg)
+                expected_role = 'assistant' if expected_role == 'user' else 'user'
+
+        # Need at least min_turns complete rounds (user + assistant)
+        if len(valid_messages) < min_turns * 2:
+            filtered_count += 1
+            continue
+
+        conv_id = item.get('conversation_hash', f"conv_{len(conversations)}")
+        conversations.append({
+            "id": conv_id,
+            "messages": valid_messages
+        })
+
+        # Progress indicator
+        if len(conversations) % 100 == 0:
+            print(f"  Loaded {len(conversations)} conversations "
+                  f"(processed {processed_count}, filtered {filtered_count})")
+
+    print(f"Loaded {len(conversations)} conversations from WildChat-1M")
+    print(f"  Processed: {processed_count}, Filtered (turns < {min_turns}): {filtered_count}")
+
+    if conversations:
+        turn_counts = [len(c['messages']) for c in conversations]
+        print(f"  Average turns per conversation: {np.mean(turn_counts):.1f}")
+        print(f"  Turn range: [{np.min(turn_counts)}, {np.max(turn_counts)}]")
+
+        # Calculate token statistics if tokenizer provided
+        if tokenizer:
+            total_tokens = []
+            for conv in conversations[:100]:  # Sample first 100
+                tokens = sum(len(tokenizer.encode(m['content'])) for m in conv['messages'])
+                total_tokens.append(tokens)
+            print(f"  Avg tokens per conversation (sample): {np.mean(total_tokens):.1f}")
+
+    return conversations
 
 
 def apply_chat_template(

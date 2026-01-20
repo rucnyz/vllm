@@ -27,6 +27,16 @@ Usage:
         --min-output-len 800 \
         --output ./pd_exp/outputs/numina_math_long.jsonl
 
+    # LongBench-v2 dataset (prefill-heavy, long context)
+    # Use --min-input-len and --max-input-len to filter input length
+    python pd_exp/export_dataset.py \
+        --dataset longbench \
+        --model Qwen/Qwen3-8B \
+        --num-samples 4000 \
+        --min-input-len 1000 \
+        --max-input-len 4000 \
+        --output ./pd_exp/outputs/longbench_prefill.jsonl
+
 Then use with vllm bench serve:
     vllm bench serve \
         --dataset-name custom \
@@ -63,7 +73,7 @@ def main():
         description='Export dataset to JSONL for vllm bench serve')
 
     parser.add_argument('--dataset', type=str, default='alpaca',
-                        choices=['alpaca', 'sharegpt', 'lmsys', 'processbench', 'numina_math'],
+                        choices=['alpaca', 'sharegpt', 'lmsys', 'processbench', 'numina_math', 'longbench'],
                         help='Dataset to export')
     parser.add_argument('--model', type=str, default='Qwen/Qwen3-8B',
                         help='Model for tokenizer (used for chat template)')
@@ -85,6 +95,11 @@ def main():
     # NuminaMath specific options
     parser.add_argument('--min-output-len', type=int, default=0,
                         help='Minimum output length filter (for numina_math, use 800+ for decode-heavy)')
+    # LongBench specific options
+    parser.add_argument('--min-input-len', type=int, default=1000,
+                        help='Minimum input length filter (for longbench, prefill-heavy)')
+    parser.add_argument('--max-input-len', type=int, default=4000,
+                        help='Maximum input length filter (for longbench)')
 
     args = parser.parse_args()
 
@@ -122,6 +137,13 @@ def main():
             tokenizer=tokenizer,
             min_output_len=args.min_output_len,
             step_by_step=not args.no_step_by_step,
+        )
+    elif args.dataset == 'longbench':
+        prompts, input_lengths, output_lengths = load_longbench_prompts(
+            max_samples=args.num_samples,
+            tokenizer=tokenizer,
+            min_input_len=args.min_input_len,
+            max_input_len=args.max_input_len,
         )
 
     # Optionally apply chat template
