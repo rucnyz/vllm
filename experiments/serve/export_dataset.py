@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Export datasets to CSV format for use with vllm bench serve.
+Export datasets to JSONL format for use with vllm bench serve.
 
 Usage:
     python experiments/serve/export_dataset.py \
         --dataset alpaca \
         --model Qwen/Qwen3-8B \
         --num-samples 1000 \
-        --output ./experiments/serve/alpaca_prompts.csv
+        --output ./experiments/serve/alpaca_prompts.jsonl
 
 Then use with vllm bench serve:
     vllm bench serve \
-        --dataset-path ./experiments/serve/alpaca_prompts.csv \
-        --dataset-prompt-column "prompt" \
+        --dataset-name custom \
+        --dataset-path ./experiments/serve/alpaca_prompts.jsonl \
+        --custom-output-len 256 \
         ...
 """
 
 import argparse
-import csv
+import json
 import os
 import sys
 
@@ -87,21 +88,33 @@ def main():
             enable_thinking=not args.disable_thinking
         )
 
-    # Export to CSV
+    # Export to JSONL (required by vllm CustomDataset)
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
 
-    print(f"Exporting {len(prompts)} prompts to {args.output}...")
-    with open(args.output, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['prompt', 'input_len', 'output_len'])
+    # Ensure output file ends with .jsonl
+    output_path = args.output
+    if not output_path.endswith('.jsonl'):
+        output_path = output_path.rsplit('.', 1)[0] + '.jsonl'
+        print(f"Note: Changed output extension to .jsonl (required by vllm)")
+
+    print(f"Exporting {len(prompts)} prompts to {output_path}...")
+    with open(output_path, 'w', encoding='utf-8') as f:
         for prompt, input_len, output_len in zip(prompts, input_lengths, output_lengths):
-            writer.writerow([prompt, input_len, output_len])
+            record = {"prompt": prompt, "input_len": input_len, "output_len": output_len}
+            f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+    # Calculate statistics
+    avg_input = sum(input_lengths) / len(input_lengths)
+    avg_output = sum(output_lengths) / len(output_lengths)
 
     print(f"Done! Exported {len(prompts)} prompts")
+    print(f"  Average input length: {avg_input:.1f} tokens")
+    print(f"  Average output length: {avg_output:.1f} tokens")
     print(f"\nUsage with vllm bench serve:")
     print(f"  vllm bench serve \\")
-    print(f"      --dataset-path {args.output} \\")
-    print(f"      --dataset-prompt-column prompt \\")
+    print(f"      --dataset-name custom \\")
+    print(f"      --dataset-path {output_path} \\")
+    print(f"      --custom-output-len 256 \\")
     print(f"      ...")
 
 
