@@ -6,6 +6,29 @@
 纵轴: 运行中的请求数量
 颜色: phase 0 (prefill) = 红色, phase 1/2 (decode) = 蓝色
 竖线: phase 切换时刻
+
+Usage:
+    # 基本用法 - 绘制完整时间线
+    python plot_schedule_gantt.py stats.json
+
+    # 显示 k 值 (在 phase 1 区间)
+    python plot_schedule_gantt.py stats.json --show-k
+
+    # 列出所有可用的 cycle
+    python plot_schedule_gantt.py stats.json --list-cycles
+
+    # 绘制特定 cycle 的放大图
+    python plot_schedule_gantt.py stats.json --cycle 0
+
+    # 组合: 绘制 cycle 0 并显示 k 值
+    python plot_schedule_gantt.py stats.json -c 0 -k -o cycle0.png
+
+Output:
+    - 红色点: Phase 0/2 (Prefill)
+    - 蓝色点: Phase 1 (Decode)
+    - 绿色虚线: Phase 切换 (-> Decode)
+    - 橙色虚线: Phase 切换 (-> Prefill)
+    - k=N 标注: Decode 阶段的 k 值 (需 --show-k)
 """
 
 import json
