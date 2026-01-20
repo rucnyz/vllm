@@ -74,6 +74,7 @@ NUM_WARMUP_REQUESTS=${NUM_WARMUP_REQUESTS:-20}
 K_RATIO=${K_RATIO:-0.8}
 BASE_PORT=${BASE_PORT:-10000}
 CUSTOM_OUTPUT_LEN=${CUSTOM_OUTPUT_LEN:-4000}
+ENABLE_THINKING=${ENABLE_THINKING:-true}  # 控制 Qwen3 thinking 模式
 
 # 硬件校准文件 (必须)
 if [ -z "${VLLM_PD_CALIBRATION_FILE:-}" ]; then
@@ -134,6 +135,7 @@ echo "  MODEL: $MODEL"
 echo "  NUM_PROMPTS: $NUM_PROMPTS"
 echo "  MAX_CONCURRENCY: $MAX_CONCURRENCY"
 echo "  CUSTOM_OUTPUT_LEN: $CUSTOM_OUTPUT_LEN"
+echo "  ENABLE_THINKING: $ENABLE_THINKING"
 echo "  K_RATIO (for pd_kratio): $K_RATIO"
 echo "  BS_VALUES: ${BS_VALUES[*]}"
 echo "  TB_VALUES: ${TB_VALUES[*]}"
@@ -166,6 +168,7 @@ cat > "${OUTPUT_DIR}/experiment_config.json" << EOF
     "num_prompts": ${NUM_PROMPTS},
     "max_concurrency": ${MAX_CONCURRENCY},
     "custom_output_len": ${CUSTOM_OUTPUT_LEN},
+    "enable_thinking": ${ENABLE_THINKING},
     "k_ratio": ${K_RATIO},
     "bs_values": [$(echo "${BS_VALUES[*]}" | sed 's/ /, /g')],
     "tb_values": [$(echo "${TB_VALUES[*]}" | sed 's/ /, /g')],
@@ -241,21 +244,31 @@ run_experiment() {
         return 1
     fi
 
-    # 运行 benchmark (使用 custom 数据集)
-    vllm bench serve \
-        --model "$MODEL" \
-        --base-url "http://localhost:${port}" \
-        --dataset-name custom \
-        --dataset-path "$DATASET_PATH" \
-        --custom-output-len "$CUSTOM_OUTPUT_LEN" \
-        --num-prompts "$NUM_PROMPTS" \
-        --num-warmups "$NUM_WARMUP_REQUESTS" \
-        --request-rate inf \
-        --max-concurrency "$MAX_CONCURRENCY" \
-        --save-result \
-        --save-detailed \
-        --result-dir "${result_dir}" \
-        --result-filename "bench_${scheduler}.json" >> "$log_file" 2>&1
+    # 构建 benchmark 命令
+    local bench_cmd=(
+        vllm bench serve
+        --model "$MODEL"
+        --base-url "http://localhost:${port}"
+        --dataset-name custom
+        --dataset-path "$DATASET_PATH"
+        --custom-output-len "$CUSTOM_OUTPUT_LEN"
+        --num-prompts "$NUM_PROMPTS"
+        --num-warmups "$NUM_WARMUP_REQUESTS"
+        --request-rate inf
+        --max-concurrency "$MAX_CONCURRENCY"
+        --save-result
+        --save-detailed
+        --result-dir "${result_dir}"
+        --result-filename "bench_${scheduler}.json"
+    )
+
+    # 如果关闭 thinking 模式，添加 extra-body 参数
+    if [ "$ENABLE_THINKING" = "false" ]; then
+        bench_cmd+=(--extra-body '{"chat_template_kwargs":{"enable_thinking":false}}')
+    fi
+
+    # 运行 benchmark
+    "${bench_cmd[@]}" >> "$log_file" 2>&1
     local bench_status=$?
 
     kill_server $server_pid $gpu_id
