@@ -77,14 +77,14 @@ python -m vllm.v1.core.sched.calibration \
 | kstar | `RUN_KSTAR=1` | 固定 k* 值 |
 | kratio | `RUN_KRATIO=1` | 固定 θ* (k* = θ* × N) |
 | ratio_auto | `RUN_RATIO_AUTO=1` | 动态 θ* (渐进公式计算) |
-| dynamic | `RUN_DYNAMIC=1` | 动态 k* (DP 算法) |
+| direct | `RUN_DIRECT=1` | 动态 k* (DP 算法) |
 
 ### 基本用法
 
 ```bash
 cd /scratch/pd_exp/aproj/vllm/pd_exp/syn
 
-# 默认运行 (baseline + ratio_auto + dynamic)
+# 默认运行 (baseline + ratio_auto + direct)
 ./run_kstar_sweep.sh [MAX_GPUS]
 
 # 指定 GPU 数量
@@ -94,21 +94,21 @@ cd /scratch/pd_exp/aproj/vllm/pd_exp/syn
 ### 运行特定模式组合
 
 ```bash
-# 只运行 baseline 和 dynamic
-RUN_BASELINE=1 RUN_KSTAR=0 RUN_KRATIO=0 RUN_RATIO_AUTO=0 RUN_DYNAMIC=1 \
+# 只运行 baseline 和 direct
+RUN_BASELINE=1 RUN_KSTAR=0 RUN_KRATIO=0 RUN_RATIO_AUTO=0 RUN_DIRECT=1 \
     ./run_kstar_sweep.sh 4
 
 # 只运行 ratio_auto
-RUN_BASELINE=0 RUN_KSTAR=0 RUN_KRATIO=0 RUN_RATIO_AUTO=1 RUN_DYNAMIC=0 \
+RUN_BASELINE=0 RUN_KSTAR=0 RUN_KRATIO=0 RUN_RATIO_AUTO=1 RUN_DIRECT=0 \
     ./run_kstar_sweep.sh 4
 
 # 只运行 kratio 模式 (需要指定 K_RATIO_VALUES)
-RUN_BASELINE=0 RUN_KSTAR=0 RUN_KRATIO=1 RUN_RATIO_AUTO=0 RUN_DYNAMIC=0 \
+RUN_BASELINE=0 RUN_KSTAR=0 RUN_KRATIO=1 RUN_RATIO_AUTO=0 RUN_DIRECT=0 \
     K_RATIO_VALUES="0.2 0.4 0.6 0.8" \
     ./run_kstar_sweep.sh 4
 
 # 运行所有模式
-RUN_BASELINE=1 RUN_KSTAR=1 RUN_KRATIO=1 RUN_RATIO_AUTO=1 RUN_DYNAMIC=1 \
+RUN_BASELINE=1 RUN_KSTAR=1 RUN_KRATIO=1 RUN_RATIO_AUTO=1 RUN_DIRECT=1 \
     K_STAR_VALUES="8 16 32 64" \
     K_RATIO_VALUES="0.2 0.4 0.6 0.8" \
     ./run_kstar_sweep.sh 4
@@ -157,7 +157,7 @@ GPUS="4,5" ./run_kstar_sweep.sh 2
 | `RUN_KSTAR` | 0 | 是否运行固定 k* |
 | `RUN_KRATIO` | 0 | 是否运行固定 θ* |
 | `RUN_RATIO_AUTO` | 1 | 是否运行动态 θ* |
-| `RUN_DYNAMIC` | 1 | 是否运行 dynamic |
+| `RUN_DIRECT` | 1 | 是否运行 direct |
 | `K_STAR_VALUES` | 8 16 32 64 128 | k* 扫描值 |
 | `K_RATIO_VALUES` | 0.1 0.2 ... 0.9 | θ* 扫描值 |
 | `GPUS` | 自动检测 | 指定 GPU 列表 |
@@ -173,13 +173,13 @@ outputs/kstar_sweep_<timestamp>/
     ├── logs/
     │   ├── baseline.log
     │   ├── ratio_auto.log
-    │   └── dynamic.log
+    │   └── direct.log
     ├── bench_baseline.json
     ├── bench_ratio_auto.json
-    ├── bench_dynamic.json
+    ├── bench_direct.json
     ├── baseline_stats.json
     ├── ratio_auto_stats.json
-    └── dynamic_stats.json
+    └── direct_stats.json
 ```
 
 ---
@@ -197,9 +197,9 @@ outputs/kstar_sweep_<timestamp>/
 | 调度器 | 说明 |
 |--------|------|
 | baseline | vLLM 默认调度器 |
-| pd_kratio | PD 调度器，固定 θ* |
+| pd_ratio | PD 调度器，固定 θ* |
 | pd_ratio_auto | PD 调度器，动态 θ* |
-| pd_dynamic | PD 调度器，动态 k* (DP) |
+| pd_direct | PD 调度器，动态 k* (DP) |
 
 ### 基本用法
 
@@ -222,7 +222,7 @@ NUM_PROMPTS=2000 \
 MAX_CONCURRENCY=1024 \
     ./run_grid_search.sh 4
 
-# 自定义 k_ratio (用于 pd_kratio)
+# 自定义 k_ratio (用于 pd_ratio)
 K_RATIO=0.6 ./run_grid_search.sh 4
 
 # 指定 GPU
@@ -250,13 +250,13 @@ outputs/grid_search_Con_2048_Prompts_4000/
         └── in128_out1024/
             ├── logs/
             │   ├── baseline.log
-            │   ├── pd_kratio.log
+            │   ├── pd_ratio.log
             │   ├── pd_ratio_auto.log
-            │   └── pd_dynamic.log
+            │   └── pd_direct.log
             ├── bench_baseline.json
-            ├── bench_pd_kratio.json
+            ├── bench_pd_ratio.json
             ├── bench_pd_ratio_auto.json
-            ├── bench_pd_dynamic.json
+            ├── bench_pd_direct.json
             └── *_stats.json
 ```
 
@@ -303,7 +303,7 @@ VLLM_PD_CALIBRATION_FILE=/path/to/calibration.json ./run_grid_search.sh 4
 
 对于 `run_kstar_sweep.sh`，使用环境变量控制:
 ```bash
-RUN_BASELINE=1 RUN_DYNAMIC=1 RUN_RATIO_AUTO=0 ./run_kstar_sweep.sh
+RUN_BASELINE=1 RUN_DIRECT=1 RUN_RATIO_AUTO=0 ./run_kstar_sweep.sh
 ```
 
 ### Q: 实验中断后如何继续?

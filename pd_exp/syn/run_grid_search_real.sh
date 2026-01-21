@@ -72,7 +72,7 @@ NUM_PROMPTS=${NUM_PROMPTS:-4000}
 MAX_CONCURRENCY=${MAX_CONCURRENCY:-2048}
 NUM_WARMUP_REQUESTS=${NUM_WARMUP_REQUESTS:-20}
 K_RATIO=${K_RATIO:-0.8}
-BASE_PORT=${BASE_PORT:-10000}
+BASE_PORT=${BASE_PORT:-3000}
 CUSTOM_OUTPUT_LEN=${CUSTOM_OUTPUT_LEN:-4000}
 ENABLE_THINKING=${ENABLE_THINKING:-true}  # 控制 Qwen3 thinking 模式
 
@@ -136,10 +136,10 @@ echo "  NUM_PROMPTS: $NUM_PROMPTS"
 echo "  MAX_CONCURRENCY: $MAX_CONCURRENCY"
 echo "  CUSTOM_OUTPUT_LEN: $CUSTOM_OUTPUT_LEN"
 echo "  ENABLE_THINKING: $ENABLE_THINKING"
-echo "  K_RATIO (for pd_kratio): $K_RATIO"
+echo "  K_RATIO (for pd_ratio): $K_RATIO"
 echo "  BS_VALUES: ${BS_VALUES[*]}"
 echo "  TB_VALUES: ${TB_VALUES[*]}"
-echo "  SCHEDULERS: baseline, pd_kratio (θ*=${K_RATIO}), pd_dynamic"
+echo "  SCHEDULERS: baseline, pd_ratio (θ*=${K_RATIO}), pd_direct"
 echo "  CALIBRATION_FILE: ${VLLM_PD_CALIBRATION_FILE:-"(未设置，使用默认参数)"}"
 echo ""
 
@@ -150,8 +150,8 @@ QUEUE_FILE="${OUTPUT_DIR}/experiment_queue.txt"
 for tb in "${TB_VALUES[@]}"; do
     for bs in "${BS_VALUES[@]}"; do
         echo "baseline|${bs}|${tb}" >> "$QUEUE_FILE"
-        echo "pd_kratio|${bs}|${tb}" >> "$QUEUE_FILE"
-        echo "pd_dynamic|${bs}|${tb}" >> "$QUEUE_FILE"
+        echo "pd_ratio|${bs}|${tb}" >> "$QUEUE_FILE"
+        echo "pd_direct|${bs}|${tb}" >> "$QUEUE_FILE"
     done
 done
 
@@ -172,11 +172,11 @@ cat > "${OUTPUT_DIR}/experiment_config.json" << EOF
     "k_ratio": ${K_RATIO},
     "bs_values": [$(echo "${BS_VALUES[*]}" | sed 's/ /, /g')],
     "tb_values": [$(echo "${TB_VALUES[*]}" | sed 's/ /, /g')],
-    "schedulers": ["baseline", "pd_kratio", "pd_dynamic"],
+    "schedulers": ["baseline", "pd_ratio", "pd_direct"],
     "scheduler_descriptions": {
         "baseline": "vLLM default scheduler",
-        "pd_kratio": "PD scheduler with fixed θ*=${K_RATIO} (manually specified)",
-        "pd_dynamic": "PD scheduler with dynamic k* (DP algorithm)"
+        "pd_ratio": "PD scheduler with ratio mode (θ*=${K_RATIO})",
+        "pd_direct": "PD scheduler with direct mode (auto k*)"
     },
     "calibration_file": "${VLLM_PD_CALIBRATION_FILE:-null}",
     "calibration_params": {
@@ -214,15 +214,15 @@ run_experiment() {
             export VLLM_USE_PD_SCHEDULER=0
             unset VLLM_PD_K_MODE VLLM_PD_K_STAR VLLM_PD_K_RATIO
             ;;
-        pd_kratio)
+        pd_ratio)
             export VLLM_USE_PD_SCHEDULER=1
             export VLLM_PD_K_MODE=ratio
             export VLLM_PD_K_RATIO=$K_RATIO
             unset VLLM_PD_K_STAR
             ;;
-        pd_dynamic)
+        pd_direct)
             export VLLM_USE_PD_SCHEDULER=1
-            export VLLM_PD_K_MODE=dynamic
+            export VLLM_PD_K_MODE=direct
             unset VLLM_PD_K_RATIO VLLM_PD_K_STAR
             ;;
     esac
@@ -262,9 +262,11 @@ run_experiment() {
         --result-filename "bench_${scheduler}.json"
     )
 
-    # 如果关闭 thinking 模式，需要使用 chat 端点并添加 extra-body 参数
-    # 注意: chat_template_kwargs 只对 /v1/chat/completions 端点有效
+    # 如果关闭 thinking 模式，需要使用 chat backend 并添加 extra-body 参数
+    # --backend openai-chat 会正确将 prompt 包装为 messages 格式
+    # --endpoint 必须同时指定为 /v1/chat/completions
     if [ "$ENABLE_THINKING" = "false" ]; then
+        bench_cmd+=(--backend openai-chat)
         bench_cmd+=(--endpoint /v1/chat/completions)
         bench_cmd+=(--extra-body '{"chat_template_kwargs":{"enable_thinking":false}}')
     fi

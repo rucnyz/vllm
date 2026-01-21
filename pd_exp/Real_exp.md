@@ -80,7 +80,7 @@ python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_longbench_pr
 
 ## WildChat (Prefix Cache Testing)
 
-多轮对话场景，用于测试 prefix cache 效果。对比 baseline、pd_kratio、pd_dynamic 三种 scheduler。
+多轮对话场景，用于测试 prefix cache 效果。对比 baseline、pd_ratio、pd_direct 三种 scheduler。
 
 ```bash
 # 导出多轮对话数据 (筛选至少 8 轮的对话)
@@ -110,7 +110,7 @@ BS_VALUES="512 1024" TB_VALUES="8192 16384" \
 - `NUM_CLIENTS`: 并发客户端数 (默认 8)
 - `MAX_TURNS`: 每个对话最多执行的轮数 (默认 10)
 - `LIMIT_MAX_TOKENS`: 每轮最大输出 token 数 (默认 256)
-- `K_RATIO`: pd_kratio scheduler 的 θ* 值 (默认 0.8)
+- `K_RATIO`: pd_ratio scheduler 的 θ* 值 (默认 0.8)
 - `BS_VALUES`: 测试的 batch size 列表 (默认 "256 512 1024")
 - `TB_VALUES`: 测试的 max_num_batched_tokens 列表 (默认 "8192 16384")
 
@@ -123,8 +123,8 @@ BS_VALUES="512 1024" TB_VALUES="8192 16384" \
 
 每个 (TB, BS) 配置会测试三种 scheduler:
 - **baseline**: vLLM 默认调度器
-- **pd_kratio**: PD scheduler，固定 θ*=K_RATIO
-- **pd_dynamic**: PD scheduler，动态 k* (DP 算法)
+- **pd_ratio**: PD scheduler，固定 θ*=K_RATIO
+- **pd_direct**: PD scheduler，direct 模式 (自动 k*)
 
 ### Prefix Cache 工作原理
 

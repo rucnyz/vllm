@@ -77,7 +77,7 @@ def analyze_directory(result_dir: str) -> pd.DataFrame:
             bs = int(bs_match.group(1))
 
             # Find scheduler results
-            for scheduler in ['baseline', 'pd_kratio', 'pd_dynamic']:
+            for scheduler in ['baseline', 'pd_ratio', 'pd_direct']:
                 metrics_file = bs_dir / f'{scheduler}_metrics.txt'
                 results_file = bs_dir / f'{scheduler}_results.json'
                 bench_log = bs_dir / 'logs' / f'{scheduler}_bench.log'
@@ -135,7 +135,7 @@ def print_comparison(df: pd.DataFrame):
             pivot = pivot.to_frame().T
 
         # Reorder schedulers
-        scheduler_order = ['baseline', 'pd_kratio', 'pd_dynamic']
+        scheduler_order = ['baseline', 'pd_ratio', 'pd_direct']
         pivot = pivot.reindex([s for s in scheduler_order if s in pivot.index])
 
         print(pivot.to_string())
@@ -144,7 +144,7 @@ def print_comparison(df: pd.DataFrame):
         if 'baseline' in group['scheduler'].values:
             baseline = group[group['scheduler'] == 'baseline'].iloc[0]
             print("\nImprovement over baseline:")
-            for scheduler in ['pd_kratio', 'pd_dynamic']:
+            for scheduler in ['pd_ratio', 'pd_direct']:
                 if scheduler in group['scheduler'].values:
                     row = group[group['scheduler'] == scheduler].iloc[0]
                     improvements = []

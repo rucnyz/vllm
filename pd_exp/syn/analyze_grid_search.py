@@ -94,11 +94,25 @@ def collect_grid_results(exp_dir: Path) -> Dict:
             bs = int(bs_dir.name[2:])
             bs_values.add(bs)
 
-            for scenario_dir in sorted(bs_dir.iterdir()):
-                if not scenario_dir.is_dir():
-                    continue
+            # 文件名映射: scheduler_name -> file_suffix
+            scheduler_file_map = {
+                "baseline": "baseline",
+                "pd_ratio": "pd_ratio",          # PD with fixed θ*
+                "pd_ratio_auto": "pd_ratio_auto",  # PD with dynamic θ*
+                "pd_direct": "pd_direct",        # PD with dynamic k* (DP algorithm)
+                "pd": "pd",                        # Legacy: for backward compatibility
+                "v0": "default_v0",                # bench_default_v0.json
+                "v0_chunked": "default_v0_chunked",  # bench_default_v0_chunked.json
+            }
 
-                scenario = scenario_dir.name
+            # 检查是否有直接在 bs_dir 下的 bench_*.json 文件（真实数据集格式）
+            # 或者在子目录中（合成数据集格式）
+            direct_bench_files = list(bs_dir.glob("bench_*.json"))
+
+            if direct_bench_files:
+                # 真实数据集格式: tb{TB}/bs{BS}/bench_*.json
+                # 使用 "default" 作为默认 scenario 名称
+                scenario = "default"
                 scenarios.add(scenario)
 
                 if scenario not in results:
@@ -108,22 +122,35 @@ def collect_grid_results(exp_dir: Path) -> Dict:
                 if key not in results[scenario]:
                     results[scenario][key] = {}
 
-                # 加载 baseline, pd_kratio, pd_ratio_auto, pd_dynamic, v0, v0_chunked 结果
-                # 文件名映射: scheduler_name -> file_suffix
-                scheduler_file_map = {
-                    "baseline": "baseline",
-                    "pd_kratio": "pd_kratio",          # PD with fixed θ*
-                    "pd_ratio_auto": "pd_ratio_auto",  # PD with dynamic θ*
-                    "pd_dynamic": "pd_dynamic",        # PD with dynamic k* (DP algorithm)
-                    "pd": "pd",                        # Legacy: for backward compatibility
-                    "v0": "default_v0",                # bench_default_v0.json
-                    "v0_chunked": "default_v0_chunked",  # bench_default_v0_chunked.json
-                }
                 for scheduler, file_suffix in scheduler_file_map.items():
-                    bench_file = scenario_dir / f"bench_{file_suffix}.json"
+                    bench_file = bs_dir / f"bench_{file_suffix}.json"
                     bench_result = load_bench_result(bench_file)
                     if bench_result:
                         results[scenario][key][scheduler] = extract_metrics(bench_result)
+            else:
+                # 合成数据集格式: tb{TB}/bs{BS}/{scenario}/bench_*.json
+                for scenario_dir in sorted(bs_dir.iterdir()):
+                    if not scenario_dir.is_dir():
+                        continue
+
+                    scenario = scenario_dir.name
+                    # 跳过 logs 目录和其他非 scenario 目录
+                    if scenario in ("logs", "__pycache__"):
+                        continue
+                    scenarios.add(scenario)
+
+                    if scenario not in results:
+                        results[scenario] = {}
+
+                    key = (tb, bs)
+                    if key not in results[scenario]:
+                        results[scenario][key] = {}
+
+                    for scheduler, file_suffix in scheduler_file_map.items():
+                        bench_file = scenario_dir / f"bench_{file_suffix}.json"
+                        bench_result = load_bench_result(bench_file)
+                        if bench_result:
+                            results[scenario][key][scheduler] = extract_metrics(bench_result)
 
     return {
         "tb_values": sorted(tb_values),
@@ -138,7 +165,7 @@ def find_optimal_configs(data: Dict) -> Dict:
     optimal = {}
 
     # 所有支持的调度器
-    all_schedulers = ["baseline", "pd_kratio", "pd_ratio_auto", "pd_dynamic", "pd", "v0", "v0_chunked"]
+    all_schedulers = ["baseline", "pd_ratio", "pd_ratio_auto", "pd_direct", "pd", "v0", "v0_chunked"]
 
     for scenario in data["scenarios"]:
         optimal[scenario] = {}
@@ -281,9 +308,9 @@ def plot_optimal_comparison(optimal: Dict, output_dir: Path):
         ("v0", '#e74c3c', 'V0'),
         ("v0_chunked", '#e67e22', 'V0+Chunk'),
         ("baseline", '#2ecc71', 'Baseline'),
-        ("pd_kratio", '#3498db', 'PD (θ*)'),       # Fixed θ* mode
-        ("pd_ratio_auto", '#9b59b6', 'PD (θ* auto)'),  # Dynamic θ* mode
-        ("pd_dynamic", '#1abc9c', 'PD (DP)'),     # Dynamic k* mode
+        ("pd_ratio", '#3498db', 'PD (ratio)'),    # Ratio mode (k* = θ* × N)
+        ("pd_ratio_auto", '#9b59b6', 'PD (ratio auto)'),  # Ratio mode with auto θ*
+        ("pd_direct", '#1abc9c', 'PD (direct)'), # Direct mode (auto k*)
         ("pd", '#5dade2', 'PD'),                   # Legacy
     ]
 
@@ -363,7 +390,7 @@ def plot_optimal_comparison(optimal: Dict, output_dir: Path):
 
 
 def generate_report(data: Dict, optimal: Dict) -> str:
-    """生成文本分析报告，支持 v0, v0_chunked, baseline, pd_kratio, pd_ratio_auto, pd_dynamic 等调度器"""
+    """生成文本分析报告，支持 v0, v0_chunked, baseline, pd_ratio, pd_ratio_auto, pd_direct 等调度器"""
     lines = []
     lines.append("=" * 80)
     lines.append("TB × BS 网格搜索分析报告")
@@ -379,9 +406,9 @@ def generate_report(data: Dict, optimal: Dict) -> str:
         ("v0", "V0"),
         ("v0_chunked", "V0+Chunk"),
         ("baseline", "Baseline"),
-        ("pd_kratio", "PD (θ*)"),
-        ("pd_ratio_auto", "PD (θ* auto)"),
-        ("pd_dynamic", "PD (DP)"),
+        ("pd_ratio", "PD (ratio)"),
+        ("pd_ratio_auto", "PD (ratio auto)"),
+        ("pd_direct", "PD (direct)"),
         ("pd", "PD (legacy)"),
     ]
 
@@ -408,20 +435,20 @@ def generate_report(data: Dict, optimal: Dict) -> str:
             baseline_opt = optimal[scenario].get("baseline", {})
             v0_opt = optimal[scenario].get("v0", {})
             # 获取 PD 变体用于对比
-            pd_dynamic_opt = optimal[scenario].get("pd_dynamic", {})
-            pd_kratio_opt = optimal[scenario].get("pd_kratio", {})
+            pd_direct_opt = optimal[scenario].get("pd_direct", {})
+            pd_ratio_opt = optimal[scenario].get("pd_ratio", {})
 
             # 对比关键指标
             header = f"{'Metric':<25}"
             for key, display_name, opt in available:
                 header += f" {display_name:<15}"
             # 添加两列对比
-            if baseline_opt and pd_dynamic_opt:
-                header += f" {'PD(DP) vs Base':<15}"
-            if baseline_opt and pd_kratio_opt:
-                header += f" {'PD(θ*) vs Base':<15}"
+            if baseline_opt and pd_direct_opt:
+                header += f" {'PD(dir) vs Base':<15}"
+            if baseline_opt and pd_ratio_opt:
+                header += f" {'PD(rat) vs Base':<15}"
             lines.append(header)
-            extra_cols = (1 if baseline_opt and pd_dynamic_opt else 0) + (1 if baseline_opt and pd_kratio_opt else 0)
+            extra_cols = (1 if baseline_opt and pd_direct_opt else 0) + (1 if baseline_opt and pd_ratio_opt else 0)
             lines.append("-" * (25 + 15 * len(available) + 15 * extra_cols))
 
             metrics_compare = [
@@ -441,9 +468,9 @@ def generate_report(data: Dict, optimal: Dict) -> str:
                     row += f" {val:<15.2f}"
 
                 # 计算 PD(DP) vs Baseline 改进
-                if baseline_opt and pd_dynamic_opt:
+                if baseline_opt and pd_direct_opt:
                     b_val = baseline_opt["metrics"].get(metric, 0)
-                    p_val = pd_dynamic_opt["metrics"].get(metric, 0)
+                    p_val = pd_direct_opt["metrics"].get(metric, 0)
                     if b_val > 0:
                         if higher_better:
                             improvement = (p_val - b_val) / b_val * 100
@@ -455,9 +482,9 @@ def generate_report(data: Dict, optimal: Dict) -> str:
                     row += f" {imp_str:<15}"
 
                 # 计算 PD(θ*) vs Baseline 改进
-                if baseline_opt and pd_kratio_opt:
+                if baseline_opt and pd_ratio_opt:
                     b_val = baseline_opt["metrics"].get(metric, 0)
-                    p_val = pd_kratio_opt["metrics"].get(metric, 0)
+                    p_val = pd_ratio_opt["metrics"].get(metric, 0)
                     if b_val > 0:
                         if higher_better:
                             improvement = (p_val - b_val) / b_val * 100
@@ -487,18 +514,18 @@ def generate_report(data: Dict, optimal: Dict) -> str:
                     lines.append(f"  Baseline vs V0: {imp:+.2f}%")
 
             # 如果有 v0，显示 PD 相对 v0 的改进
-            if v0_opt and pd_dynamic_opt:
+            if v0_opt and pd_direct_opt:
                 v0_tp = v0_opt["metrics"].get("throughput", 0)
-                p_tp = pd_dynamic_opt["metrics"].get("throughput", 0)
+                p_tp = pd_direct_opt["metrics"].get("throughput", 0)
                 if v0_tp > 0:
                     imp = (p_tp - v0_tp) / v0_tp * 100
-                    lines.append(f"  PD(DP) vs V0: {imp:+.2f}%")
-            if v0_opt and pd_kratio_opt:
+                    lines.append(f"  PD(direct) vs V0: {imp:+.2f}%")
+            if v0_opt and pd_ratio_opt:
                 v0_tp = v0_opt["metrics"].get("throughput", 0)
-                p_tp = pd_kratio_opt["metrics"].get("throughput", 0)
+                p_tp = pd_ratio_opt["metrics"].get("throughput", 0)
                 if v0_tp > 0:
                     imp = (p_tp - v0_tp) / v0_tp * 100
-                    lines.append(f"  PD(θ*) vs V0: {imp:+.2f}%")
+                    lines.append(f"  PD(ratio) vs V0: {imp:+.2f}%")
 
         lines.append("")
 
@@ -508,11 +535,11 @@ def generate_report(data: Dict, optimal: Dict) -> str:
     lines.append("=" * 80)
 
     # 统计各调度器在各 scenario 下的胜出情况
-    # 调度器分组: baseline, PD variants (pd_kratio, pd_dynamic, pd_ratio_auto, pd)
+    # 调度器分组: baseline, PD variants (pd_ratio, pd_direct, pd_ratio_auto, pd)
     scheduler_groups = {
         "baseline": ["baseline"],
-        "pd_kratio": ["pd_kratio"],
-        "pd_dynamic": ["pd_dynamic"],
+        "pd_ratio": ["pd_ratio"],        # Ratio mode (k* = θ* × N)
+        "pd_direct": ["pd_direct"],      # Direct mode (auto k*)
         "pd_ratio_auto": ["pd_ratio_auto"],
         "v0": ["v0"],
         "v0_chunked": ["v0_chunked"],
@@ -554,7 +581,7 @@ def generate_report(data: Dict, optimal: Dict) -> str:
             lines.append(f"  {display_name}: {wins[key]}/{total} scenarios")
 
     # 汇总: Baseline vs 所有 PD 变体
-    pd_variants = ["pd_kratio", "pd_ratio_auto", "pd_dynamic", "pd"]
+    pd_variants = ["pd_ratio", "pd_ratio_auto", "pd_direct", "pd"]
     baseline_wins = wins.get("baseline", 0)
     pd_total_wins = sum(wins.get(v, 0) for v in pd_variants)
 

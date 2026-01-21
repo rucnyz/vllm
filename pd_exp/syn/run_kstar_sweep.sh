@@ -18,8 +18,8 @@
 #   RUN_BASELINE: 是否运行 baseline，默认 1
 #   RUN_KSTAR: 是否运行固定 K* 扫描 (需要 PD_MAX_BATCH_SIZE)，默认 0
 #   RUN_KRATIO: 是否运行 K ratio 扫描 (固定 θ*)，默认 0
-#   RUN_RATIO_AUTO: 是否运行 ratio 模式 (动态 θ*)，默认 1
-#   RUN_DYNAMIC: 是否运行 dynamic 模式，默认 1
+#   RUN_RATIO_AUTO: 是否运行 ratio 模式 (动态 θ*)，默认 0
+#   RUN_DIRECT: 是否运行 direct 模式 (自动 k*)，默认 1
 #   SKIP_EXISTING: 跳过已有结果的测试 (检测 bench_*.json)，默认 0
 #   TOKEN_BUDGET_DEFAULT: Baseline 的 max_num_batched_tokens
 #   TOKEN_BUDGET_PD: P/D Scheduler 的 max_num_batched_tokens，默认 10752
@@ -82,7 +82,7 @@ RUN_BASELINE=${RUN_BASELINE:-1}    # 运行 baseline (默认调度器)
 RUN_KSTAR=${RUN_KSTAR:-0}          # 运行 K* 扫描 (固定 K* 模式)
 RUN_KRATIO=${RUN_KRATIO:-0}        # 运行 K ratio 扫描 (手动指定固定 θ*) - 默认关闭，可手动启用
 RUN_RATIO_AUTO=${RUN_RATIO_AUTO:-0}  # 运行 ratio_auto 模式 (自动计算 θ*) - 已禁用，渐近公式严重低估 k*
-RUN_DYNAMIC=${RUN_DYNAMIC:-1}      # 运行 dynamic 模式
+RUN_DIRECT=${RUN_DIRECT:-1}      # 运行 dynamic 模式
 SKIP_EXISTING=${SKIP_EXISTING:-0}  # 跳过已有结果 (检测 bench_*.json)
 
 # Warmup 配置
@@ -168,7 +168,7 @@ echo "  RUN_KSTAR: $RUN_KSTAR"
 echo "  RUN_KRATIO: $RUN_KRATIO"
 [ "$RUN_KRATIO" = "1" ] && echo "    K_RATIO_VALUES: ${K_RATIO_VALUES[*]}"
 echo "  RUN_RATIO_AUTO: $RUN_RATIO_AUTO"
-echo "  RUN_DYNAMIC: $RUN_DYNAMIC"
+echo "  RUN_DIRECT: $RUN_DIRECT"
 echo "  SKIP_EXISTING: $SKIP_EXISTING"
 echo "  CALIBRATION_FILE: ${VLLM_PD_CALIBRATION_FILE:-"(未设置，使用默认参数)"}"
 echo ""
@@ -206,9 +206,9 @@ for scenario in "${SCENARIOS[@]}"; do
         echo "ratio_auto|${input_len}|${output_len}" >> "$QUEUE_FILE"
     fi
 
-    # Dynamic 模式
-    if [ "$RUN_DYNAMIC" = "1" ]; then
-        echo "dynamic|${input_len}|${output_len}" >> "$QUEUE_FILE"
+    # Direct 模式 (自动计算 k*)
+    if [ "$RUN_DIRECT" = "1" ]; then
+        echo "direct|${input_len}|${output_len}" >> "$QUEUE_FILE"
     fi
 done
 
@@ -236,7 +236,7 @@ cat > "${OUTPUT_DIR}/experiment_config.json" << EOF
     "run_kstar": ${RUN_KSTAR},
     "run_kratio": ${RUN_KRATIO},
     "run_ratio_auto": ${RUN_RATIO_AUTO},
-    "run_dynamic": ${RUN_DYNAMIC},
+    "run_direct": ${RUN_DIRECT},
     "calibration_file": "${VLLM_PD_CALIBRATION_FILE:-null}",
     "calibration_params": {
         "alpha_p": ${ALPHA_P},
@@ -282,8 +282,8 @@ run_experiment() {
         ratio_auto)
             result_prefix="ratio_auto"
             ;;
-        dynamic)
-            result_prefix="dynamic"
+        direct)
+            result_prefix="direct"
             ;;
     esac
 
@@ -316,9 +316,9 @@ run_experiment() {
             [ -n "$TOKEN_BUDGET_DEFAULT" ] && serve_args="$serve_args --max-num-batched-tokens $TOKEN_BUDGET_DEFAULT"
             ;;
         kstar)
-            # 固定 k* 模式: k* = param
+            # Direct 模式 + 固定 k*: k* = param
             export VLLM_USE_PD_SCHEDULER=1
-            export VLLM_PD_K_MODE=fixed
+            export VLLM_PD_K_MODE=direct
             export VLLM_PD_K_STAR=$param
             unset VLLM_PD_K_RATIO
             serve_args="$serve_args --max-num-seqs $PD_MAX_BATCH_SIZE --max-num-batched-tokens $TOKEN_BUDGET_PD"
@@ -338,10 +338,10 @@ run_experiment() {
             unset VLLM_PD_K_RATIO VLLM_PD_K_STAR
             serve_args="$serve_args --max-num-seqs $PD_MAX_NUM_SEQS --max-num-batched-tokens $TOKEN_BUDGET_PD"
             ;;
-        dynamic)
-            # Dynamic 模式: 每次调度动态计算 k*
+        direct)
+            # Direct 模式: 自动计算 k*
             export VLLM_USE_PD_SCHEDULER=1
-            export VLLM_PD_K_MODE=dynamic
+            export VLLM_PD_K_MODE=direct
             unset VLLM_PD_K_RATIO VLLM_PD_K_STAR
             serve_args="$serve_args --max-num-seqs $PD_MAX_NUM_SEQS --max-num-batched-tokens $TOKEN_BUDGET_PD"
             ;;

@@ -87,11 +87,11 @@ echo "实验配置:"
 echo "  MODEL: $MODEL"
 echo "  NUM_PROMPTS: $NUM_PROMPTS"
 echo "  MAX_CONCURRENCY: $MAX_CONCURRENCY"
-echo "  K_RATIO (for pd_kratio): $K_RATIO"
+echo "  K_RATIO (for pd_ratio): $K_RATIO"
 echo "  BS_VALUES: ${BS_VALUES[*]}"
 echo "  TB_VALUES: ${TB_VALUES[*]}"
 echo "  SCENARIOS: ${#SCENARIOS[@]} 个"
-echo "  SCHEDULERS: baseline, pd_kratio (θ*=${K_RATIO}), pd_dynamic"
+echo "  SCHEDULERS: baseline, pd_ratio (θ*=${K_RATIO}), pd_direct"
 echo "  CALIBRATION_FILE: ${VLLM_PD_CALIBRATION_FILE:-"(未设置，使用默认参数)"}"
 echo ""
 
@@ -104,9 +104,9 @@ for tb in "${TB_VALUES[@]}"; do
         for scenario in "${SCENARIOS[@]}"; do
             read -r input_len output_len <<< "$scenario"
             echo "baseline|${input_len}|${output_len}|${bs}|${tb}" >> "$QUEUE_FILE"
-            echo "pd_kratio|${input_len}|${output_len}|${bs}|${tb}" >> "$QUEUE_FILE"
+            echo "pd_ratio|${input_len}|${output_len}|${bs}|${tb}" >> "$QUEUE_FILE"
             # pd_ratio_auto 已禁用：渐近公式计算 θ* 不准确，严重低估 k*
-            echo "pd_dynamic|${input_len}|${output_len}|${bs}|${tb}" >> "$QUEUE_FILE"
+            echo "pd_direct|${input_len}|${output_len}|${bs}|${tb}" >> "$QUEUE_FILE"
         done
     done
 done
@@ -124,11 +124,11 @@ cat > "${OUTPUT_DIR}/experiment_config.json" << EOF
     "k_ratio": ${K_RATIO},
     "bs_values": [$(echo "${BS_VALUES[*]}" | sed 's/ /, /g')],
     "tb_values": [$(echo "${TB_VALUES[*]}" | sed 's/ /, /g')],
-    "schedulers": ["baseline", "pd_kratio", "pd_dynamic"],
+    "schedulers": ["baseline", "pd_ratio", "pd_direct"],
     "scheduler_descriptions": {
         "baseline": "vLLM default scheduler",
-        "pd_kratio": "PD scheduler with fixed θ*=${K_RATIO} (manually specified)",
-        "pd_dynamic": "PD scheduler with dynamic k* (DP algorithm)"
+        "pd_ratio": "PD scheduler with ratio mode (θ*=${K_RATIO})",
+        "pd_direct": "PD scheduler with direct mode (auto k*)"
     },
     "disabled_schedulers": {
         "pd_ratio_auto": "Dynamic θ* mode - asymptotic formula severely underestimates k*"
@@ -171,7 +171,7 @@ run_experiment() {
             export VLLM_USE_PD_SCHEDULER=0
             unset VLLM_PD_K_MODE VLLM_PD_K_STAR VLLM_PD_K_RATIO
             ;;
-        pd_kratio)
+        pd_ratio)
             # PD 调度器 - 固定 θ* 模式
             export VLLM_USE_PD_SCHEDULER=1
             export VLLM_PD_K_MODE=ratio
@@ -184,10 +184,10 @@ run_experiment() {
             export VLLM_PD_K_MODE=ratio
             unset VLLM_PD_K_RATIO VLLM_PD_K_STAR
             ;;
-        pd_dynamic)
-            # PD 调度器 - Dynamic 模式
+        pd_direct)
+            # PD 调度器 - Direct 模式 (自动计算 k*)
             export VLLM_USE_PD_SCHEDULER=1
-            export VLLM_PD_K_MODE=dynamic
+            export VLLM_PD_K_MODE=direct
             unset VLLM_PD_K_RATIO VLLM_PD_K_STAR
             ;;
     esac
