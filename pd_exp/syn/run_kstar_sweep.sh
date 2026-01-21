@@ -93,7 +93,7 @@ TOKEN_BUDGET_DEFAULT=${TOKEN_BUDGET_DEFAULT:-}   # Baseline 使用
 TOKEN_BUDGET_PD=${TOKEN_BUDGET_PD:-16384}        # P/D Scheduler 使用
 
 # P/D Scheduler max_num_seqs 参数 (K Ratio 模式使用)
-PD_MAX_NUM_SEQS=${PD_MAX_NUM_SEQS:-1408}
+PD_MAX_NUM_SEQS=${PD_MAX_NUM_SEQS:-1024}
 
 # 硬件校准文件 (必须)
 # PD Scheduler 需要硬件校准参数才能准确调度

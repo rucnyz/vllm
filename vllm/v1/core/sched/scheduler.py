@@ -276,9 +276,9 @@ class Scheduler(SchedulerInterface):
 
             # Enable adaptive N: dynamically adjust batch size based on KV cache and workload
             # In ratio/dynamic mode, this allows N to be updated periodically along with k*
-            # Default: enabled (1)
+            # Default: disabled (0) to match fixed mode behavior
             self.pd_enable_adaptive_n = os.environ.get(
-                "VLLM_PD_ENABLE_ADAPTIVE_N", "1") == "1"
+                "VLLM_PD_ENABLE_ADAPTIVE_N", "0") == "1"
 
             # Workload parameter p: cold-start value assuming mean output length ~100
             # Will be replaced by actual measurement after first N requests complete
@@ -927,30 +927,33 @@ class Scheduler(SchedulerInterface):
             # instead of len(running)==0 to allow this.
             elif not has_decoding and has_waiting:
                 self._reset_pd_to_initial()
-            # RECOVERY: If N was reduced during cold start but queue is now full,
-            # restore N to adaptive value (not max) to prevent oversubscription
-            # Added cooldown check to prevent frequent N updates
-            elif (self.pd_batch_size_N < self._compute_adaptive_N()
-                  and waiting_count >= self.max_num_running_reqs // 2
-                  and (time.monotonic() - self.pd_last_n_update_time
-                       >= self.pd_n_update_cooldown)):
-                old_n = self.pd_batch_size_N
-                # Use adaptive N to account for learned avg output tokens
-                self.pd_batch_size_N = self._compute_adaptive_N()
-                # Also restore k* based on mode
-                if self.pd_k_mode == "ratio":
-                    self.pd_switch_threshold_k = self._compute_k_from_ratio()
-                elif self.pd_k_mode == "dynamic":
-                    self.pd_switch_threshold_k = self._compute_optimal_k()
-                # fixed mode: k* doesn't change
-                # Record N update time and trajectory
-                self.pd_last_n_update_time = time.monotonic()
-                self._record_n_update(old_n, self.pd_batch_size_N, "recovery")
-                logger.info(
-                    f"[P/D] N RECOVERY: {old_n} -> {self.pd_batch_size_N} "
-                    f"(queue filled, k*={self.pd_switch_threshold_k}, "
-                    f"avg_out={self.pd_avg_output_tokens:.1f})"
-                )
+            else:
+                # RECOVERY: If N was reduced during cold start but queue is now full,
+                # restore N to max value (or adaptive value if enabled)
+                # Added cooldown check to prevent frequent N updates
+                target_n = (self._compute_adaptive_N() if self.pd_enable_adaptive_n
+                            else self.max_num_running_reqs)
+                if (self.pd_batch_size_N < target_n
+                      and waiting_count >= self.max_num_running_reqs // 2
+                      and (time.monotonic() - self.pd_last_n_update_time
+                           >= self.pd_n_update_cooldown)):
+                    old_n = self.pd_batch_size_N
+                    # Use target N (adaptive or max based on setting)
+                    self.pd_batch_size_N = target_n
+                    # Also restore k* based on mode
+                    if self.pd_k_mode == "ratio":
+                        self.pd_switch_threshold_k = self._compute_k_from_ratio()
+                    elif self.pd_k_mode == "dynamic":
+                        self.pd_switch_threshold_k = self._compute_optimal_k()
+                    # fixed mode: k* doesn't change
+                    # Record N update time and trajectory
+                    self.pd_last_n_update_time = time.monotonic()
+                    self._record_n_update(old_n, self.pd_batch_size_N, "recovery")
+                    logger.info(
+                        f"[P/D] N RECOVERY: {old_n} -> {self.pd_batch_size_N} "
+                        f"(queue filled, k*={self.pd_switch_threshold_k}, "
+                        f"avg_out={self.pd_avg_output_tokens:.1f})"
+                    )
 
         elif self.pd_phase == 2:
             # Refill prefill -> decode when k prefilled OR no more waiting
@@ -1028,8 +1031,8 @@ class Scheduler(SchedulerInterface):
     def _reset_pd_to_initial(self) -> None:
         """Reset P/D scheduler to initial state with adaptive N."""
         old_n = self.pd_batch_size_N
-        # Use adaptive N if we have learned avg output tokens
-        if self.pd_avg_output_tokens_initialized:
+        # Use adaptive N only if enabled and we have learned avg output tokens
+        if self.pd_enable_adaptive_n and self.pd_avg_output_tokens_initialized:
             self.pd_batch_size_N = self._compute_adaptive_N()
         else:
             self.pd_batch_size_N = self.max_num_running_reqs

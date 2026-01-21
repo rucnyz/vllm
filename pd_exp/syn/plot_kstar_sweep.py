@@ -1184,30 +1184,37 @@ def plot_schedule_mode(k_star_results: dict, baseline_metrics: dict, dynamic_res
         plt.show()
 
     # Dynamic K* 轨迹图
+    # 合并 dynamic_results 和 special_results 中有 k_star_trajectory 的数据
+    trajectory_data = {}
     if dynamic_results:
-        trajectory_data = {
+        trajectory_data.update({
             name: metrics for name, metrics in dynamic_results.items()
             if metrics.get('k_star_trajectory')
-        }
-        if trajectory_data:
-            fig2, ax2 = plt.subplots(figsize=(12, 6))
-            for i, (name, metrics) in enumerate(trajectory_data.items()):
-                color = dynamic_colors[i % len(dynamic_colors)]
-                times = metrics['k_star_times']
-                k_values = metrics['k_star_trajectory']
-                ax2.plot(times, k_values, color=color, linewidth=1.5,
-                         alpha=0.8, label=f"Dynamic {name}")
-            ax2.set_xlabel('Time (s)', fontsize=12)
-            ax2.set_ylabel('K* Value', fontsize=12)
-            ax2.set_title('Dynamic K* Trajectory Over Time', fontsize=14)
-            ax2.legend(fontsize=10, loc='best')
-            ax2.grid(True, alpha=0.3)
-            plt.tight_layout()
-            trajectory_path = output_path.replace('.png', '_trajectory.png')
-            plt.savefig(trajectory_path, dpi=150, bbox_inches='tight')
-            print(f"K* trajectory plot saved to: {trajectory_path}")
-            if not no_show:
-                plt.show()
+        })
+    if special_results:
+        trajectory_data.update({
+            name: metrics for name, metrics in special_results.items()
+            if metrics.get('k_star_trajectory')
+        })
+    if trajectory_data:
+        fig2, ax2 = plt.subplots(figsize=(12, 6))
+        for i, (name, metrics) in enumerate(trajectory_data.items()):
+            color = dynamic_colors[i % len(dynamic_colors)]
+            times = metrics['k_star_times']
+            k_values = metrics['k_star_trajectory']
+            ax2.plot(times, k_values, color=color, linewidth=1.5,
+                     alpha=0.8, label=f"Dynamic {name}")
+        ax2.set_xlabel('Time (s)', fontsize=12)
+        ax2.set_ylabel('K* Value', fontsize=12)
+        ax2.set_title('Dynamic K* Trajectory Over Time', fontsize=14)
+        ax2.legend(fontsize=10, loc='best')
+        ax2.grid(True, alpha=0.3)
+        plt.tight_layout()
+        trajectory_path = output_path.replace('.png', '_trajectory.png')
+        plt.savefig(trajectory_path, dpi=150, bbox_inches='tight')
+        print(f"K* trajectory plot saved to: {trajectory_path}")
+        if not no_show:
+            plt.show()
 
     # 打印汇总表
     print("\n" + "=" * 120)
@@ -2770,6 +2777,42 @@ def main():
             print("Generating N trajectory plot...")
             print(f"{'=' * 50}")
             plot_n_trajectory(kratio_results_sched, output_path, args.no_show)
+
+        # 绘制 K* trajectory 图 (dynamic 和 special results)
+        dynamic_results = schedule_data[2]
+        special_results = schedule_data[4]
+        trajectory_data = {}
+        if dynamic_results:
+            trajectory_data.update({
+                name: metrics for name, metrics in dynamic_results.items()
+                if metrics.get('k_star_trajectory')
+            })
+        if special_results:
+            trajectory_data.update({
+                name: metrics for name, metrics in special_results.items()
+                if metrics.get('k_star_trajectory')
+            })
+        if trajectory_data:
+            import matplotlib.pyplot as plt
+            dynamic_colors = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00']
+            fig2, ax2 = plt.subplots(figsize=(12, 6))
+            for i, (name, metrics) in enumerate(trajectory_data.items()):
+                color = dynamic_colors[i % len(dynamic_colors)]
+                times = metrics['k_star_times']
+                k_values = metrics['k_star_trajectory']
+                ax2.plot(times, k_values, color=color, linewidth=1.5,
+                         alpha=0.8, label=f"Dynamic {name}")
+            ax2.set_xlabel('Time (s)', fontsize=12)
+            ax2.set_ylabel('K* Value', fontsize=12)
+            ax2.set_title('Dynamic K* Trajectory Over Time', fontsize=14)
+            ax2.legend(fontsize=10, loc='best')
+            ax2.grid(True, alpha=0.3)
+            plt.tight_layout()
+            trajectory_path = output_path.replace('.png', '_trajectory.png')
+            plt.savefig(trajectory_path, dpi=150, bbox_inches='tight')
+            print(f"K* trajectory plot saved to: {trajectory_path}")
+            if not args.no_show:
+                plt.show()
 
         return
 
