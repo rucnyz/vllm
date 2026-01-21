@@ -262,8 +262,10 @@ run_experiment() {
         --result-filename "bench_${scheduler}.json"
     )
 
-    # 如果关闭 thinking 模式，添加 extra-body 参数
+    # 如果关闭 thinking 模式，需要使用 chat 端点并添加 extra-body 参数
+    # 注意: chat_template_kwargs 只对 /v1/chat/completions 端点有效
     if [ "$ENABLE_THINKING" = "false" ]; then
+        bench_cmd+=(--endpoint /v1/chat/completions)
         bench_cmd+=(--extra-body '{"chat_template_kwargs":{"enable_thinking":false}}')
     fi
 
