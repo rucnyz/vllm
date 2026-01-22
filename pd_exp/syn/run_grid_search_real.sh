@@ -72,7 +72,7 @@ NUM_PROMPTS=${NUM_PROMPTS:-4000}
 MAX_CONCURRENCY=${MAX_CONCURRENCY:-2048}
 NUM_WARMUP_REQUESTS=${NUM_WARMUP_REQUESTS:-20}
 K_RATIO=${K_RATIO:-0.8}
-BASE_PORT=${BASE_PORT:-3000}
+BASE_PORT=${BASE_PORT:-11000}
 CUSTOM_OUTPUT_LEN=${CUSTOM_OUTPUT_LEN:-4000}
 ENABLE_THINKING=${ENABLE_THINKING:-true}  # 控制 Qwen3 thinking 模式
 
@@ -145,17 +145,22 @@ echo ""
 
 # 生成实验队列
 QUEUE_FILE="${OUTPUT_DIR}/experiment_queue.txt"
-> "$QUEUE_FILE"
+RESUME=${RESUME:-false}
 
-for tb in "${TB_VALUES[@]}"; do
-    for bs in "${BS_VALUES[@]}"; do
-        echo "baseline|${bs}|${tb}" >> "$QUEUE_FILE"
-        echo "pd_ratio|${bs}|${tb}" >> "$QUEUE_FILE"
-        echo "pd_direct|${bs}|${tb}" >> "$QUEUE_FILE"
+if [ "$RESUME" = "true" ] && [ -f "$QUEUE_FILE" ] && [ -s "$QUEUE_FILE" ]; then
+    echo "恢复模式: 使用现有队列文件 ($QUEUE_FILE)"
+    TOTAL_EXPERIMENTS=$(wc -l < "$QUEUE_FILE")
+else
+    > "$QUEUE_FILE"
+    for tb in "${TB_VALUES[@]}"; do
+        for bs in "${BS_VALUES[@]}"; do
+            echo "baseline|${bs}|${tb}" >> "$QUEUE_FILE"
+            echo "pd_ratio|${bs}|${tb}" >> "$QUEUE_FILE"
+            echo "pd_direct|${bs}|${tb}" >> "$QUEUE_FILE"
+        done
     done
-done
-
-TOTAL_EXPERIMENTS=$(wc -l < "$QUEUE_FILE")
+    TOTAL_EXPERIMENTS=$(wc -l < "$QUEUE_FILE")
+fi
 echo "总实验数: $TOTAL_EXPERIMENTS"
 echo ""
 
