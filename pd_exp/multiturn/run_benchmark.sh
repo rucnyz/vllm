@@ -71,7 +71,7 @@ DATASET_NAME=$(basename "$DATASET_PATH" .json)
 # 实验参数
 MODEL=${MODEL:-"Qwen/Qwen3-8B"}
 NUM_CLIENTS=${NUM_CLIENTS:-8}
-MAX_TURNS=${MAX_TURNS:-10}
+MAX_TURNS=${MAX_TURNS:-12}
 LIMIT_MAX_TOKENS=${LIMIT_MAX_TOKENS:-256}
 REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-120}
 BASE_PORT=${BASE_PORT:-10000}
@@ -112,8 +112,8 @@ else
 fi
 
 # 网格搜索参数
-BS_VALUES=(${BS_VALUES:-256 512 1024})
-TB_VALUES=(${TB_VALUES:-8192 16384})
+BS_VALUES=(${BS_VALUES:-256 512 1024 1536 2048})
+TB_VALUES=(${TB_VALUES:-4096 8192 10240 14336 16384 18432})
 
 # 输出目录
 OUTPUT_DIR="${SCRIPT_DIR}/../outputs/multiturn_${DATASET_NAME}_Clients_${NUM_CLIENTS}_MaxTurns_${MAX_TURNS}"
@@ -145,17 +145,23 @@ echo ""
 
 # 生成实验队列
 QUEUE_FILE="${OUTPUT_DIR}/experiment_queue.txt"
-> "$QUEUE_FILE"
+RESUME=${RESUME:-false}
 
-for tb in "${TB_VALUES[@]}"; do
-    for bs in "${BS_VALUES[@]}"; do
-        echo "baseline|${bs}|${tb}" >> "$QUEUE_FILE"
-        echo "pd_ratio|${bs}|${tb}" >> "$QUEUE_FILE"
-        echo "pd_direct|${bs}|${tb}" >> "$QUEUE_FILE"
+if [ "$RESUME" = "true" ] && [ -f "$QUEUE_FILE" ] && [ -s "$QUEUE_FILE" ]; then
+    echo "恢复模式: 使用现有队列文件 ($QUEUE_FILE)"
+    TOTAL_EXPERIMENTS=$(wc -l < "$QUEUE_FILE")
+else
+    > "$QUEUE_FILE"
+    for tb in "${TB_VALUES[@]}"; do
+        for bs in "${BS_VALUES[@]}"; do
+            echo "baseline|${bs}|${tb}" >> "$QUEUE_FILE"
+            echo "pd_ratio|${bs}|${tb}" >> "$QUEUE_FILE"
+            echo "pd_direct|${bs}|${tb}" >> "$QUEUE_FILE"
+        done
     done
-done
+    TOTAL_EXPERIMENTS=$(wc -l < "$QUEUE_FILE")
+fi
 
-TOTAL_EXPERIMENTS=$(wc -l < "$QUEUE_FILE")
 echo "总实验数: $TOTAL_EXPERIMENTS"
 echo ""
 
@@ -191,6 +197,110 @@ cat > "${OUTPUT_DIR}/experiment_config.json" << EOF
 }
 EOF
 
+# Python 脚本: 从 benchmark 输出中提取并保存 metrics
+extract_metrics_script() {
+    cat << 'PYTHON_SCRIPT'
+import sys
+import json
+import re
+from pathlib import Path
+
+def extract_metrics(bench_log_path, output_path, duration_sec):
+    """从 benchmark 日志中提取 metrics 并保存为 JSON"""
+    metrics = {}
+
+    with open(bench_log_path, 'r') as f:
+        content = f.read()
+
+    # 解析 pandas describe() 输出
+    # 格式: metric_name  count  mean  std  min  25%  50%  75%  90%  99%  max
+    lines = content.strip().split('\n')
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 3:
+            metric_name = parts[0]
+            if metric_name in ['ttft_ms', 'tpot_ms', 'latency_ms',
+                               'input_num_tokens', 'output_num_tokens',
+                               'input_num_turns', 'output_num_chunks']:
+                try:
+                    # count=1, mean=2, std=3, min=4, 25%=5, 50%=6, 75%=7, 90%=8, 99%=9, max=10
+                    count = float(parts[1])
+                    mean = float(parts[2])
+                    std = float(parts[3]) if len(parts) > 3 else 0
+                    min_val = float(parts[4]) if len(parts) > 4 else mean
+                    p50 = float(parts[6]) if len(parts) > 6 else mean
+                    p99 = float(parts[9]) if len(parts) > 9 else mean
+                    max_val = float(parts[10]) if len(parts) > 10 else mean
+
+                    metrics[f'mean_{metric_name}'] = mean
+                    metrics[f'std_{metric_name}'] = std
+                    metrics[f'min_{metric_name}'] = min_val
+                    metrics[f'median_{metric_name}'] = p50
+                    metrics[f'p99_{metric_name}'] = p99
+                    metrics[f'max_{metric_name}'] = max_val
+                    metrics[f'count_{metric_name}'] = count
+                except (ValueError, IndexError):
+                    pass
+
+    # 计算 throughput
+    if 'count_latency_ms' in metrics and duration_sec > 0:
+        completed = metrics['count_latency_ms']
+        metrics['request_throughput'] = completed / duration_sec
+
+        if 'mean_output_num_tokens' in metrics:
+            total_output_tokens = completed * metrics['mean_output_num_tokens']
+            metrics['output_throughput'] = total_output_tokens / duration_sec
+
+    # 重命名以匹配 vllm bench serve 格式
+    rename_map = {
+        'mean_ttft_ms': 'mean_ttft_ms',
+        'median_ttft_ms': 'median_ttft_ms',
+        'p99_ttft_ms': 'p99_ttft_ms',
+        'mean_tpot_ms': 'mean_tpot_ms',
+        'median_tpot_ms': 'median_tpot_ms',
+        'p99_tpot_ms': 'p99_tpot_ms',
+        'mean_latency_ms': 'mean_e2e_latency_ms',
+        'median_latency_ms': 'median_e2e_latency_ms',
+        'p99_latency_ms': 'p99_e2e_latency_ms',
+    }
+
+    result = {}
+    for old_key, new_key in rename_map.items():
+        if old_key in metrics:
+            result[new_key] = metrics[old_key]
+
+    # 添加 throughput
+    if 'request_throughput' in metrics:
+        result['request_throughput'] = metrics['request_throughput']
+    if 'output_throughput' in metrics:
+        result['output_throughput'] = metrics['output_throughput']
+
+    # 添加其他有用的 metrics
+    for key in ['mean_input_num_tokens', 'mean_output_num_tokens',
+                'mean_input_num_turns', 'count_latency_ms']:
+        if key in metrics:
+            result[key] = metrics[key]
+
+    # 保存
+    with open(output_path, 'w') as f:
+        json.dump(result, f, indent=2)
+
+    return result
+
+if __name__ == '__main__':
+    if len(sys.argv) < 4:
+        print("Usage: extract_metrics.py <bench_log> <output_json> <duration_sec>")
+        sys.exit(1)
+
+    bench_log = sys.argv[1]
+    output_json = sys.argv[2]
+    duration_sec = float(sys.argv[3])
+
+    result = extract_metrics(bench_log, output_json, duration_sec)
+    print(f"Saved metrics to {output_json}: throughput={result.get('request_throughput', 0):.2f} req/s")
+PYTHON_SCRIPT
+}
+
 # 运行单个实验
 run_experiment() {
     local gpu_id=$1 scheduler=$2 bs=$3 tb=$4
@@ -209,6 +319,7 @@ run_experiment() {
 
     # 设置环境变量
     export CUDA_VISIBLE_DEVICES=$gpu_id
+    export VLLM_COLLECT_SCHEDULE_STATS=1
 
     case "$scheduler" in
         baseline)
@@ -231,6 +342,7 @@ run_experiment() {
     wait_for_gpu_memory $gpu_id 60 || return 1
 
     # 启动服务
+    VLLM_SCHEDULE_STATS_FILE="${result_dir}/${scheduler}_stats.json" \
     vllm serve "$MODEL" \
         --port "$port" \
         --gpu-memory-utilization 0.9 \
@@ -244,6 +356,9 @@ run_experiment() {
         return 1
     fi
 
+    # 记录开始时间
+    local start_time=$(date +%s.%N)
+
     # 运行多轮对话 benchmark
     python benchmarks/multi_turn/benchmark_serving_multi_turn_threaded.py \
         --input-file "$DATASET_PATH" \
@@ -251,16 +366,20 @@ run_experiment() {
         --url "http://localhost:${port}" \
         --num-clients "$NUM_CLIENTS" \
         --max-turns "$MAX_TURNS" \
+        --limit-min-tokens -1 \
         --limit-max-tokens "$LIMIT_MAX_TOKENS" \
         --request-timeout-sec "$REQUEST_TIMEOUT" \
-        --output-file "${result_dir}/${scheduler}_results.json" \
+        --output-file "${result_dir}/${scheduler}_conversations.json" \
         > "$bench_log" 2>&1
     local bench_status=$?
 
-    # 提取关键指标
+    # 记录结束时间
+    local end_time=$(date +%s.%N)
+    local duration=$(echo "$end_time - $start_time" | bc)
+
+    # 提取并保存 metrics 到 JSON (使用 bench_*.json 格式)
     if [ $bench_status -eq 0 ]; then
-        # 从 benchmark 输出中提取统计信息
-        grep -E "(ttft_ms|tpot_ms|latency_ms|approx_cached_percent)" "$bench_log" > "${result_dir}/${scheduler}_metrics.txt" 2>/dev/null || true
+        extract_metrics_script | python3 - "$bench_log" "${result_dir}/bench_${scheduler}.json" "$duration"
     fi
 
     kill_server $server_pid $gpu_id
@@ -327,6 +446,3 @@ echo ""
 echo "运行分析脚本:"
 echo "  # 结果分析 (scheduler 对比)"
 echo "  python ${SCRIPT_DIR}/analyze_results.py $OUTPUT_DIR"
-echo ""
-echo "  # 导出 CSV"
-echo "  python ${SCRIPT_DIR}/analyze_results.py $OUTPUT_DIR --csv ${OUTPUT_DIR}/results.csv"

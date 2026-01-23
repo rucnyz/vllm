@@ -105,14 +105,18 @@ python pd_exp/multiturn/analyze_results.py pd_exp/outputs/multiturn_wildchat_mul
 NUM_CLIENTS=16 MAX_TURNS=12 LIMIT_MAX_TOKENS=512 K_RATIO=0.7 \
 BS_VALUES="512 1024" TB_VALUES="8192 16384" \
     ./pd_exp/multiturn/run_benchmark.sh ./pd_exp/outputs/wildchat_multiturn.json 4
+
+# 恢复中断的实验 (从队列文件继续)
+RESUME=true ./pd_exp/multiturn/run_benchmark.sh ./pd_exp/outputs/wildchat_multiturn.json 4
 ```
 
 - `NUM_CLIENTS`: 并发客户端数 (默认 8)
 - `MAX_TURNS`: 每个对话最多执行的轮数 (默认 10)
 - `LIMIT_MAX_TOKENS`: 每轮最大输出 token 数 (默认 256)
 - `K_RATIO`: pd_ratio scheduler 的 θ* 值 (默认 0.8)
-- `BS_VALUES`: 测试的 batch size 列表 (默认 "256 512 1024")
-- `TB_VALUES`: 测试的 max_num_batched_tokens 列表 (默认 "8192 16384")
+- `BS_VALUES`: 测试的 batch size 列表 (默认 "256 512 1024 1536 2048")
+- `TB_VALUES`: 测试的 max_num_batched_tokens 列表 (默认 "4096 8192 10240 14336 16384 18432")
+- `RESUME`: 设为 true 时从现有队列恢复实验 (默认 false)
 
 ### 导出参数
 
