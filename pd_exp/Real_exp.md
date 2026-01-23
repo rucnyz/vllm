@@ -61,7 +61,7 @@ python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_numina_math_
 ## longbench
 
 ```bash
-# A6000完成 - 
+# A6000完成 - baseline, pd_ratio
 python pd_exp/export_dataset.py \
       --dataset longbench \
       --model Qwen/Qwen3-8B \
@@ -86,7 +86,7 @@ python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_longbench_pr
 多轮对话场景，用于测试 prefix cache 效果。对比 baseline、pd_ratio、pd_direct 三种 scheduler。
 
 ```bash
-# A6000完成 - 
+# A6000完成 - baseline, pd_ratio
 # 导出多轮对话数据 (筛选至少 8 轮的对话)
 python pd_exp/multiturn/export_dataset.py \
     --dataset wildchat \

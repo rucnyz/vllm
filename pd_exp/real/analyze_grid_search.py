@@ -16,6 +16,7 @@
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -29,13 +30,51 @@ except ImportError:
     print("警告: matplotlib 未安装，跳过绑图")
 
 
-def load_bench_result(filepath: Path) -> Optional[Dict]:
-    """加载 benchmark 结果文件"""
+def load_bench_result_fast(filepath: Path) -> Optional[Dict]:
+    """快速加载 benchmark 结果文件（只读取开头的元数据）
+
+    对于大文件（100MB+），只读取前 100KB 来提取关键指标，
+    避免加载整个文件到内存。
+    """
     if not filepath.exists():
         return None
+
     try:
-        with open(filepath) as f:
-            return json.load(f)
+        file_size = filepath.stat().st_size
+
+        # 小文件直接加载
+        if file_size < 10 * 1024 * 1024:  # < 10MB
+            with open(filepath) as f:
+                return json.load(f)
+
+        # 大文件只读取开头
+        with open(filepath, 'r') as f:
+            header = f.read(100 * 1024)  # 读取前 100KB
+
+        result = {}
+
+        # 需要提取的字段（都在文件开头）
+        fields = [
+            'request_throughput', 'output_throughput', 'total_token_throughput',
+            'mean_ttft_ms', 'median_ttft_ms', 'p99_ttft_ms',
+            'mean_tpot_ms', 'median_tpot_ms', 'p99_tpot_ms',
+            'mean_itl_ms', 'median_itl_ms', 'p99_itl_ms',
+            'completed', 'failed', 'num_prompts'
+        ]
+
+        for field in fields:
+            # 匹配 "field": value 模式
+            pattern = rf'"{field}":\s*([^,\}}\]]+)'
+            match = re.search(pattern, header)
+            if match:
+                value_str = match.group(1).strip()
+                try:
+                    result[field] = json.loads(value_str)
+                except json.JSONDecodeError:
+                    pass
+
+        return result if result else None
+
     except Exception:
         return None
 
@@ -105,7 +144,7 @@ def collect_grid_results(exp_dir: Path) -> Dict:
 
             for scheduler, suffix in scheduler_file_map.items():
                 bench_file = bs_dir / f"bench_{suffix}.json"
-                bench_result = load_bench_result(bench_file)
+                bench_result = load_bench_result_fast(bench_file)
                 if bench_result:
                     results[key][scheduler] = extract_metrics(bench_result)
 
