@@ -15,6 +15,7 @@ export VLLM_PD_CALIBRATION_FILE=$(pwd)/pd_exp/outputs/pd_calibration.json
 ## ShareGPT
 
 ```shell
+# A6000完成 baseline, pd_naive
 wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
 
 python pd_exp/export_dataset.py \
@@ -26,18 +27,19 @@ rm -rf ShareGPT_V3_unfiltered_cleaned_split.json
 
 # ShareGPT: balanced workload, 关闭 thinking，输出长度 500
 ENABLE_THINKING=false CUSTOM_OUTPUT_LEN=500 \
-    ./pd_exp/syn/run_grid_search_real.sh ./pd_exp/outputs/sharegpt_prompts.jsonl 4
+    ./pd_exp/real/run_grid_search.sh ./pd_exp/outputs/sharegpt_prompts.jsonl 4
 
 # Grid search 结果分析
-python pd_exp/syn/analyze_grid_search.py pd_exp/outputs/grid_search_sharegpt_prompts_Con_2048_Prompts_4000
+python pd_exp/real/analyze_grid_search.py pd_exp/outputs/grid_search_sharegpt_prompts_Con_2048_Prompts_4000
 
 # Input/Output 长度统计
-python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_sharegpt_prompts_Con_2048_Prompts_4000
+python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_sharegpt_prompts_Con_2048_Prompts_4000 --summary-only
 ```
 
 ## numina_math
 
 ```bash
+# A6000完成baseline, pd_naive
 python pd_exp/export_dataset.py \
     --dataset numina_math \
     --model Qwen/Qwen3-8B \
@@ -47,18 +49,19 @@ python pd_exp/export_dataset.py \
 
 # numina_math: 开启 thinking (默认)，输出长度 4000
 CUSTOM_OUTPUT_LEN=4000 \
-    ./pd_exp/syn/run_grid_search_real.sh ./pd_exp/outputs/numina_math_prompts.jsonl 4
+    ./pd_exp/real/run_grid_search.sh ./pd_exp/outputs/numina_math_prompts.jsonl 4
 
 # Grid search 结果分析
-python pd_exp/syn/analyze_grid_search.py pd_exp/outputs/grid_search_numina_math_prompts_Con_2048_Prompts_4000
+python pd_exp/real/analyze_grid_search.py pd_exp/outputs/grid_search_numina_math_prompts_Con_2048_Prompts_4000
 
 # Input/Output 长度统计 (查看真实的 decode-heavy 程度)
-python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_numina_math_prompts_Con_2048_Prompts_4000
+python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_numina_math_prompts_Con_2048_Prompts_4000 --summary-only
 ```
 
 ## longbench
 
 ```bash
+# A6000完成 - 
 python pd_exp/export_dataset.py \
       --dataset longbench \
       --model Qwen/Qwen3-8B \
@@ -69,13 +72,13 @@ python pd_exp/export_dataset.py \
 
 # longbench: prefill-heavy, 关闭 thinking，输出长度 20
 ENABLE_THINKING=false CUSTOM_OUTPUT_LEN=20 \
-    ./pd_exp/syn/run_grid_search_real.sh ./pd_exp/outputs/longbench_prefill.jsonl 4
+    ./pd_exp/real/run_grid_search.sh ./pd_exp/outputs/longbench_prefill.jsonl 4
 
 # Grid search 结果分析
-python pd_exp/syn/analyze_grid_search.py pd_exp/outputs/grid_search_longbench_prefill_Con_2048_Prompts_4000
+python pd_exp/real/analyze_grid_search.py pd_exp/outputs/grid_search_longbench_prefill_Con_2048_Prompts_4000
 
 # Input/Output 长度统计 (确认是否 prefill-heavy)
-python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_longbench_prefill_Con_2048_Prompts_4000
+python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_longbench_prefill_Con_2048_Prompts_4000 --summary-only
 ```
 
 ## WildChat (Prefix Cache Testing)
@@ -83,12 +86,13 @@ python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_longbench_pr
 多轮对话场景，用于测试 prefix cache 效果。对比 baseline、pd_ratio、pd_direct 三种 scheduler。
 
 ```bash
+# A6000完成 - 
 # 导出多轮对话数据 (筛选至少 8 轮的对话)
 python pd_exp/multiturn/export_dataset.py \
     --dataset wildchat \
     --model Qwen/Qwen3-8B \
-    --num-conversations 500 \
-    --min-turns 8 \
+    --num-conversations 3000 \
+    --min-turns 6 \
     --output ./pd_exp/outputs/wildchat_multiturn.json
 
 # 运行实验 (对比三种 scheduler)
