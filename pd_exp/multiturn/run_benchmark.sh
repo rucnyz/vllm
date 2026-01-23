@@ -356,9 +356,6 @@ run_experiment() {
         return 1
     fi
 
-    # 记录开始时间
-    local start_time=$(date +%s.%N)
-
     # 运行多轮对话 benchmark
     python benchmarks/multi_turn/benchmark_serving_multi_turn_threaded.py \
         --input-file "$DATASET_PATH" \
@@ -370,17 +367,9 @@ run_experiment() {
         --limit-max-tokens "$LIMIT_MAX_TOKENS" \
         --request-timeout-sec "$REQUEST_TIMEOUT" \
         --output-file "${result_dir}/${scheduler}_conversations.json" \
+        --metrics-file "${result_dir}/bench_${scheduler}.json" \
         > "$bench_log" 2>&1
     local bench_status=$?
-
-    # 记录结束时间
-    local end_time=$(date +%s.%N)
-    local duration=$(echo "$end_time - $start_time" | bc)
-
-    # 提取并保存 metrics 到 JSON (使用 bench_*.json 格式)
-    if [ $bench_status -eq 0 ]; then
-        extract_metrics_script | python3 - "$bench_log" "${result_dir}/bench_${scheduler}.json" "$duration"
-    fi
 
     kill_server $server_pid $gpu_id
 
