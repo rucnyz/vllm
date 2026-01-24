@@ -69,7 +69,12 @@ elif [ -f "$CALIBRATION_FILE" ]; then
     echo "  如需重新校准，请删除此文件或设置 SKIP_CALIBRATION=false"
 else
     log_time "开始硬件校准..."
-    python -m vllm.v1.core.sched.calibration --model "$MODEL" --output "$CALIBRATION_FILE"
+    # 某些模型不支持 float16，可通过 DTYPE=bfloat16 指定
+    DTYPE_ARG=""
+    if [ -n "${DTYPE:-}" ]; then
+        DTYPE_ARG="--dtype $DTYPE"
+    fi
+    python -m vllm.v1.core.sched.calibration --model "$MODEL" $DTYPE_ARG --output "$CALIBRATION_FILE"
     log_time "校准完成: $CALIBRATION_FILE"
 fi
 

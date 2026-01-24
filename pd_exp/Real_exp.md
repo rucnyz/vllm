@@ -3,16 +3,23 @@
 ```bash
 # 运行所有实验 (校准 + 数据集导出 + 4个实验)
 ./pd_exp/run_all_experiments.sh Qwen/Qwen3-8B 4
-./pd_exp/run_all_experiments.sh Qwen/Qwen3-30B-A3B 4
-
-# 跑其他模型
-./pd_exp/run_all_experiments.sh meta-llama/Llama-3.1-8B 4
+./pd_exp/run_all_experiments.sh Qwen/Qwen3-30B-A3B 4 # ongoing
+DTYPE=bfloat16 ./pd_exp/run_all_experiments.sh google/gemma-3-1b-it 4 # ongoing
+./pd_exp/run_all_experiments.sh openai/gpt-oss-120b 4 # 
 
 # 可选参数
 SKIP_CALIBRATION=true ./pd_exp/run_all_experiments.sh ...  # 跳过校准
 SKIP_EXPORT=true ./pd_exp/run_all_experiments.sh ...       # 跳过数据集导出
 EXPERIMENTS="sharegpt numina_math" ./pd_exp/run_all_experiments.sh ...  # 只跑指定实验
 ```
+
+## 分析所有实验结果
+
+```bash
+python pd_exp/generate_summary.py
+```
+
+输出报告保存到 `pd_exp/eoutputs/evaluation/report_xxx.md`
 
 ---
 
@@ -153,6 +160,7 @@ RESUME=true ./pd_exp/multiturn/run_benchmark.sh ./pd_exp/outputs/wildchat_multit
 ### Scheduler 对比
 
 每个 (TB, BS) 配置会测试三种 scheduler:
+
 - **baseline**: vLLM 默认调度器
 - **pd_ratio**: PD scheduler，固定 θ*=K_RATIO
 - **pd_direct**: PD scheduler，direct 模式 (自动 k*)
@@ -160,6 +168,7 @@ RESUME=true ./pd_exp/multiturn/run_benchmark.sh ./pd_exp/outputs/wildchat_multit
 ### Prefix Cache 工作原理
 
 对于一个 n 轮对话：
+
 - 第 1 轮: 0% cached (新对话)
 - 第 2 轮: ~50% cached (复用第 1 轮历史)
 - 第 3 轮: ~67% cached (复用第 1-2 轮历史)
