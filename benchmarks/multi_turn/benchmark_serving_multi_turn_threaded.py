@@ -139,7 +139,8 @@ async def send_request_async(
                             pass
             else:
                 valid = False
-                logger.warning(f"Request failed with status {response.status}")
+                error_text = await response.text()
+                logger.warning(f"Request failed with status {response.status}: {error_text[:500]}")
     except asyncio.TimeoutError:
         valid = False
         logger.warning("Request timed out")
@@ -179,6 +180,8 @@ def client_worker(
     limit_max_tokens: int,
     timeout_sec: int,
     verbose: bool,
+    shared_turns_count: dict,
+    turns_lock: threading.Lock,
 ):
     """Worker function that runs in a thread."""
     logger.info(f"{Color.CYAN}Started client {client_id}{Color.RESET}")
@@ -188,7 +191,6 @@ def client_worker(
     random.seed(thread_seed)
     np.random.seed(thread_seed % (2**32))
 
-    turns_count: Counter = Counter()
     num_successes = 0
     num_failures = 0
 
@@ -209,9 +211,12 @@ def client_worker(
                     task_queue.put((TERM_SIGNAL, TERM_SIGNAL))  # Re-add for other workers
                     break
 
-                # Process conversation turns
-                turns_count[conv_id] += 1
-                current_turn = turns_count[conv_id]
+                # Process conversation turns (thread-safe)
+                with turns_lock:
+                    if conv_id not in shared_turns_count:
+                        shared_turns_count[conv_id] = 0
+                    shared_turns_count[conv_id] += 1
+                    current_turn = shared_turns_count[conv_id]
 
                 if current_turn > len(messages):
                     continue
@@ -275,13 +280,15 @@ def client_worker(
                     result_queue.put(stats)
 
                     # Update conversation with response
-                    turns_count[conv_id] += 1
                     if current_turn < len(messages):
                         messages[current_turn]["content"] = content
 
-                    # Check if more turns available
+                    # Check if more turns available (thread-safe)
                     max_allowed = len(messages) if max_turns is None else min(max_turns, len(messages))
-                    if turns_count[conv_id] < max_allowed:
+                    with turns_lock:
+                        shared_turns_count[conv_id] += 1
+                        should_continue = shared_turns_count[conv_id] < max_allowed
+                    if should_continue:
                         task_queue.put((conv_id, messages))
 
                     if verbose:
@@ -320,6 +327,10 @@ def run_benchmark(
     result_queue: Queue = Queue()
     stop_event = threading.Event()
 
+    # Shared turn counter across all clients (thread-safe)
+    shared_turns_count: dict = {}
+    turns_lock = threading.Lock()
+
     # Add all conversations to the task queue
     for conv_id, messages in conversations.items():
         task_queue.put((conv_id, messages))
@@ -349,6 +360,8 @@ def run_benchmark(
                 limit_max_tokens,
                 timeout_sec,
                 verbose,
+                shared_turns_count,
+                turns_lock,
             ),
             daemon=True,
         )
@@ -387,8 +400,8 @@ def run_benchmark(
     return all_results
 
 
-def print_statistics(results: list[RequestStats]) -> None:
-    """Print benchmark statistics."""
+def print_statistics(results: list[RequestStats], metrics_file: str | None = None) -> None:
+    """Print benchmark statistics and optionally save to JSON."""
     if not results:
         logger.info("No results to display")
         return
@@ -407,6 +420,40 @@ def print_statistics(results: list[RequestStats]) -> None:
     print(stats_df)
     print(TEXT_SEPARATOR)
 
+    # Save metrics to JSON if requested
+    if metrics_file:
+        metrics = {}
+        # Map internal metric names to output names (for compatibility with vllm bench serve)
+        metric_name_map = {
+            "ttft_ms": "ttft_ms",
+            "tpot_ms": "tpot_ms",
+            "latency_ms": "e2e_latency_ms",  # Rename for compatibility
+            "input_num_tokens": "input_num_tokens",
+            "output_num_tokens": "output_num_tokens",
+        }
+        for internal_name, output_name in metric_name_map.items():
+            if internal_name in stats_df.index:
+                row = stats_df.loc[internal_name]
+                metrics[f"mean_{output_name}"] = float(row["mean"])
+                metrics[f"std_{output_name}"] = float(row["std"])
+                metrics[f"min_{output_name}"] = float(row["min"])
+                metrics[f"median_{output_name}"] = float(row["50%"])
+                metrics[f"p99_{output_name}"] = float(row["99%"])
+                metrics[f"max_{output_name}"] = float(row["max"])
+                metrics[f"count_{output_name}"] = int(row["count"])
+
+        # Add throughput metrics
+        if results:
+            total_time_sec = (results[-1].start_time_ms - results[0].start_time_ms) / 1000 + results[-1].latency_ms / 1000
+            if total_time_sec > 0:
+                metrics["request_throughput"] = len(results) / total_time_sec
+                if "mean_output_num_tokens" in metrics:
+                    metrics["output_throughput"] = len(results) * metrics["mean_output_num_tokens"] / total_time_sec
+
+        with open(metrics_file, "w") as f:
+            json.dump(metrics, f, indent=2)
+        logger.info(f"Saved metrics to {metrics_file}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -423,6 +470,7 @@ def main():
     parser.add_argument("--limit-min-tokens", type=int, default=0, help="Min output tokens")
     parser.add_argument("--limit-max-tokens", type=int, default=0, help="Max output tokens")
     parser.add_argument("--request-timeout-sec", type=int, default=120, help="Request timeout")
+    parser.add_argument("--metrics-file", type=str, default=None, help="Output metrics JSON file")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 
@@ -462,7 +510,7 @@ def main():
         verbose=args.verbose,
     )
 
-    print_statistics(results)
+    print_statistics(results, metrics_file=args.metrics_file)
 
     if args.output_file:
         output_data = conversations_dict_to_list(conversations)
