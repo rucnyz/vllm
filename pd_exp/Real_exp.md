@@ -1,13 +1,36 @@
-## 0. 硬件校准 (必须先运行)
-
-PD Scheduler 需要硬件校准参数才能准确调度。所有实验前必须先运行一次。
+## 一键运行所有实验
 
 ```bash
-# 运行校准
-python -m vllm.v1.core.sched.calibration --model Qwen/Qwen3-8B
+# 运行所有实验 (校准 + 数据集导出 + 4个实验)
+./pd_exp/run_all_experiments.sh Qwen/Qwen3-8B 4
+./pd_exp/run_all_experiments.sh Qwen/Qwen3-30B-A3B 4
 
-# 设置环境变量 (校准文件默认保存到 pd_exp/outputs/pd_calibration.json)
-export VLLM_PD_CALIBRATION_FILE=$(pwd)/pd_exp/outputs/pd_calibration.json
+# 跑其他模型
+./pd_exp/run_all_experiments.sh meta-llama/Llama-3.1-8B 4
+
+# 可选参数
+SKIP_CALIBRATION=true ./pd_exp/run_all_experiments.sh ...  # 跳过校准
+SKIP_EXPORT=true ./pd_exp/run_all_experiments.sh ...       # 跳过数据集导出
+EXPERIMENTS="sharegpt numina_math" ./pd_exp/run_all_experiments.sh ...  # 只跑指定实验
+```
+
+---
+
+## 0. 硬件校准 (必须先运行)
+
+PD Scheduler 需要硬件校准参数才能准确调度。每个模型需要单独校准一次。
+
+```bash
+# 运行校准 (校准文件自动按模型命名: pd_calibration_<model_short>.json)
+python -m vllm.v1.core.sched.calibration --model Qwen/Qwen3-8B
+# -> 保存到 pd_exp/outputs/pd_calibration_Qwen3-8B.json
+
+# 如果跑其他模型，需要单独校准
+python -m vllm.v1.core.sched.calibration --model meta-llama/Llama-3.1-8B
+# -> 保存到 pd_exp/outputs/pd_calibration_Llama-3.1-8B.json
+
+# 实验脚本会自动查找对应模型的校准文件
+# 也可以手动指定: VLLM_PD_CALIBRATION_FILE=/path/to/file.json
 ```
 
 ---
@@ -29,11 +52,11 @@ rm -rf ShareGPT_V3_unfiltered_cleaned_split.json
 ENABLE_THINKING=false CUSTOM_OUTPUT_LEN=500 \
     ./pd_exp/real/run_grid_search.sh ./pd_exp/outputs/sharegpt_prompts.jsonl 4
 
-# Grid search 结果分析
-python pd_exp/real/analyze_grid_search.py pd_exp/outputs/grid_search_sharegpt_prompts_Con_2048_Prompts_4000
+# Grid search 结果分析 (目录名包含模型短名)
+python pd_exp/real/analyze_grid_search.py pd_exp/outputs/grid_search_sharegpt_prompts_Qwen3-8B_Con_2048_Prompts_4000
 
 # Input/Output 长度统计
-python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_sharegpt_prompts_Con_2048_Prompts_4000 --summary-only
+python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_sharegpt_prompts_Qwen3-8B_Con_2048_Prompts_4000 --summary-only
 ```
 
 ## numina_math
@@ -52,10 +75,10 @@ CUSTOM_OUTPUT_LEN=4000 \
     ./pd_exp/real/run_grid_search.sh ./pd_exp/outputs/numina_math_prompts.jsonl 4
 
 # Grid search 结果分析
-python pd_exp/real/analyze_grid_search.py pd_exp/outputs/grid_search_numina_math_prompts_Con_2048_Prompts_4000
+python pd_exp/real/analyze_grid_search.py pd_exp/outputs/grid_search_numina_math_prompts_Qwen3-8B_Con_2048_Prompts_4000
 
 # Input/Output 长度统计 (查看真实的 decode-heavy 程度)
-python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_numina_math_prompts_Con_2048_Prompts_4000 --summary-only
+python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_numina_math_prompts_Qwen3-8B_Con_2048_Prompts_4000 --summary-only
 ```
 
 ## longbench
@@ -75,10 +98,10 @@ ENABLE_THINKING=false CUSTOM_OUTPUT_LEN=20 \
     ./pd_exp/real/run_grid_search.sh ./pd_exp/outputs/longbench_prefill.jsonl 4
 
 # Grid search 结果分析
-python pd_exp/real/analyze_grid_search.py pd_exp/outputs/grid_search_longbench_prefill_Con_2048_Prompts_4000
+python pd_exp/real/analyze_grid_search.py pd_exp/outputs/grid_search_longbench_prefill_Qwen3-8B_Con_2048_Prompts_4000
 
 # Input/Output 长度统计 (确认是否 prefill-heavy)
-python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_longbench_prefill_Con_2048_Prompts_4000 --summary-only
+python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_longbench_prefill_Qwen3-8B_Con_2048_Prompts_4000 --summary-only
 ```
 
 ## WildChat (Prefix Cache Testing)
@@ -99,7 +122,7 @@ python pd_exp/multiturn/export_dataset.py \
 ./pd_exp/multiturn/run_benchmark.sh ./pd_exp/outputs/wildchat_multiturn.json 4
 
 # 结果分析 (scheduler 对比)
-python pd_exp/multiturn/analyze_results.py pd_exp/outputs/multiturn_wildchat_multiturn_Clients_8_MaxTurns_10
+python pd_exp/multiturn/analyze_results.py pd_exp/outputs/multiturn_wildchat_multiturn_Qwen3-8B_Clients_8_MaxTurns_10
 ```
 
 ### 脚本参数 (环境变量)

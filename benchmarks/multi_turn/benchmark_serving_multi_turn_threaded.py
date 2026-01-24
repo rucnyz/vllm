@@ -224,6 +224,10 @@ def client_worker(
                 # Prepare messages for this turn
                 turn_messages = messages[:current_turn]
                 if turn_messages[-1]["role"] != "user":
+                    # Not a user turn, put back in queue to continue processing
+                    max_allowed = len(messages) if max_turns is None else min(max_turns, len(messages))
+                    if current_turn < max_allowed:
+                        task_queue.put((conv_id, messages))
                     continue
 
                 # Determine token limits
@@ -286,7 +290,6 @@ def client_worker(
                     # Check if more turns available (thread-safe)
                     max_allowed = len(messages) if max_turns is None else min(max_turns, len(messages))
                     with turns_lock:
-                        shared_turns_count[conv_id] += 1
                         should_continue = shared_turns_count[conv_id] < max_allowed
                     if should_continue:
                         task_queue.put((conv_id, messages))

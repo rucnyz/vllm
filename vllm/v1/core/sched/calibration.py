@@ -617,16 +617,20 @@ def main():
         default=0.9,
         help="GPU memory utilization (default: 0.9)",
     )
-    # 默认输出到 pd_exp/outputs/pd_calibration.json
-    default_output = Path(__file__).parent.parent.parent.parent.parent / "pd_exp" / "outputs" / "pd_calibration.json"
     parser.add_argument(
         "--output", "-o",
         type=str,
-        default=str(default_output),
-        help=f"Output file path (default: {default_output})",
+        default=None,
+        help="Output file path (default: pd_exp/outputs/pd_calibration_<model_short>.json)",
     )
 
     args = parser.parse_args()
+
+    # 默认输出路径按模型区分
+    if args.output is None:
+        model_short = args.model.split("/")[-1]
+        default_output = Path(__file__).parent.parent.parent.parent.parent / "pd_exp" / "outputs" / f"pd_calibration_{model_short}.json"
+        args.output = str(default_output)
 
     prefill_sizes = [int(x) for x in args.prefill_sizes.split(",")]
     decode_counts = [int(x) for x in args.decode_counts.split(",")]

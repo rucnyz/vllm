@@ -68,6 +68,8 @@ DATASET_NAME=$(basename "$DATASET_PATH" .jsonl)
 
 # 实验参数
 MODEL=${MODEL:-"Qwen/Qwen3-8B"}
+# 模型短名称（用于目录命名，将 / 替换为 _）
+MODEL_SHORT=$(echo "$MODEL" | sed 's|.*/||')
 NUM_PROMPTS=${NUM_PROMPTS:-4000}
 MAX_CONCURRENCY=${MAX_CONCURRENCY:-2048}
 NUM_WARMUP_REQUESTS=${NUM_WARMUP_REQUESTS:-20}
@@ -76,9 +78,9 @@ BASE_PORT=${BASE_PORT:-11000}
 CUSTOM_OUTPUT_LEN=${CUSTOM_OUTPUT_LEN:-4000}
 ENABLE_THINKING=${ENABLE_THINKING:-true}  # 控制 Qwen3 thinking 模式
 
-# 硬件校准文件 (必须)
+# 硬件校准文件 (必须，按模型区分)
 if [ -z "${VLLM_PD_CALIBRATION_FILE:-}" ]; then
-    DEFAULT_CALIBRATION="${SCRIPT_DIR}/../outputs/pd_calibration.json"
+    DEFAULT_CALIBRATION="${SCRIPT_DIR}/../outputs/pd_calibration_${MODEL_SHORT}.json"
     if [ -f "$DEFAULT_CALIBRATION" ]; then
         export VLLM_PD_CALIBRATION_FILE="$DEFAULT_CALIBRATION"
     else
@@ -86,7 +88,7 @@ if [ -z "${VLLM_PD_CALIBRATION_FILE:-}" ]; then
         echo ""
         echo "PD Scheduler 需要硬件校准参数才能准确调度。"
         echo "请先运行校准:"
-        echo "  python -m vllm.v1.core.sched.calibration --model ${MODEL}"
+        echo "  python -m vllm.v1.core.sched.calibration --model ${MODEL} --output ${DEFAULT_CALIBRATION}"
         echo ""
         echo "校准文件默认保存到: ${DEFAULT_CALIBRATION}"
         echo "或手动指定: VLLM_PD_CALIBRATION_FILE=/path/to/file.json $0 ..."
@@ -114,8 +116,8 @@ fi
 BS_VALUES=(256 512 1024 1536 2048)
 TB_VALUES=(4096 8192 10240 14336 16384 18432)
 
-# 输出目录
-OUTPUT_DIR="${SCRIPT_DIR}/../outputs/grid_search_${DATASET_NAME}_Con_${MAX_CONCURRENCY}_Prompts_${NUM_PROMPTS}"
+# 输出目录 (包含模型名)
+OUTPUT_DIR="${SCRIPT_DIR}/../outputs/grid_search_${DATASET_NAME}_${MODEL_SHORT}_Con_${MAX_CONCURRENCY}_Prompts_${NUM_PROMPTS}"
 mkdir -p "$OUTPUT_DIR"
 
 # 初始化环境

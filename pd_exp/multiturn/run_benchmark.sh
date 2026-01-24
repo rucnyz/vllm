@@ -70,6 +70,8 @@ DATASET_NAME=$(basename "$DATASET_PATH" .json)
 
 # 实验参数
 MODEL=${MODEL:-"Qwen/Qwen3-8B"}
+# 模型短名称（用于目录命名，将 / 替换为 _）
+MODEL_SHORT=$(echo "$MODEL" | sed 's|.*/||')
 NUM_CLIENTS=${NUM_CLIENTS:-2048}
 MAX_TURNS=${MAX_TURNS:-12}
 LIMIT_MAX_TOKENS=${LIMIT_MAX_TOKENS:-256}
@@ -77,9 +79,9 @@ REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-120}
 BASE_PORT=${BASE_PORT:-10000}
 K_RATIO=${K_RATIO:-0.8}
 
-# 硬件校准文件 (必须)
+# 硬件校准文件 (必须，按模型区分)
 if [ -z "${VLLM_PD_CALIBRATION_FILE:-}" ]; then
-    DEFAULT_CALIBRATION="${SCRIPT_DIR}/../outputs/pd_calibration.json"
+    DEFAULT_CALIBRATION="${SCRIPT_DIR}/../outputs/pd_calibration_${MODEL_SHORT}.json"
     if [ -f "$DEFAULT_CALIBRATION" ]; then
         export VLLM_PD_CALIBRATION_FILE="$DEFAULT_CALIBRATION"
     else
@@ -87,7 +89,7 @@ if [ -z "${VLLM_PD_CALIBRATION_FILE:-}" ]; then
         echo ""
         echo "PD Scheduler 需要硬件校准参数才能准确调度。"
         echo "请先运行校准:"
-        echo "  python -m vllm.v1.core.sched.calibration --model ${MODEL}"
+        echo "  python -m vllm.v1.core.sched.calibration --model ${MODEL} --output ${DEFAULT_CALIBRATION}"
         echo ""
         echo "校准文件默认保存到: ${DEFAULT_CALIBRATION}"
         echo "或手动指定: VLLM_PD_CALIBRATION_FILE=/path/to/file.json $0 ..."
@@ -115,8 +117,8 @@ fi
 BS_VALUES=(${BS_VALUES:-256 512 1024 1536 2048})
 TB_VALUES=(${TB_VALUES:-4096 8192 10240 14336 16384 18432})
 
-# 输出目录
-OUTPUT_DIR="${SCRIPT_DIR}/../outputs/multiturn_${DATASET_NAME}_Clients_${NUM_CLIENTS}_MaxTurns_${MAX_TURNS}"
+# 输出目录 (包含模型名)
+OUTPUT_DIR="${SCRIPT_DIR}/../outputs/multiturn_${DATASET_NAME}_${MODEL_SHORT}_Clients_${NUM_CLIENTS}_MaxTurns_${MAX_TURNS}"
 mkdir -p "$OUTPUT_DIR"
 
 # 初始化环境
