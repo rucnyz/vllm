@@ -134,6 +134,7 @@ echo ""
 echo "实验配置:"
 echo "  DATASET: $DATASET_PATH"
 echo "  MODEL: $MODEL"
+echo "  DTYPE: ${DTYPE:-auto}"
 echo "  NUM_PROMPTS: $NUM_PROMPTS"
 echo "  MAX_CONCURRENCY: $MAX_CONCURRENCY"
 echo "  CUSTOM_OUTPUT_LEN: $CUSTOM_OUTPUT_LEN"
@@ -141,7 +142,15 @@ echo "  ENABLE_THINKING: $ENABLE_THINKING"
 echo "  K_RATIO (for pd_ratio): $K_RATIO"
 echo "  BS_VALUES: ${BS_VALUES[*]}"
 echo "  TB_VALUES: ${TB_VALUES[*]}"
-echo "  SCHEDULERS: baseline, pd_ratio (θ*=${K_RATIO}), pd_direct"
+# 支持通过 SCHEDULERS 环境变量指定要运行的调度器
+# 例如: SCHEDULERS="pd_ifr" 只运行 pd_ifr 模式
+SCHEDULERS=${SCHEDULERS:-"baseline pd_ratio pd_ifr"}
+echo "  SCHEDULERS: $SCHEDULERS"
+# 支持版本后缀，用于重复运行同一调度器生成不同结果文件
+# 例如: VERSION=1 SCHEDULERS="pd_ifr" 会生成 bench_pd_ifr_1.json
+if [ -n "${VERSION:-}" ]; then
+    echo "  VERSION: ${VERSION} (文件后缀: _${VERSION})"
+fi
 echo "  CALIBRATION_FILE: ${VLLM_PD_CALIBRATION_FILE:-"(未设置，使用默认参数)"}"
 echo ""
 
@@ -156,9 +165,9 @@ else
     > "$QUEUE_FILE"
     for tb in "${TB_VALUES[@]}"; do
         for bs in "${BS_VALUES[@]}"; do
-            echo "baseline|${bs}|${tb}" >> "$QUEUE_FILE"
-            echo "pd_ratio|${bs}|${tb}" >> "$QUEUE_FILE"
-            echo "pd_direct|${bs}|${tb}" >> "$QUEUE_FILE"
+            for scheduler in $SCHEDULERS; do
+                echo "${scheduler}|${bs}|${tb}" >> "$QUEUE_FILE"
+            done
         done
     done
     TOTAL_EXPERIMENTS=$(wc -l < "$QUEUE_FILE")
@@ -172,6 +181,7 @@ cat > "${OUTPUT_DIR}/experiment_config.json" << EOF
     "dataset_path": "${DATASET_PATH}",
     "dataset_name": "${DATASET_NAME}",
     "model": "${MODEL}",
+    "dtype": "${DTYPE:-auto}",
     "num_prompts": ${NUM_PROMPTS},
     "max_concurrency": ${MAX_CONCURRENCY},
     "custom_output_len": ${CUSTOM_OUTPUT_LEN},
@@ -179,11 +189,11 @@ cat > "${OUTPUT_DIR}/experiment_config.json" << EOF
     "k_ratio": ${K_RATIO},
     "bs_values": [$(echo "${BS_VALUES[*]}" | sed 's/ /, /g')],
     "tb_values": [$(echo "${TB_VALUES[*]}" | sed 's/ /, /g')],
-    "schedulers": ["baseline", "pd_ratio", "pd_direct"],
+    "schedulers": [$(echo "$SCHEDULERS" | sed 's/[^ ]*/"&"/g' | sed 's/ /, /g')],
     "scheduler_descriptions": {
         "baseline": "vLLM default scheduler",
         "pd_ratio": "PD scheduler with ratio mode (θ*=${K_RATIO})",
-        "pd_direct": "PD scheduler with direct mode (auto k*)"
+        "pd_ifr": "PD scheduler with IFR mode (adaptive θ* based on hazard rate)"
     },
     "calibration_file": "${VLLM_PD_CALIBRATION_FILE:-null}",
     "calibration_params": {
@@ -203,7 +213,19 @@ run_experiment() {
     local gpu_id=$1 scheduler=$2 bs=$3 tb=$4
     local port=$((BASE_PORT + gpu_id))
     local result_dir="${OUTPUT_DIR}/tb${tb}/bs${bs}"
-    local log_file="${result_dir}/logs/${scheduler}.log"
+    # 支持版本后缀: VERSION=1 会生成 pd_ifr_1.log, bench_pd_ifr_1.json 等
+    local suffix=""
+    if [ -n "${VERSION:-}" ]; then
+        suffix="_${VERSION}"
+    fi
+    local log_file="${result_dir}/logs/${scheduler}${suffix}.log"
+    local result_file="${result_dir}/bench_${scheduler}${suffix}.json"
+
+    # 检查是否跳过已有结果
+    if [ "${SKIP_EXISTING:-1}" = "1" ] && [ -f "$result_file" ]; then
+        echo "[GPU $gpu_id] 跳过: ${scheduler} tb=${tb} bs=${bs} (结果已存在)"
+        return 0
+    fi
 
     mkdir -p "${result_dir}/logs"
     : > "$log_file"
@@ -227,9 +249,9 @@ run_experiment() {
             export VLLM_PD_K_RATIO=$K_RATIO
             unset VLLM_PD_K_STAR
             ;;
-        pd_direct)
+        pd_ifr)
             export VLLM_USE_PD_SCHEDULER=1
-            export VLLM_PD_K_MODE=direct
+            export VLLM_PD_K_MODE=ifr
             unset VLLM_PD_K_RATIO VLLM_PD_K_STAR
             ;;
     esac
@@ -237,12 +259,18 @@ run_experiment() {
     wait_for_gpu_memory $gpu_id 60 || return 1
 
     # 启动服务
-    VLLM_SCHEDULE_STATS_FILE="${result_dir}/${scheduler}_stats.json" \
+    local dtype_arg=""
+    if [ -n "${DTYPE:-}" ]; then
+        dtype_arg="--dtype $DTYPE"
+    fi
+
+    VLLM_SCHEDULE_STATS_FILE="${result_dir}/${scheduler}${suffix}_stats.json" \
     vllm serve "$MODEL" \
         --port "$port" \
         --gpu-memory-utilization 0.9 \
         --max-num-seqs "$bs" \
-        --max-num-batched-tokens "$tb" >> "$log_file" 2>&1 &
+        --max-num-batched-tokens "$tb" \
+        $dtype_arg >> "$log_file" 2>&1 &
     local server_pid=$!
 
     if ! wait_for_server $port $server_pid 180 "$log_file"; then
@@ -266,7 +294,7 @@ run_experiment() {
         --save-result
         --save-detailed
         --result-dir "${result_dir}"
-        --result-filename "bench_${scheduler}.json"
+        --result-filename "bench_${scheduler}${suffix}.json"
     )
 
     # 如果关闭 thinking 模式，需要使用 chat backend 并添加 extra-body 参数

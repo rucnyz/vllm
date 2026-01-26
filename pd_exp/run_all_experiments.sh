@@ -27,6 +27,17 @@ if [ -z "${1:-}" ]; then
     echo "  SKIP_CALIBRATION=true   跳过校准步骤"
     echo "  SKIP_EXPORT=true        跳过数据集导出步骤"
     echo "  EXPERIMENTS=\"sharegpt numina_math\"  只运行指定实验"
+    echo "  SCHEDULERS=\"baseline pd_ratio pd_ifr\"  只运行指定调度器模式"
+    echo "  SKIP_EXISTING=0         不跳过已有结果 (默认跳过)"
+    echo "  VERSION=1               文件名后缀，用于重复运行生成 ifr_1, ifr_2 等"
+    echo ""
+    echo "调度器模式 (SCHEDULERS):"
+    echo "  baseline   vLLM 默认调度器"
+    echo "  pd_ratio   PD scheduler with ratio mode (θ*=K_RATIO)"
+    echo "  pd_ifr     PD scheduler with IFR mode (adaptive θ* based on hazard rate)"
+    echo ""
+    echo "示例 - 只运行 pd_ifr 模式的实验:"
+    echo "  SCHEDULERS=pd_ifr $0 Qwen/Qwen3-8B 4"
     exit 1
 fi
 
@@ -85,6 +96,10 @@ if [ ! -f "$CALIBRATION_FILE" ]; then
 fi
 
 export VLLM_PD_CALIBRATION_FILE="$CALIBRATION_FILE"
+
+# SKIP_EXISTING: 默认跳过已有结果文件 (方便只运行某个 scheduler 模式)
+export SKIP_EXISTING=${SKIP_EXISTING:-1}
+echo "  SKIP_EXISTING: $SKIP_EXISTING"
 echo ""
 
 # ============================================================
@@ -183,6 +198,7 @@ run_experiment() {
     ENABLE_THINKING=$enable_thinking \
     CUSTOM_OUTPUT_LEN=$output_len \
     MODEL=$MODEL \
+    DTYPE=${DTYPE:-} \
         "$script" "$dataset" "$MAX_GPUS"
 
     log_time "实验完成: $name"
@@ -224,6 +240,7 @@ if [[ "$EXPERIMENTS" == *"wildchat"* ]]; then
         echo ""
 
         MODEL=$MODEL \
+        DTYPE=${DTYPE:-} \
             "${SCRIPT_DIR}/multiturn/run_benchmark.sh" "$WILDCHAT_DATA" "$MAX_GPUS"
 
         log_time "实验完成: WildChat"

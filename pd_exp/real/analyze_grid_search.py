@@ -116,15 +116,6 @@ def collect_grid_results(exp_dir: Path) -> Dict:
     bs_values = set()
     results = {}
 
-    # 调度器文件名映射
-    scheduler_file_map = {
-        "baseline": "baseline",
-        "pd_ratio": "pd_ratio",
-        "pd_direct": "pd_direct",
-        "pd_kratio": "pd_kratio",
-        "pd_dynamic": "pd_dynamic",
-    }
-
     for tb_dir in sorted(exp_dir.iterdir()):
         if not tb_dir.is_dir() or not tb_dir.name.startswith("tb"):
             continue
@@ -142,8 +133,10 @@ def collect_grid_results(exp_dir: Path) -> Dict:
             key = (tb, bs)
             results[key] = {}
 
-            for scheduler, suffix in scheduler_file_map.items():
-                bench_file = bs_dir / f"bench_{suffix}.json"
+            # 动态检测所有 bench_*.json 文件
+            for bench_file in bs_dir.glob("bench_*.json"):
+                # 从文件名提取调度器名称: bench_pd_ifr_1.json -> pd_ifr_1
+                scheduler = bench_file.stem[6:]  # 去掉 "bench_" 前缀
                 bench_result = load_bench_result_fast(bench_file)
                 if bench_result:
                     results[key][scheduler] = extract_metrics(bench_result)
@@ -158,9 +151,12 @@ def collect_grid_results(exp_dir: Path) -> Dict:
 def find_optimal_configs(data: Dict) -> Dict:
     """找到每个调度器的最优配置"""
     optimal = {}
-    all_schedulers = ["baseline", "pd_ratio", "pd_direct", "pd_kratio", "pd_dynamic"]
+    # 动态检测所有调度器
+    all_schedulers = set()
+    for sched_results in data["results"].values():
+        all_schedulers.update(sched_results.keys())
 
-    for scheduler in all_schedulers:
+    for scheduler in sorted(all_schedulers):
         best_key = None
         best_throughput = 0
 
@@ -183,13 +179,13 @@ def find_optimal_configs(data: Dict) -> Dict:
 
 def get_best_pd_variant(sched_results: Dict) -> Optional[str]:
     """获取可用的最佳 PD 变体（按吞吐量选择）"""
-    pd_variants = ["pd_ratio", "pd_direct", "pd_kratio", "pd_dynamic"]
+    # 动态检测所有 pd_ 开头的调度器
     best_variant = None
     best_tp = 0
 
-    for variant in pd_variants:
-        if variant in sched_results:
-            tp = sched_results[variant].get("throughput", 0)
+    for variant, metrics in sched_results.items():
+        if variant.startswith("pd_"):
+            tp = metrics.get("throughput", 0)
             if tp > best_tp:
                 best_tp = tp
                 best_variant = variant
@@ -298,7 +294,7 @@ def plot_optimal_comparison(optimal: Dict, output_dir: Path):
     schedulers = [
         ("baseline", '#2ecc71', 'Baseline'),
         ("pd_ratio", '#3498db', 'PD (ratio)'),
-        ("pd_direct", '#9b59b6', 'PD (direct)'),
+        ("pd_ifr", '#9b59b6', 'PD (IFR)'),
         ("pd_kratio", '#e74c3c', 'PD (θ*)'),
         ("pd_dynamic", '#1abc9c', 'PD (DP)'),
     ]
@@ -331,11 +327,11 @@ def plot_optimal_comparison(optimal: Dict, output_dir: Path):
 
         # 计算 PD vs baseline 改进
         baseline_val = optimal.get("baseline", {}).get("metrics", {}).get(metric, 0)
-        # 找最佳 PD
+        # 找最佳 PD (动态检测所有 pd_ 开头的调度器)
         best_pd_val = 0
-        for key in ["pd_ratio", "pd_direct", "pd_kratio", "pd_dynamic"]:
-            if key in optimal:
-                val = optimal[key]["metrics"].get(metric, 0)
+        for key, opt_data in optimal.items():
+            if key.startswith("pd_"):
+                val = opt_data["metrics"].get(metric, 0)
                 if val > best_pd_val:
                     best_pd_val = val
 
@@ -387,16 +383,16 @@ def generate_report(data: Dict, optimal: Dict) -> str:
         lines.append("=" * 80)
         lines.append("")
 
-        for scheduler in ["baseline", "pd_ratio", "pd_direct", "pd_kratio", "pd_dynamic"]:
-            if scheduler in optimal:
-                opt = optimal[scheduler]
-                lines.append(f"  {scheduler:>12}: TB={opt['tb']}, BS={opt['bs']}, "
-                           f"throughput={opt['metrics']['throughput']:.2f} req/s")
+        # 动态列出所有调度器的最优配置
+        for scheduler in sorted(optimal.keys()):
+            opt = optimal[scheduler]
+            lines.append(f"  {scheduler:>15}: TB={opt['tb']}, BS={opt['bs']}, "
+                       f"throughput={opt['metrics']['throughput']:.2f} req/s")
 
         lines.append("")
 
-        # 对比表格
-        available = [(s, optimal[s]) for s in ["baseline", "pd_ratio", "pd_direct"] if s in optimal]
+        # 对比表格: baseline 和所有 pd_* 调度器
+        available = [(s, optimal[s]) for s in sorted(optimal.keys())]
         if len(available) >= 2:
             lines.append("-" * 80)
             header = f"{'Metric':<25}"
@@ -425,9 +421,9 @@ def generate_report(data: Dict, optimal: Dict) -> str:
                 # 计算改进 (baseline vs best PD)
                 baseline_val = optimal.get("baseline", {}).get("metrics", {}).get(metric, 0)
                 best_pd_val = 0
-                for s in ["pd_ratio", "pd_direct"]:
-                    if s in optimal:
-                        v = optimal[s]["metrics"].get(metric, 0)
+                for s, opt_data in optimal.items():
+                    if s.startswith("pd_"):
+                        v = opt_data["metrics"].get(metric, 0)
                         if v > best_pd_val:
                             best_pd_val = v
 
@@ -453,8 +449,8 @@ def generate_report(data: Dict, optimal: Dict) -> str:
         lines.append(f"吞吐量最高: {winner} ({throughputs[winner]:.2f} req/s)")
 
         if "baseline" in throughputs:
-            for pd in ["pd_ratio", "pd_direct"]:
-                if pd in throughputs:
+            for pd in sorted(throughputs.keys()):
+                if pd.startswith("pd_"):
                     imp = (throughputs[pd] - throughputs["baseline"]) / throughputs["baseline"] * 100
                     lines.append(f"  {pd} vs baseline: {imp:+.2f}%")
 

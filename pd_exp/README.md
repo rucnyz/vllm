@@ -199,7 +199,7 @@ outputs/kstar_sweep_<timestamp>/
 | baseline | vLLM 默认调度器 |
 | pd_ratio | PD 调度器，固定 θ* |
 | pd_ratio_auto | PD 调度器，动态 θ* |
-| pd_direct | PD 调度器，动态 k* (DP) |
+| pd_ifr | PD 调度器，IFR 模式 (基于 hazard rate 自适应 θ*) |
 
 ### 基本用法
 
@@ -252,11 +252,11 @@ outputs/grid_search_Con_2048_Prompts_4000/
             │   ├── baseline.log
             │   ├── pd_ratio.log
             │   ├── pd_ratio_auto.log
-            │   └── pd_direct.log
+            │   └── pd_ifr.log
             ├── bench_baseline.json
             ├── bench_pd_ratio.json
             ├── bench_pd_ratio_auto.json
-            ├── bench_pd_direct.json
+            ├── bench_pd_ifr.json
             └── *_stats.json
 ```
 

@@ -73,15 +73,6 @@ def collect_grid_results(exp_dir: Path) -> Dict:
     bs_values = set()
     results = {}
 
-    # 文件名映射: scheduler_name -> file_suffix
-    scheduler_file_map = {
-        "baseline": "baseline",
-        "pd_ratio": "pd_ratio",
-        "pd_ratio_auto": "pd_ratio_auto",
-        "pd_direct": "pd_direct",
-        "pd": "pd",
-    }
-
     # 遍历目录结构: tb{TB}/bs{BS}/
     for tb_dir in sorted(exp_dir.iterdir()):
         if not tb_dir.is_dir() or not tb_dir.name.startswith("tb"):
@@ -107,8 +98,10 @@ def collect_grid_results(exp_dir: Path) -> Dict:
             if key not in results:
                 results[key] = {}
 
-            for scheduler, file_suffix in scheduler_file_map.items():
-                bench_file = bs_dir / f"bench_{file_suffix}.json"
+            # 动态检测所有 bench_*.json 文件
+            for bench_file in bs_dir.glob("bench_*.json"):
+                # 从文件名提取调度器名称: bench_pd_ifr_1.json -> pd_ifr_1
+                scheduler = bench_file.stem[6:]  # 去掉 "bench_" 前缀
                 bench_result = load_bench_result(bench_file)
                 if bench_result:
                     results[key][scheduler] = extract_metrics(bench_result)
@@ -123,9 +116,12 @@ def collect_grid_results(exp_dir: Path) -> Dict:
 def find_optimal_configs(data: Dict) -> Dict:
     """找到每个 scheduler 的最优配置"""
     optimal = {}
-    all_schedulers = ["baseline", "pd_ratio", "pd_ratio_auto", "pd_direct", "pd"]
+    # 动态检测所有调度器
+    all_schedulers = set()
+    for sched_results in data["results"].values():
+        all_schedulers.update(sched_results.keys())
 
-    for scheduler in all_schedulers:
+    for scheduler in sorted(all_schedulers):
         best_key = None
         best_throughput = 0
 
@@ -146,7 +142,7 @@ def find_optimal_configs(data: Dict) -> Dict:
     return optimal
 
 
-def compute_improvement_grid(data: Dict, metric: str, pd_scheduler: str = "pd_direct",
+def compute_improvement_grid(data: Dict, metric: str, pd_scheduler: str = "pd_ifr",
                              higher_better: bool = True) -> Tuple[np.ndarray, list, list]:
     """计算 PD 相对 baseline 的改进网格
 
@@ -190,7 +186,7 @@ def plot_heatmaps(data: Dict, output_dir: Path):
 
     # 检测可用的 PD scheduler
     pd_schedulers = []
-    for key in ["pd_direct", "pd_ratio", "pd"]:
+    for key in ["pd_ifr", "pd_ratio", "pd"]:
         for sched_results in data["results"].values():
             if key in sched_results:
                 pd_schedulers.append(key)
@@ -265,7 +261,7 @@ def plot_optimal_comparison(optimal: Dict, output_dir: Path):
         ("baseline", '#2ecc71', 'Baseline'),
         ("pd_ratio", '#3498db', 'PD (ratio)'),
         ("pd_ratio_auto", '#9b59b6', 'PD (ratio auto)'),
-        ("pd_direct", '#1abc9c', 'PD (direct)'),
+        ("pd_ifr", '#1abc9c', 'PD (IFR)'),
         ("pd", '#5dade2', 'PD (legacy)'),
     ]
 
@@ -299,12 +295,12 @@ def plot_optimal_comparison(optimal: Dict, output_dir: Path):
 
         # 计算 PD 相对 baseline 的改进
         baseline_val = optimal.get("baseline", {}).get("metrics", {}).get(metric, 0)
-        pd_direct_val = optimal.get("pd_direct", {}).get("metrics", {}).get(metric, 0)
-        if baseline_val > 0 and pd_direct_val > 0:
+        pd_ifr_val = optimal.get("pd_ifr", {}).get("metrics", {}).get(metric, 0)
+        if baseline_val > 0 and pd_ifr_val > 0:
             if higher_better:
-                improvement = (pd_direct_val - baseline_val) / baseline_val * 100
+                improvement = (pd_ifr_val - baseline_val) / baseline_val * 100
             else:
-                improvement = (baseline_val - pd_direct_val) / baseline_val * 100
+                improvement = (baseline_val - pd_ifr_val) / baseline_val * 100
             imp_str = f"PD(direct) vs Base: {improvement:+.1f}%"
         else:
             imp_str = ""
@@ -347,20 +343,26 @@ def generate_report(data: Dict, optimal: Dict) -> str:
     lines.append(f"BS 值: {data['bs_values']}")
     lines.append("")
 
-    # 所有可能的调度器
-    all_schedulers = [
-        ("baseline", "Baseline"),
-        ("pd_ratio", "PD (ratio)"),
-        ("pd_ratio_auto", "PD (ratio auto)"),
-        ("pd_direct", "PD (direct)"),
-        ("pd", "PD (legacy)"),
-    ]
+    # 动态检测并收集可用的调度器
+    def get_display_name(key: str) -> str:
+        """将调度器 key 转换为显示名称"""
+        name_map = {
+            "baseline": "Baseline",
+            "pd_ratio": "PD (ratio)",
+            "pd_ratio_auto": "PD (ratio auto)",
+            "pd_ifr": "PD (IFR)",
+            "pd": "PD (legacy)",
+        }
+        if key in name_map:
+            return name_map[key]
+        # 对于带后缀的调度器 (如 pd_ifr_1)，生成友好名称
+        if key.startswith("pd_"):
+            return f"PD ({key[3:]})"
+        return key
 
-    # 收集可用的调度器
     available = []
-    for key, display_name in all_schedulers:
-        if key in optimal:
-            available.append((key, display_name, optimal[key]))
+    for key in sorted(optimal.keys()):
+        available.append((key, get_display_name(key), optimal[key]))
 
     if len(available) >= 2:
         lines.append("=" * 80)
@@ -373,20 +375,20 @@ def generate_report(data: Dict, optimal: Dict) -> str:
 
         # 获取特定调度器的最优配置
         baseline_opt = optimal.get("baseline", {})
-        pd_direct_opt = optimal.get("pd_direct", {})
+        pd_ifr_opt = optimal.get("pd_ifr", {})
         pd_ratio_opt = optimal.get("pd_ratio", {})
 
         # 对比关键指标
         header = f"{'Metric':<25}"
         for key, display_name, opt in available:
             header += f" {display_name:<15}"
-        if baseline_opt and pd_direct_opt:
+        if baseline_opt and pd_ifr_opt:
             header += f" {'PD(dir) vs Base':<15}"
         if baseline_opt and pd_ratio_opt:
             header += f" {'PD(rat) vs Base':<15}"
         lines.append(header)
 
-        extra_cols = (1 if baseline_opt and pd_direct_opt else 0) + (1 if baseline_opt and pd_ratio_opt else 0)
+        extra_cols = (1 if baseline_opt and pd_ifr_opt else 0) + (1 if baseline_opt and pd_ratio_opt else 0)
         lines.append("-" * (25 + 15 * len(available) + 15 * extra_cols))
 
         metrics_compare = [
@@ -405,10 +407,10 @@ def generate_report(data: Dict, optimal: Dict) -> str:
                 val = opt["metrics"].get(metric, 0)
                 row += f" {val:<15.2f}"
 
-            # 计算 PD(direct) vs Baseline 改进
-            if baseline_opt and pd_direct_opt:
+            # 计算 PD(IFR) vs Baseline 改进
+            if baseline_opt and pd_ifr_opt:
                 b_val = baseline_opt["metrics"].get(metric, 0)
-                p_val = pd_direct_opt["metrics"].get(metric, 0)
+                p_val = pd_ifr_opt["metrics"].get(metric, 0)
                 if b_val > 0:
                     if higher_better:
                         improvement = (p_val - b_val) / b_val * 100
@@ -450,16 +452,16 @@ def generate_report(data: Dict, optimal: Dict) -> str:
     lines.append("总体结论")
     lines.append("=" * 80)
 
-    # 统计胜出
-    pd_variants = ["pd_ratio", "pd_ratio_auto", "pd_direct", "pd"]
+    # 统计胜出 (动态检测所有 pd_ 开头的调度器)
     baseline_tp = optimal.get("baseline", {}).get("metrics", {}).get("throughput", 0)
     best_pd_tp = 0
     best_pd_name = None
-    for v in pd_variants:
-        tp = optimal.get(v, {}).get("metrics", {}).get("throughput", 0)
-        if tp > best_pd_tp:
-            best_pd_tp = tp
-            best_pd_name = v
+    for v, opt_data in optimal.items():
+        if v.startswith("pd_"):
+            tp = opt_data.get("metrics", {}).get("throughput", 0)
+            if tp > best_pd_tp:
+                best_pd_tp = tp
+                best_pd_name = v
 
     lines.append("")
     if baseline_tp > 0 and best_pd_tp > 0:

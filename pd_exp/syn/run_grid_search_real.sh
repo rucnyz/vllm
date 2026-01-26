@@ -139,7 +139,9 @@ echo "  ENABLE_THINKING: $ENABLE_THINKING"
 echo "  K_RATIO (for pd_ratio): $K_RATIO"
 echo "  BS_VALUES: ${BS_VALUES[*]}"
 echo "  TB_VALUES: ${TB_VALUES[*]}"
-echo "  SCHEDULERS: baseline, pd_ratio (θ*=${K_RATIO}), pd_direct"
+# 支持通过 SCHEDULERS 环境变量指定要运行的调度器
+SCHEDULERS=${SCHEDULERS:-"baseline pd_ratio pd_ifr"}
+echo "  SCHEDULERS: $SCHEDULERS"
 echo "  CALIBRATION_FILE: ${VLLM_PD_CALIBRATION_FILE:-"(未设置，使用默认参数)"}"
 echo ""
 
@@ -154,9 +156,9 @@ else
     > "$QUEUE_FILE"
     for tb in "${TB_VALUES[@]}"; do
         for bs in "${BS_VALUES[@]}"; do
-            echo "baseline|${bs}|${tb}" >> "$QUEUE_FILE"
-            echo "pd_ratio|${bs}|${tb}" >> "$QUEUE_FILE"
-            echo "pd_direct|${bs}|${tb}" >> "$QUEUE_FILE"
+            for scheduler in $SCHEDULERS; do
+                echo "${scheduler}|${bs}|${tb}" >> "$QUEUE_FILE"
+            done
         done
     done
     TOTAL_EXPERIMENTS=$(wc -l < "$QUEUE_FILE")
@@ -177,11 +179,11 @@ cat > "${OUTPUT_DIR}/experiment_config.json" << EOF
     "k_ratio": ${K_RATIO},
     "bs_values": [$(echo "${BS_VALUES[*]}" | sed 's/ /, /g')],
     "tb_values": [$(echo "${TB_VALUES[*]}" | sed 's/ /, /g')],
-    "schedulers": ["baseline", "pd_ratio", "pd_direct"],
+    "schedulers": [$(echo "$SCHEDULERS" | sed 's/[^ ]*/"&"/g' | sed 's/ /, /g')],
     "scheduler_descriptions": {
         "baseline": "vLLM default scheduler",
         "pd_ratio": "PD scheduler with ratio mode (θ*=${K_RATIO})",
-        "pd_direct": "PD scheduler with direct mode (auto k*)"
+        "pd_ifr": "PD scheduler with IFR mode (adaptive θ* based on hazard rate)"
     },
     "calibration_file": "${VLLM_PD_CALIBRATION_FILE:-null}",
     "calibration_params": {
@@ -202,6 +204,13 @@ run_experiment() {
     local port=$((BASE_PORT + gpu_id))
     local result_dir="${OUTPUT_DIR}/tb${tb}/bs${bs}"
     local log_file="${result_dir}/logs/${scheduler}.log"
+    local result_file="${result_dir}/bench_${scheduler}.json"
+
+    # 检查是否跳过已有结果
+    if [ "${SKIP_EXISTING:-1}" = "1" ] && [ -f "$result_file" ]; then
+        echo "[GPU $gpu_id] 跳过: ${scheduler} tb=${tb} bs=${bs} (结果已存在)"
+        return 0
+    fi
 
     mkdir -p "${result_dir}/logs"
     : > "$log_file"
@@ -225,9 +234,9 @@ run_experiment() {
             export VLLM_PD_K_RATIO=$K_RATIO
             unset VLLM_PD_K_STAR
             ;;
-        pd_direct)
+        pd_ifr)
             export VLLM_USE_PD_SCHEDULER=1
-            export VLLM_PD_K_MODE=direct
+            export VLLM_PD_K_MODE=ifr
             unset VLLM_PD_K_RATIO VLLM_PD_K_STAR
             ;;
     esac

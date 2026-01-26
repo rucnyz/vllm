@@ -1,3 +1,8 @@
+## 只运行ifr(ours)
+```bash
+./pd_exp/run_all_experiments.sh Qwen/Qwen3-8B 4 SCHEDULERS=pd_ifr SKIP_EXISTING=1
+```
+
 ## 一键运行所有实验
 
 ```bash
@@ -5,7 +10,7 @@
 ./pd_exp/run_all_experiments.sh Qwen/Qwen3-8B 4
 ./pd_exp/run_all_experiments.sh Qwen/Qwen3-30B-A3B 4 # ongoing
 DTYPE=bfloat16 ./pd_exp/run_all_experiments.sh google/gemma-3-1b-it 4 # ongoing
-./pd_exp/run_all_experiments.sh openai/gpt-oss-120b 4 # 
+./pd_exp/run_all_experiments.sh openai/gpt-oss-20b 5 # 
 
 # 可选参数
 SKIP_CALIBRATION=true ./pd_exp/run_all_experiments.sh ...  # 跳过校准
@@ -113,7 +118,7 @@ python pd_exp/analyze_benchmark_stats.py pd_exp/outputs/grid_search_longbench_pr
 
 ## WildChat (Prefix Cache Testing)
 
-多轮对话场景，用于测试 prefix cache 效果。对比 baseline、pd_ratio、pd_direct 三种 scheduler。
+多轮对话场景，用于测试 prefix cache 效果。对比 baseline、pd_ratio、pd_ifr 三种 scheduler。
 
 ```bash
 # A6000完成 - baseline, pd_ratio
@@ -163,7 +168,7 @@ RESUME=true ./pd_exp/multiturn/run_benchmark.sh ./pd_exp/outputs/wildchat_multit
 
 - **baseline**: vLLM 默认调度器
 - **pd_ratio**: PD scheduler，固定 θ*=K_RATIO
-- **pd_direct**: PD scheduler，direct 模式 (自动 k*)
+- **pd_ifr**: PD scheduler，IFR 模式 (基于 hazard rate 自适应 θ*)
 
 ### Prefix Cache 工作原理
 

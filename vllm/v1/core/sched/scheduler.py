@@ -280,6 +280,30 @@ class Scheduler(SchedulerInterface):
             # Will be replaced by actual measurement after first N requests complete
             self.pd_p = 0.01
 
+            # IFR (Increasing Failure Rate) mode parameters
+            # Used for online adaptive threshold selection (Algorithm 2)
+            # Must be initialized before k* mode selection below
+            if self.pd_k_mode == "ifr":
+                # All output length samples (no sliding window, use all data)
+                self.pd_ifr_samples: list[int] = []
+                # M: Update interval (re-estimate every M completions)
+                self.pd_ifr_update_interval = int(os.environ.get(
+                    "VLLM_PD_IFR_UPDATE_INTERVAL", "100"))
+                # W_min: Minimum samples before estimation starts
+                self.pd_ifr_min_samples = int(os.environ.get(
+                    "VLLM_PD_IFR_MIN_SAMPLES", "30"))
+                # θ_default: Default theta during cold-start phase
+                self.pd_ifr_default_theta = float(os.environ.get(
+                    "VLLM_PD_IFR_DEFAULT_THETA", "0.8"))
+                # c: Independent update counter
+                self.pd_ifr_update_counter = 0
+                # Estimated hazard rate parameters: h(t) = p_0 + η * t
+                self.pd_hazard_p0 = 0.01  # Base hazard rate (will be estimated)
+                self.pd_hazard_eta = 0.0  # Hazard rate slope (η >= 0 for IFR)
+                # Maximum theta to prevent excessive waiting
+                self.pd_theta_max = float(os.environ.get(
+                    "VLLM_PD_THETA_MAX", "0.95"))
+
             # Initialize k* based on mode
             if self.pd_k_mode == "direct":
                 # 若指定了 k*，使用固定值；否则计算最优 k*
@@ -292,6 +316,11 @@ class Scheduler(SchedulerInterface):
                 if not self.pd_k_ratio_user_specified:
                     self.pd_k_ratio = self._compute_optimal_ratio()
                 self.pd_switch_threshold_k = self._compute_k_from_ratio()
+            elif self.pd_k_mode == "ifr":
+                # IFR mode: use default theta during cold-start phase
+                # Will adapt based on hazard rate estimation as samples accumulate
+                self.pd_k_ratio = self.pd_ifr_default_theta
+                self.pd_switch_threshold_k = self._compute_k_from_ratio()
             else:
                 logger.warning(f"Unknown k mode '{self.pd_k_mode}', using direct mode")
                 self.pd_k_mode = "direct"
@@ -301,9 +330,12 @@ class Scheduler(SchedulerInterface):
             if self.pd_k_mode == "direct":
                 dyn_tag = "fixed" if self.pd_k_star_user_specified else "auto"
                 k_info = f"k*={self.pd_switch_threshold_k} ({dyn_tag})"
-            else:  # ratio
+            elif self.pd_k_mode == "ratio":
                 dyn_tag = "fixed" if self.pd_k_ratio_user_specified else "auto"
                 k_info = f"θ*={self.pd_k_ratio:.4f}, k*={self.pd_switch_threshold_k} ({dyn_tag})"
+            else:  # ifr
+                k_info = (f"θ*={self.pd_k_ratio:.4f}, k*={self.pd_switch_threshold_k} "
+                          f"(IFR adaptive, θ_max={self.pd_theta_max})")
             logger.info(
                 f"[P/D Competition Scheduler] Initialized: "
                 f"N={self.pd_batch_size_N}, k_mode={k_info}, "
@@ -387,7 +419,7 @@ class Scheduler(SchedulerInterface):
 
     def get_pd_stats(self) -> dict:
         """Get current P/D scheduling statistics for monitoring."""
-        return {
+        stats = {
             "phase": self.pd_phase,
             "k_star": self.pd_switch_threshold_k,
             "k_ratio": self.pd_k_ratio,
@@ -405,6 +437,17 @@ class Scheduler(SchedulerInterface):
             "adaptive_kv_threshold": self._compute_adaptive_kv_threshold(),
             "adaptive_N": self._compute_adaptive_N(),
         }
+        # Add IFR-specific stats if in IFR mode
+        if self.pd_k_mode == "ifr":
+            stats.update({
+                "hazard_p0": self.pd_hazard_p0,
+                "hazard_eta": self.pd_hazard_eta,
+                "ifr_sample_count": len(self.pd_ifr_samples),
+                "ifr_update_counter": self.pd_ifr_update_counter,
+                "ifr_update_interval": self.pd_ifr_update_interval,
+                "theta_max": self.pd_theta_max,
+            })
+        return stats
 
     # @cprofile("compute_optimal_k.prof")
     def _compute_optimal_k(self) -> int:
@@ -524,6 +567,253 @@ class Scheduler(SchedulerInterface):
 
         return theta_star
 
+    def _estimate_hazard_params(self) -> tuple[float, float]:
+        """
+        Estimate hazard rate parameters (p_0, η) from sliding window samples.
+
+        The empirical hazard rate at iteration t is:
+            ĥ(t) = #{O_i = t} / #{O_i >= t}
+
+        We fit h(t) = p_0 + η * t via weighted least squares over t ∈ [1, t_95],
+        with weights w_t = #{O_i >= t} to prioritize reliable early estimates.
+
+        Returns:
+            tuple[float, float]: (p_0, η) where η >= 0 for IFR distributions
+        """
+        # Use all historical samples for estimation
+        samples = self.pd_ifr_samples
+        if len(samples) < self.pd_ifr_min_samples:
+            # Not enough samples, return current estimates
+            return self.pd_hazard_p0, self.pd_hazard_eta
+
+        # Compute t_95 (95th percentile) as cutoff
+        sorted_samples = sorted(samples)
+        t_95 = sorted_samples[int(len(sorted_samples) * 0.95)]
+        t_95 = max(t_95, 10)  # Ensure at least 10 time points
+
+        # Count occurrences and survivors
+        from collections import Counter
+        counts = Counter(samples)
+        max_t = max(samples)
+
+        # Compute survivors: #{O_i >= t} for each t
+        survivors = [0] * (max_t + 2)
+        survivors[max_t + 1] = 0
+        for t in range(max_t, 0, -1):
+            survivors[t] = survivors[t + 1] + counts.get(t, 0)
+
+        # Compute empirical hazard rate and perform weighted least squares
+        # h(t) = p_0 + η * t
+        # Minimize: Σ w_t * (ĥ(t) - p_0 - η * t)^2
+        sum_w = 0.0
+        sum_wt = 0.0
+        sum_wt2 = 0.0
+        sum_wh = 0.0
+        sum_wth = 0.0
+
+        for t in range(1, min(t_95 + 1, max_t + 1)):
+            n_t = survivors[t]
+            if n_t < 5:  # Skip unreliable estimates
+                continue
+            d_t = counts.get(t, 0)
+            h_t = d_t / n_t  # Empirical hazard at t
+
+            w = n_t  # Weight by number of survivors
+            sum_w += w
+            sum_wt += w * t
+            sum_wt2 += w * t * t
+            sum_wh += w * h_t
+            sum_wth += w * t * h_t
+
+        if sum_w < 10:
+            # Not enough valid data points
+            return self.pd_hazard_p0, self.pd_hazard_eta
+
+        # Solve normal equations for weighted least squares
+        # [sum_w    sum_wt ] [p_0]   [sum_wh ]
+        # [sum_wt   sum_wt2] [η  ] = [sum_wth]
+        det = sum_w * sum_wt2 - sum_wt * sum_wt
+        if abs(det) < 1e-10:
+            # Singular matrix, use sample mean based estimate
+            sample_mean = sum(samples) / len(samples)
+            p_0 = 1.0 / sample_mean if sample_mean > 0 else 0.01
+            return p_0, 0.0
+
+        p_0_raw = (sum_wt2 * sum_wh - sum_wt * sum_wth) / det
+        eta_raw = (sum_w * sum_wth - sum_wt * sum_wh) / det
+
+        # Compute sample mean for a more reliable p estimate
+        sample_mean = sum(samples) / len(samples)
+        p_from_mean = 1.0 / sample_mean if sample_mean > 0 else 0.01
+
+        # Check if hazard rate fitting is reliable
+        # For long sequences, early h(t) are all zeros, causing negative p_0
+        # If p_0_raw is negative or much smaller than mean-based estimate,
+        # the linear hazard model h(t) = p_0 + η*t doesn't fit well
+        if p_0_raw < p_from_mean * 0.1:
+            # Hazard rate fitting unreliable, fall back to CFR (η=0)
+            # Use sample mean based estimate for p_0
+            return p_from_mean, 0.0
+
+        # Ensure valid ranges
+        p_0 = max(0.0001, p_0_raw)
+        eta = max(0.0, eta_raw)  # η >= 0 for IFR (clamp negative to CFR)
+
+        return p_0, eta
+
+    def _compute_ifr_correction(self, theta_cfr: float) -> float:
+        """
+        Compute IFR correction Δθ based on Proposition 3.
+
+        For linear increasing hazard rate h(t) = p_0 + η * t with η > 0,
+        the optimal threshold admits:
+            θ*_IFR = θ*_CFR + Δθ
+
+        where:
+            Δθ = (η(1-θ*_CFR)²) / (p_0² * θ*_CFR) *
+                 [Λ(θ*_CFR/(1-θ*_CFR) - Λ/2) + ρ(Λ - θ*_CFR)]
+
+        with Λ = -ln(1-θ*_CFR) and ρ = β_d * N / α_d.
+
+        Args:
+            theta_cfr: The CFR baseline threshold θ*_CFR
+
+        Returns:
+            float: The correction Δθ (always >= 0)
+        """
+        if self.pd_hazard_eta <= 0 or theta_cfr <= 0 or theta_cfr >= 1:
+            return 0.0
+
+        import math
+
+        p_0 = self.pd_hazard_p0
+        eta = self.pd_hazard_eta
+
+        # Λ = -ln(1 - θ*_CFR)
+        Lambda = -math.log(1 - theta_cfr)
+
+        # ρ = β_d * N / α_d (per-token cost ratio)
+        rho = self.pd_beta_d * self.pd_batch_size_N / self.pd_alpha_d
+
+        # Duration effect: Λ * (θ*_CFR/(1-θ*_CFR) - Λ/2)
+        duration_effect = Lambda * (theta_cfr / (1 - theta_cfr) - Lambda / 2)
+
+        # Per-token cost effect: ρ * (Λ - θ*_CFR)
+        per_token_effect = rho * (Lambda - theta_cfr)
+
+        # Δθ = (η(1-θ*_CFR)²) / (p_0² * θ*_CFR) * [duration + per_token]
+        numerator = eta * (1 - theta_cfr) ** 2
+        denominator = p_0 ** 2 * theta_cfr
+
+        if denominator < 1e-12:
+            return 0.0
+
+        delta_theta = (numerator / denominator) * (duration_effect + per_token_effect)
+
+        # Ensure non-negative and limit max correction to prevent explosion
+        # When p_0 is very small (unreliable estimate), Δθ can explode
+        # Limit to 0.3 to avoid extreme jumps (θ* = θ_CFR + Δθ)
+        delta_theta = max(0.0, min(delta_theta, 0.3))
+        return delta_theta
+
+    def _compute_optimal_ratio_ifr(self) -> float:
+        """
+        Compute optimal ratio θ* with IFR correction.
+
+        This implements Algorithm 1 (Adaptive Threshold Selection):
+        1. Estimate hazard rate parameters (p_0, η) from samples
+        2. Compute CFR baseline θ*_CFR using Proposition 1
+        3. If η > 0, apply IFR correction from Proposition 3
+        4. Return θ* = min(θ*_CFR + Δθ, θ_max)
+
+        Returns:
+            float: Optimal ratio θ* in (0, θ_max]
+        """
+        # Step 1: Estimate hazard rate parameters
+        p_0, eta = self._estimate_hazard_params()
+        self.pd_hazard_p0 = p_0
+        self.pd_hazard_eta = eta
+
+        # Step 2: Compute CFR baseline using p_0 (not self.pd_p)
+        # Temporarily set pd_p to p_0 for _compute_optimal_ratio
+        old_p = self.pd_p
+        self.pd_p = p_0
+        theta_cfr = self._compute_optimal_ratio()
+        self.pd_p = old_p
+
+        # Step 3: Apply IFR correction if η > 0
+        if eta > 0:
+            delta_theta = self._compute_ifr_correction(theta_cfr)
+            theta_star = theta_cfr + delta_theta
+        else:
+            theta_star = theta_cfr
+
+        # Step 4: Clamp to θ_max
+        theta_star = min(theta_star, self.pd_theta_max)
+        theta_star = max(0.01, theta_star)
+
+        logger.debug(
+            f"IFR optimal ratio: θ*={theta_star:.4f} "
+            f"(θ*_CFR={theta_cfr:.4f}, Δθ={theta_star - theta_cfr:.4f}, "
+            f"p_0={p_0:.6f}, η={eta:.8f})"
+        )
+
+        return theta_star
+
+    def _update_ifr_threshold(self) -> None:
+        """
+        Online adaptive threshold update (Algorithm 2).
+
+        Called every M completions when window has >= W_min samples.
+        Updates hazard rate parameters and recomputes θ*.
+        """
+        old_ratio = self.pd_k_ratio
+        old_k = self.pd_switch_threshold_k
+
+        # Step 1: Estimate hazard rate parameters from sliding window
+        p_0, eta = self._estimate_hazard_params()
+        self.pd_hazard_p0 = p_0
+        self.pd_hazard_eta = eta
+
+        # Step 2: Compute CFR baseline θ_0 using p_0
+        old_p = self.pd_p
+        self.pd_p = p_0
+        theta_0 = self._compute_optimal_ratio()
+        self.pd_p = old_p
+
+        # Step 3: Apply IFR correction if η > 0
+        if eta > 0:
+            delta_theta = self._compute_ifr_correction(theta_0)
+            theta_star = theta_0 + delta_theta
+        else:
+            delta_theta = 0.0
+            theta_star = theta_0
+
+        # Step 4: Clamp to θ_max and update k*
+        theta_star = min(theta_star, self.pd_theta_max)
+        theta_star = max(0.01, theta_star)
+
+        # Apply EMA smoothing to prevent sudden jumps in θ
+        # Use slower update when falling (more conservative) vs rising
+        if theta_star < old_ratio:
+            # Falling: use slower update to avoid being too conservative
+            ema_alpha = 0.1
+        else:
+            # Rising: can update faster
+            ema_alpha = 0.3
+        self.pd_k_ratio = ema_alpha * theta_star + (1 - ema_alpha) * old_ratio
+        self.pd_switch_threshold_k = max(
+            1, int(self.pd_k_ratio * self.pd_batch_size_N))
+
+        # Log significant changes
+        if abs(self.pd_k_ratio - old_ratio) > 0.01 or old_k != self.pd_switch_threshold_k:
+            logger.info(
+                f"[P/D IFR] online update: θ*={old_ratio:.4f}->{self.pd_k_ratio:.4f} "
+                f"(θ_CFR={theta_0:.4f}, Δθ={delta_theta:.4f}), "
+                f"k*={old_k}->{self.pd_switch_threshold_k} "
+                f"(p_0={p_0:.6f}, η={eta:.8f}, samples={len(self.pd_ifr_samples)})"
+            )
+
     def _record_n_update(self, old_n: int, new_n: int, reason: str) -> None:
         """Record an N update event for trajectory tracking."""
         if old_n == new_n:
@@ -640,10 +930,23 @@ class Scheduler(SchedulerInterface):
         k* update behavior by mode:
         - "direct": k* 根据 Proposition 1 计算（除非用户指定了 VLLM_PD_K_STAR）
         - "ratio":  k* = θ* × N, θ* 根据 p 计算（除非用户指定了 VLLM_PD_K_RATIO）
+        - "ifr":    k* = θ* × N, θ* 根据 IFR 校正公式计算（基于 hazard rate 估计）
         """
         # HOT PATH: Only integer operations (zero overhead)
         self.pd_batch_completed_count += 1
         self.pd_batch_total_output_tokens += output_tokens
+
+        # IFR mode: online adaptive update (Algorithm 2)
+        if self.pd_k_mode == "ifr":
+            # Append to sample list (use all historical data)
+            self.pd_ifr_samples.append(output_tokens)
+            self.pd_ifr_update_counter += 1
+
+            # Check if we should update threshold (independent of other params)
+            if (self.pd_ifr_update_counter >= self.pd_ifr_update_interval
+                    and len(self.pd_ifr_samples) >= self.pd_ifr_min_samples):
+                self._update_ifr_threshold()
+                self.pd_ifr_update_counter = 0
 
         # Check if we've reached the update interval
         if self.pd_batch_completed_count < self.pd_param_update_interval:
@@ -697,6 +1000,9 @@ class Scheduler(SchedulerInterface):
                         f"(p={self.pd_p:.4f}, mean_len={batch_mean_len:.1f})"
                     )
 
+            # Note: IFR mode uses independent online update mechanism
+            # (see _update_ifr_threshold called from hot path)
+
         # Reset batch accumulators
         self.pd_batch_completed_count = 0
         self.pd_batch_total_output_tokens = 0
@@ -734,6 +1040,7 @@ class Scheduler(SchedulerInterface):
 
         - direct mode: if user specified k*, don't update; otherwise recompute
         - ratio mode: if user specified ratio, don't update; otherwise recompute
+        - ifr mode: uses independent online update (see _update_ifr_threshold)
         """
         if self.pd_k_mode == "direct":
             if not self.pd_k_star_user_specified:
@@ -741,6 +1048,10 @@ class Scheduler(SchedulerInterface):
         elif self.pd_k_mode == "ratio":
             if not self.pd_k_ratio_user_specified:
                 self.pd_switch_threshold_k = self._compute_k_from_ratio()
+        elif self.pd_k_mode == "ifr":
+            # IFR mode uses independent online update mechanism
+            # Only recalculate k* from current ratio (N may have changed)
+            self.pd_switch_threshold_k = self._compute_k_from_ratio()
 
     def _apply_long_prefill_threshold(self, num_tokens: int) -> int:
         """Apply long prefill token threshold if configured."""
