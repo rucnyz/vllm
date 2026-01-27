@@ -1,8 +1,11 @@
 ## 只运行ifr(ours)
 ```bash
-./pd_exp/run_all_experiments.sh Qwen/Qwen3-8B 4 SCHEDULERS=pd_ifr SKIP_EXISTING=1
+SCHEDULERS=pd_ifr ./pd_exp/run_all_experiments.sh Qwen/Qwen3-8B 4
 ```
-
+如果需要重复运行，可以加上VERSION=1
+```bash
+VERSION=1 SCHEDULERS=pd_ifr SKIP_EXISTING=1 ./pd_exp/run_all_experiments.sh Qwen/Qwen3-8B 4
+```
 ## 一键运行所有实验
 
 ```bash

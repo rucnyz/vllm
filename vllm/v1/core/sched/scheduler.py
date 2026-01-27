@@ -294,7 +294,7 @@ class Scheduler(SchedulerInterface):
                     "VLLM_PD_IFR_MIN_SAMPLES", "30"))
                 # θ_default: Default theta during cold-start phase
                 self.pd_ifr_default_theta = float(os.environ.get(
-                    "VLLM_PD_IFR_DEFAULT_THETA", "0.8"))
+                    "VLLM_PD_IFR_DEFAULT_THETA", "0.80"))
                 # c: Independent update counter
                 self.pd_ifr_update_counter = 0
                 # Estimated hazard rate parameters: h(t) = p_0 + η * t
@@ -302,7 +302,7 @@ class Scheduler(SchedulerInterface):
                 self.pd_hazard_eta = 0.0  # Hazard rate slope (η >= 0 for IFR)
                 # Maximum theta to prevent excessive waiting
                 self.pd_theta_max = float(os.environ.get(
-                    "VLLM_PD_THETA_MAX", "0.95"))
+                    "VLLM_PD_THETA_MAX", "0.90"))
 
             # Initialize k* based on mode
             if self.pd_k_mode == "direct":
@@ -639,25 +639,12 @@ class Scheduler(SchedulerInterface):
             p_0 = 1.0 / sample_mean if sample_mean > 0 else 0.01
             return p_0, 0.0
 
-        p_0_raw = (sum_wt2 * sum_wh - sum_wt * sum_wth) / det
-        eta_raw = (sum_w * sum_wth - sum_wt * sum_wh) / det
-
-        # Compute sample mean for a more reliable p estimate
-        sample_mean = sum(samples) / len(samples)
-        p_from_mean = 1.0 / sample_mean if sample_mean > 0 else 0.01
-
-        # Check if hazard rate fitting is reliable
-        # For long sequences, early h(t) are all zeros, causing negative p_0
-        # If p_0_raw is negative or much smaller than mean-based estimate,
-        # the linear hazard model h(t) = p_0 + η*t doesn't fit well
-        if p_0_raw < p_from_mean * 0.1:
-            # Hazard rate fitting unreliable, fall back to CFR (η=0)
-            # Use sample mean based estimate for p_0
-            return p_from_mean, 0.0
+        p_0 = (sum_wt2 * sum_wh - sum_wt * sum_wth) / det
+        eta = (sum_w * sum_wth - sum_wt * sum_wh) / det
 
         # Ensure valid ranges
-        p_0 = max(0.0001, p_0_raw)
-        eta = max(0.0, eta_raw)  # η >= 0 for IFR (clamp negative to CFR)
+        p_0 = max(0.0001, p_0)  # p_0 must be positive
+        eta = max(0.0, eta)     # η >= 0 for IFR (clamp negative to CFR)
 
         return p_0, eta
 
@@ -710,11 +697,8 @@ class Scheduler(SchedulerInterface):
 
         delta_theta = (numerator / denominator) * (duration_effect + per_token_effect)
 
-        # Ensure non-negative and limit max correction to prevent explosion
-        # When p_0 is very small (unreliable estimate), Δθ can explode
-        # Limit to 0.3 to avoid extreme jumps (θ* = θ_CFR + Δθ)
-        delta_theta = max(0.0, min(delta_theta, 0.3))
-        return delta_theta
+        # Ensure non-negative (should always be positive for IFR)
+        return max(0.0, delta_theta)
 
     def _compute_optimal_ratio_ifr(self) -> float:
         """
@@ -790,18 +774,8 @@ class Scheduler(SchedulerInterface):
             theta_star = theta_0
 
         # Step 4: Clamp to θ_max and update k*
-        theta_star = min(theta_star, self.pd_theta_max)
-        theta_star = max(0.01, theta_star)
-
-        # Apply EMA smoothing to prevent sudden jumps in θ
-        # Use slower update when falling (more conservative) vs rising
-        if theta_star < old_ratio:
-            # Falling: use slower update to avoid being too conservative
-            ema_alpha = 0.1
-        else:
-            # Rising: can update faster
-            ema_alpha = 0.3
-        self.pd_k_ratio = ema_alpha * theta_star + (1 - ema_alpha) * old_ratio
+        self.pd_k_ratio = min(theta_star, self.pd_theta_max)
+        self.pd_k_ratio = max(0.01, self.pd_k_ratio)
         self.pd_switch_threshold_k = max(
             1, int(self.pd_k_ratio * self.pd_batch_size_N))
 
