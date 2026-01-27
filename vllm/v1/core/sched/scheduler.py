@@ -294,7 +294,7 @@ class Scheduler(SchedulerInterface):
                     "VLLM_PD_IFR_MIN_SAMPLES", "30"))
                 # θ_default: Default theta during cold-start phase
                 self.pd_ifr_default_theta = float(os.environ.get(
-                    "VLLM_PD_IFR_DEFAULT_THETA", "0.80"))
+                    "VLLM_PD_IFR_DEFAULT_THETA", "0.70"))
                 # c: Independent update counter
                 self.pd_ifr_update_counter = 0
                 # Estimated hazard rate parameters: h(t) = p_0 + η * t
@@ -302,7 +302,7 @@ class Scheduler(SchedulerInterface):
                 self.pd_hazard_eta = 0.0  # Hazard rate slope (η >= 0 for IFR)
                 # Maximum theta to prevent excessive waiting
                 self.pd_theta_max = float(os.environ.get(
-                    "VLLM_PD_THETA_MAX", "0.90"))
+                    "VLLM_PD_THETA_MAX", "0.80"))
 
             # Initialize k* based on mode
             if self.pd_k_mode == "direct":

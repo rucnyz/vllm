@@ -338,6 +338,15 @@ def load_schedule_data(results_dir: Path, args) -> tuple[dict, dict, dict, dict,
             special_results["dynamic"] = metrics
             print(f"Loaded dynamic: throughput={metrics['overall_throughput_tps']:.0f} tok/s")
 
+    # 加载 ifr_stats.json (IFR 模式)
+    ifr_path = results_dir / "ifr_stats.json"
+    if ifr_path.exists():
+        data = load_json(ifr_path)
+        if data is not None and "stats" in data:
+            metrics = compute_schedule_metrics(data["stats"])
+            special_results["ifr"] = metrics
+            print(f"Loaded IFR: throughput={metrics['overall_throughput_tps']:.0f} tok/s")
+
     return k_star_results, baseline_metrics, dynamic_results, kratio_results, special_results
 
 
@@ -421,6 +430,17 @@ def load_bench_data(results_dir: Path, args) -> tuple[dict, dict, dict, dict]:
             tps = metrics['total_token_throughput']
             ttft = metrics['mean_ttft_ms']
             print(f"Loaded dynamic: throughput={tps:.0f} tok/s, TTFT={ttft:.0f}ms")
+
+    # 加载 bench_ifr.json (IFR 模式)
+    ifr_path = results_dir / "bench_ifr.json"
+    if ifr_path.exists():
+        data = load_json(ifr_path)
+        if data is not None:
+            metrics = extract_bench_metrics(data)
+            special_results["ifr"] = metrics
+            tps = metrics['total_token_throughput']
+            ttft = metrics['mean_ttft_ms']
+            print(f"Loaded IFR: throughput={tps:.0f} tok/s, TTFT={ttft:.0f}ms")
 
     return k_star_results, baseline_result, kratio_results, special_results
 
@@ -901,12 +921,12 @@ def plot_schedule_mode(k_star_results: dict, baseline_metrics: dict, dynamic_res
                    linestyle=':', linewidth=2, alpha=0.8,
                    label=f"Dynamic {name} ({metrics['overall_throughput_tps']:.0f})")
     # 绘制 special_results (ratio_auto, dynamic)
-    special_colors = {'ratio_auto': 'green', 'dynamic': 'purple'}
-    special_styles = {'ratio_auto': '-.', 'dynamic': ':'}
+    special_colors = {'ratio_auto': 'green', 'dynamic': 'purple', 'ifr': 'cyan'}
+    special_styles = {'ratio_auto': '-.', 'dynamic': ':', 'ifr': '--'}
     for name, metrics in special_results.items():
         color = special_colors.get(name, 'gray')
         style = special_styles.get(name, '-.')
-        display_name = {'ratio_auto': 'Ratio Auto (θ* auto)', 'dynamic': 'Dynamic (DP)'}.get(name, name)
+        display_name = {'ratio_auto': 'Ratio Auto (θ* auto)', 'dynamic': 'Dynamic (DP)'}.get(name, 'IFR' if name == 'ifr' else name)
         ax.axhline(y=metrics['overall_throughput_tps'], color=color,
                    linestyle=style, linewidth=2.5, alpha=0.9,
                    label=f"{display_name} ({metrics['overall_throughput_tps']:.0f})")
@@ -935,7 +955,7 @@ def plot_schedule_mode(k_star_results: dict, baseline_metrics: dict, dynamic_res
     for name, metrics in special_results.items():
         color = special_colors.get(name, 'gray')
         style = special_styles.get(name, '-.')
-        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
         ax.axhline(y=metrics['prefill_throughput_tps'], color=color,
                    linestyle=style, linewidth=2, alpha=0.7,
                    label=f"{display_name} Prefill ({metrics['prefill_throughput_tps']:.0f})")
@@ -954,7 +974,7 @@ def plot_schedule_mode(k_star_results: dict, baseline_metrics: dict, dynamic_res
     for name, metrics in special_results.items():
         color = special_decode_colors.get(name, 'gray')
         style = special_styles.get(name, '-.')
-        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
         ax2.axhline(y=metrics['decode_throughput_tps'], color=color,
                     linestyle=style, linewidth=2, alpha=0.7,
                     label=f"{display_name} Decode ({metrics['decode_throughput_tps']:.0f})")
@@ -995,7 +1015,7 @@ def plot_schedule_mode(k_star_results: dict, baseline_metrics: dict, dynamic_res
     for name, metrics in special_results.items():
         color = special_interval_colors.get(name, 'gray')
         style = special_styles.get(name, '-.')
-        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
         ax.axhline(y=metrics['schedule_interval_ms_mean'], color=color,
                    linestyle=style, linewidth=2, alpha=0.7,
                    label=f"{display_name} ({metrics['schedule_interval_ms_mean']:.2f} ms)")
@@ -1015,7 +1035,7 @@ def plot_schedule_mode(k_star_results: dict, baseline_metrics: dict, dynamic_res
     for name, metrics in special_results.items():
         color = special_toksched_colors.get(name, 'gray')
         style = special_styles.get(name, '-.')
-        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
         ax2.axhline(y=metrics['tokens_per_schedule_mean'], color=color,
                     linestyle=style, linewidth=2, alpha=0.7,
                     label=f"{display_name} ({metrics['tokens_per_schedule_mean']:.1f})")
@@ -1059,7 +1079,7 @@ def plot_schedule_mode(k_star_results: dict, baseline_metrics: dict, dynamic_res
     for name, metrics in special_results.items():
         color = special_colors.get(name, 'gray')
         style = special_styles.get(name, '-.')
-        display_name = {'ratio_auto': 'Ratio Auto', 'dynamic': 'Dynamic (DP)'}.get(name, name)
+        display_name = {'ratio_auto': 'Ratio Auto', 'dynamic': 'Dynamic (DP)'}.get(name, 'IFR' if name == 'ifr' else name)
         ax.axhline(y=metrics['num_schedules'], color=color,
                    linestyle=style, linewidth=2.5, alpha=0.9,
                    label=f"{display_name} ({metrics['num_schedules']})")
@@ -1089,7 +1109,7 @@ def plot_schedule_mode(k_star_results: dict, baseline_metrics: dict, dynamic_res
         for name, metrics in special_results.items():
             color = special_colors.get(name, 'gray')
             style = special_styles.get(name, '-.')
-            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
             preempt_reqs = metrics.get('total_preempted_reqs', 0)
             ax.axhline(y=preempt_reqs, color=color,
                        linestyle=style, linewidth=2, alpha=0.7,
@@ -1105,7 +1125,7 @@ def plot_schedule_mode(k_star_results: dict, baseline_metrics: dict, dynamic_res
         for name, metrics in special_results.items():
             color = special_preempt_tok_colors.get(name, 'gray')
             style = special_styles.get(name, '-.')
-            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
             preempt_toks = metrics.get('total_preempted_tokens', 0)
             ax2.axhline(y=preempt_toks, color=color,
                         linestyle=style, linewidth=2, alpha=0.7,
@@ -1151,7 +1171,7 @@ def plot_schedule_mode(k_star_results: dict, baseline_metrics: dict, dynamic_res
     for name, metrics in special_results.items():
         color = special_colors.get(name, 'gray')
         style = special_styles.get(name, '-.')
-        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
         sp_prefill = metrics.get('total_prefill_tokens', 0)
         sp_decode = metrics.get('total_decode_tokens', 0)
         sp_overhead = (sp_prefill - sp_decode) / sp_decode * 100 if sp_decode > 0 else 0
@@ -1853,12 +1873,12 @@ def plot_all_mode(schedule_data: tuple, bench_data: tuple, output_path: str, no_
                        linestyle=':', linewidth=2, alpha=0.8,
                        label=f"Dynamic {name} ({metrics['overall_throughput_tps']:.0f})")
         # 绘制 special_results (ratio_auto, dynamic)
-        special_colors = {'ratio_auto': 'green', 'dynamic': 'purple'}
-        special_styles = {'ratio_auto': '-.', 'dynamic': ':'}
+        special_colors = {'ratio_auto': 'green', 'dynamic': 'purple', 'ifr': 'cyan'}
+        special_styles = {'ratio_auto': '-.', 'dynamic': ':', 'ifr': '--'}
         for name, metrics in special_results_sched.items():
             color = special_colors.get(name, 'gray')
             style = special_styles.get(name, '-.')
-            display_name = {'ratio_auto': 'Ratio Auto', 'dynamic': 'Dynamic (DP)'}.get(name, name)
+            display_name = {'ratio_auto': 'Ratio Auto', 'dynamic': 'Dynamic (DP)'}.get(name, 'IFR' if name == 'ifr' else name)
             ax.axhline(y=metrics['overall_throughput_tps'], color=color,
                        linestyle=style, linewidth=2.5, alpha=0.9,
                        label=f"{display_name} ({metrics['overall_throughput_tps']:.0f})")
@@ -1886,7 +1906,7 @@ def plot_all_mode(schedule_data: tuple, bench_data: tuple, output_path: str, no_
         for name, metrics in special_results_sched.items():
             color = special_colors.get(name, 'gray')
             style = special_styles.get(name, '-.')
-            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
             ax.axhline(y=metrics['prefill_throughput_tps'], color=color,
                        linestyle=style, linewidth=2, alpha=0.7,
                        label=f"{display_name} P ({metrics['prefill_throughput_tps']:.0f})")
@@ -1905,7 +1925,7 @@ def plot_all_mode(schedule_data: tuple, bench_data: tuple, output_path: str, no_
         for name, metrics in special_results_sched.items():
             color = special_decode_colors.get(name, 'gray')
             style = special_styles.get(name, '-.')
-            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
             ax2.axhline(y=metrics['decode_throughput_tps'], color=color,
                         linestyle=style, linewidth=2, alpha=0.7,
                         label=f"{display_name} D ({metrics['decode_throughput_tps']:.0f})")
@@ -1931,7 +1951,7 @@ def plot_all_mode(schedule_data: tuple, bench_data: tuple, output_path: str, no_
         for name, metrics in special_results_sched.items():
             color = special_interval_colors.get(name, 'gray')
             style = special_styles.get(name, '-.')
-            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
             ax.axhline(y=metrics['schedule_interval_ms_mean'], color=color,
                        linestyle=style, linewidth=2, alpha=0.7,
                        label=f"{display_name} ({metrics['schedule_interval_ms_mean']:.2f}ms)")
@@ -1951,7 +1971,7 @@ def plot_all_mode(schedule_data: tuple, bench_data: tuple, output_path: str, no_
         for name, metrics in special_results_sched.items():
             color = special_toksched_colors.get(name, 'gray')
             style = special_styles.get(name, '-.')
-            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
             ax2.axhline(y=metrics['tokens_per_schedule_mean'], color=color,
                         linestyle=style, linewidth=2, alpha=0.7,
                         label=f"{display_name} ({metrics['tokens_per_schedule_mean']:.1f})")
@@ -1980,7 +2000,7 @@ def plot_all_mode(schedule_data: tuple, bench_data: tuple, output_path: str, no_
         for name, metrics in special_results_sched.items():
             color = special_colors.get(name, 'gray')
             style = special_styles.get(name, '-.')
-            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
             ax.axhline(y=metrics['num_schedules'], color=color,
                        linestyle=style, linewidth=2.5, alpha=0.9,
                        label=f"{display_name} ({metrics['num_schedules']})")
@@ -2011,7 +2031,7 @@ def plot_all_mode(schedule_data: tuple, bench_data: tuple, output_path: str, no_
             for name, metrics in special_results_sched.items():
                 color = special_colors.get(name, 'gray')
                 style = special_styles.get(name, '-.')
-                display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+                display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
                 preempt_reqs = metrics.get('total_preempted_reqs', 0)
                 ax.axhline(y=preempt_reqs, color=color,
                            linestyle=style, linewidth=2, alpha=0.7,
@@ -2033,7 +2053,7 @@ def plot_all_mode(schedule_data: tuple, bench_data: tuple, output_path: str, no_
             for name, metrics in special_results_sched.items():
                 color = special_preempt_tok_colors.get(name, 'gray')
                 style = special_styles.get(name, '-.')
-                display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+                display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
                 preempt_toks = metrics.get('total_preempted_tokens', 0)
                 ax2.axhline(y=preempt_toks, color=color,
                             linestyle=style, linewidth=2, alpha=0.7,
@@ -2084,7 +2104,7 @@ def plot_all_mode(schedule_data: tuple, bench_data: tuple, output_path: str, no_
         for name, metrics in special_results_sched.items():
             color = special_colors.get(name, 'gray')
             style = special_styles.get(name, '-.')
-            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
             sp_prefill = metrics.get('total_prefill_tokens', 0)
             sp_decode = metrics.get('total_decode_tokens', 0)
             sp_overhead = (sp_prefill - sp_decode) / sp_decode * 100 if sp_decode > 0 else 0
@@ -2134,12 +2154,12 @@ def plot_all_mode(schedule_data: tuple, bench_data: tuple, output_path: str, no_
                        linestyle='--', linewidth=2,
                        label=f"Baseline ({baseline_result['total_token_throughput']:.0f})")
         # 绘制 special_results (ratio_auto, dynamic)
-        special_colors = {'ratio_auto': 'green', 'dynamic': 'purple'}
-        special_styles = {'ratio_auto': '-.', 'dynamic': ':'}
+        special_colors = {'ratio_auto': 'green', 'dynamic': 'purple', 'ifr': 'cyan'}
+        special_styles = {'ratio_auto': '-.', 'dynamic': ':', 'ifr': '--'}
         for name, metrics in special_results_bench.items():
             color = special_colors.get(name, 'gray')
             style = special_styles.get(name, '-.')
-            display_name = {'ratio_auto': 'Ratio Auto', 'dynamic': 'Dynamic (DP)'}.get(name, name)
+            display_name = {'ratio_auto': 'Ratio Auto', 'dynamic': 'Dynamic (DP)'}.get(name, 'IFR' if name == 'ifr' else name)
             ax.axhline(y=metrics['total_token_throughput'], color=color,
                        linestyle=style, linewidth=2.5, alpha=0.9,
                        label=f"{display_name} ({metrics['total_token_throughput']:.0f})")
@@ -2176,7 +2196,7 @@ def plot_all_mode(schedule_data: tuple, bench_data: tuple, output_path: str, no_
             out_color = special_output_colors.get(name, 'gray')
             req_color = special_request_colors.get(name, 'gray')
             style = special_styles.get(name, '-.')
-            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
             ax.axhline(y=metrics['output_throughput'], color=out_color,
                        linestyle=style, linewidth=2, alpha=0.7,
                        label=f"{display_name} Out ({metrics['output_throughput']:.0f})")
@@ -2204,7 +2224,7 @@ def plot_all_mode(schedule_data: tuple, bench_data: tuple, output_path: str, no_
         for name, metrics in special_results_bench.items():
             color = special_colors.get(name, 'gray')
             style = special_styles.get(name, '-.')
-            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
             ax.axhline(y=metrics['mean_ttft_ms'], color=color,
                        linestyle=style, linewidth=2, alpha=0.7,
                        label=f"{display_name} ({metrics['mean_ttft_ms']:.0f}ms)")
@@ -2233,7 +2253,7 @@ def plot_all_mode(schedule_data: tuple, bench_data: tuple, output_path: str, no_
         for name, metrics in special_results_bench.items():
             color = special_colors.get(name, 'gray')
             style = special_styles.get(name, '-.')
-            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
             ax.axhline(y=metrics['mean_tpot_ms'], color=color,
                        linestyle=style, linewidth=2, alpha=0.7,
                        label=f"{display_name} ({metrics['mean_tpot_ms']:.2f}ms)")
@@ -2262,7 +2282,7 @@ def plot_all_mode(schedule_data: tuple, bench_data: tuple, output_path: str, no_
         for name, metrics in special_results_bench.items():
             color = special_colors.get(name, 'gray')
             style = special_styles.get(name, '-.')
-            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+            display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
             ax.axhline(y=metrics['mean_itl_ms'], color=color,
                        linestyle=style, linewidth=2, alpha=0.7,
                        label=f"{display_name} ({metrics['mean_itl_ms']:.2f}ms)")
@@ -2296,7 +2316,7 @@ def plot_all_mode(schedule_data: tuple, bench_data: tuple, output_path: str, no_
         for name, metrics in special_results_bench.items():
             color = special_colors.get(name, 'gray')
             marker = special_markers.get(name, 'o')
-            display_name = {'ratio_auto': 'Ratio Auto', 'dynamic': 'Dynamic (DP)'}.get(name, name)
+            display_name = {'ratio_auto': 'Ratio Auto', 'dynamic': 'Dynamic (DP)'}.get(name, 'IFR' if name == 'ifr' else name)
             ax.scatter(metrics['mean_ttft_ms'], metrics['total_token_throughput'],
                        c=color, s=150, marker=marker, edgecolors='black',
                        linewidths=1, label=display_name, zorder=5)
@@ -2460,12 +2480,12 @@ def plot_bench_mode(k_star_results: dict, baseline_result: dict, output_path: st
                    linestyle='--', linewidth=2,
                    label=f"Baseline ({baseline_result['total_token_throughput']:.0f})")
     # 绘制 special_results (ratio_auto, dynamic)
-    special_colors = {'ratio_auto': 'green', 'dynamic': 'purple'}
-    special_styles = {'ratio_auto': '-.', 'dynamic': ':'}
+    special_colors = {'ratio_auto': 'green', 'dynamic': 'purple', 'ifr': 'cyan'}
+    special_styles = {'ratio_auto': '-.', 'dynamic': ':', 'ifr': '--'}
     for name, metrics in special_results.items():
         color = special_colors.get(name, 'gray')
         style = special_styles.get(name, '-.')
-        display_name = {'ratio_auto': 'Ratio Auto (θ* auto)', 'dynamic': 'Dynamic (DP)'}.get(name, name)
+        display_name = {'ratio_auto': 'Ratio Auto (θ* auto)', 'dynamic': 'Dynamic (DP)'}.get(name, 'IFR' if name == 'ifr' else name)
         ax.axhline(y=metrics['total_token_throughput'], color=color,
                    linestyle=style, linewidth=2.5, alpha=0.9,
                    label=f"{display_name} ({metrics['total_token_throughput']:.0f})")
@@ -2505,7 +2525,7 @@ def plot_bench_mode(k_star_results: dict, baseline_result: dict, output_path: st
         out_color = special_output_colors.get(name, 'gray')
         req_color = special_request_colors.get(name, 'gray')
         style = special_styles.get(name, '-.')
-        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
         ax.axhline(y=metrics['output_throughput'], color=out_color,
                    linestyle=style, linewidth=2, alpha=0.7,
                    label=f"{display_name} Out ({metrics['output_throughput']:.0f})")
@@ -2547,7 +2567,7 @@ def plot_bench_mode(k_star_results: dict, baseline_result: dict, output_path: st
     for name, metrics in special_results.items():
         color = special_colors.get(name, 'gray')
         style = special_styles.get(name, '-.')
-        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
         ax.axhline(y=metrics['mean_ttft_ms'], color=color,
                    linestyle=style, linewidth=2, alpha=0.7,
                    label=f"{display_name} ({metrics['mean_ttft_ms']:.0f}ms)")
@@ -2577,7 +2597,7 @@ def plot_bench_mode(k_star_results: dict, baseline_result: dict, output_path: st
     for name, metrics in special_results.items():
         color = special_colors.get(name, 'gray')
         style = special_styles.get(name, '-.')
-        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
         ax.axhline(y=metrics['mean_tpot_ms'], color=color,
                    linestyle=style, linewidth=2, alpha=0.7,
                    label=f"{display_name} ({metrics['mean_tpot_ms']:.2f}ms)")
@@ -2607,7 +2627,7 @@ def plot_bench_mode(k_star_results: dict, baseline_result: dict, output_path: st
     for name, metrics in special_results.items():
         color = special_colors.get(name, 'gray')
         style = special_styles.get(name, '-.')
-        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
         ax.axhline(y=metrics['mean_itl_ms'], color=color,
                    linestyle=style, linewidth=2, alpha=0.7,
                    label=f"{display_name} ({metrics['mean_itl_ms']:.2f}ms)")
@@ -2642,7 +2662,7 @@ def plot_bench_mode(k_star_results: dict, baseline_result: dict, output_path: st
     for name, metrics in special_results.items():
         color = special_colors.get(name, 'gray')
         marker = special_markers.get(name, 'o')
-        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, name)
+        display_name = {'ratio_auto': 'R.Auto', 'dynamic': 'Dynamic'}.get(name, 'IFR' if name == 'ifr' else name)
         ax.scatter(metrics['mean_ttft_ms'], metrics['total_token_throughput'],
                    c=color, s=150, marker=marker, edgecolors='black',
                    linewidths=1, label=display_name, zorder=5)
