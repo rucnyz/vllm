@@ -33,10 +33,45 @@ select_gpus() {
 # 检查端口是否可用
 check_port_available() {
     local port=$1 gpu_id=${2:-""}
-    if lsof -i :$port >/dev/null 2>&1; then
+    # 只检查 LISTEN 状态，避免被 TIME_WAIT/ESTABLISHED 误判为占用
+    if lsof -nP -iTCP:$port -sTCP:LISTEN >/dev/null 2>&1; then
         echo "[GPU $gpu_id] 端口 $port 被占用"
         return 1
     fi
+}
+
+# 使用 Python 真正尝试 bind 来判断端口是否可用（不依赖 lsof 权限）
+port_is_free() {
+    local port=$1
+    python - "$port" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("0.0.0.0", port))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+}
+
+# 从起始端口开始查找可用端口
+find_free_port() {
+    local start_port=$1
+    local max_tries=${2:-50}
+    local port=$start_port
+    local i=0
+    while [ $i -lt $max_tries ]; do
+        if port_is_free "$port"; then
+            echo "$port"
+            return 0
+        fi
+        port=$((port + 1))
+        i=$((i + 1))
+    done
+    return 1
 }
 
 # 等待 GPU 内存释放

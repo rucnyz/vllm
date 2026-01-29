@@ -765,6 +765,714 @@ def plot_ratio_analysis(
     return fig, ax
 
 
+def plot_slope_vs_ratio(
+    pure_prefill: dict,
+    pure_decode: dict,
+    mixed_by_ratio: dict[float, dict],
+    config: dict,
+    output_path: str,
+    target_ratios: list[float],
+):
+    """
+    Plot slope as a function of decode ratio - clean visualization for papers.
+
+    This creates a simple line/scatter plot showing how the effective slope
+    (ms per token) changes with decode ratio, clearly highlighting the
+    non-monotonic behavior where high decode ratios can exceed 100% decode.
+    """
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    # Collect slope data
+    ratios = []
+    slopes = []
+    slope_errors = []
+
+    # Add pure prefill (0% decode)
+    if pure_prefill["x"].size > 0 and len(pure_prefill["x"]) >= 2:
+        prefill_slope, _ = np.polyfit(pure_prefill["x"], pure_prefill["y"], 1)
+        ratios.append(0.0)
+        slopes.append(prefill_slope)
+        slope_errors.append(0)  # Could compute confidence interval if needed
+
+    # Add mixed ratios
+    for ratio in sorted(target_ratios):
+        data = mixed_by_ratio.get(ratio, {"x": np.array([])})
+        if len(data["x"]) >= 2:
+            x_arr = np.array(data["x"])
+            y_arr = np.array(data["y"])
+            slope, _ = np.polyfit(x_arr, y_arr, 1)
+            ratios.append(ratio)
+            slopes.append(slope)
+            slope_errors.append(0)
+
+    # Add pure decode (100% decode)
+    if pure_decode["x"].size > 0 and len(pure_decode["x"]) >= 2:
+        decode_slope, _ = np.polyfit(pure_decode["x"], pure_decode["y"], 1)
+        ratios.append(1.0)
+        slopes.append(decode_slope)
+        slope_errors.append(0)
+
+    # Convert to arrays
+    ratios = np.array(ratios)
+    slopes = np.array(slopes)
+
+    # Plot main curve
+    ax.plot(
+        ratios * 100,
+        slopes * 1000,  # Convert to μs/token for readability
+        "o-",
+        color="#2c3e50",
+        linewidth=2,
+        markersize=8,
+        markerfacecolor="#3498db",
+        markeredgecolor="#2c3e50",
+        markeredgewidth=1.5,
+        label="Measured slope",
+    )
+
+    # Add horizontal reference line for pure decode
+    if pure_decode["x"].size > 0 and len(pure_decode["x"]) >= 2:
+        ax.axhline(
+            y=decode_slope * 1000,
+            color="#e74c3c",
+            linestyle="--",
+            linewidth=1.5,
+            alpha=0.7,
+            label="Pure decode slope",
+        )
+
+    # Highlight the crossover region
+    # Find where slope exceeds pure decode
+    if len(slopes) > 0 and pure_decode["x"].size > 0 and len(pure_decode["x"]) >= 2:
+        decode_slope_val = decode_slope * 1000
+        for r, s in zip(ratios, slopes):
+            if r < 1.0 and s * 1000 > decode_slope_val:
+                ax.scatter(
+                    [r * 100],
+                    [s * 1000],
+                    color="#e74c3c",
+                    s=150,
+                    zorder=5,
+                    marker="o",
+                    edgecolors="#c0392b",
+                    linewidths=2,
+                )
+
+    # Labels and styling
+    ax.set_xlabel("Decode Ratio (%)", fontsize=12)
+    ax.set_ylabel("Slope (μs/token)", fontsize=12)
+
+    model_name = config.get("model", "Unknown").split("/")[-1]  # Short name
+    ax.set_title(
+        f"Iteration Time Slope vs Decode Ratio\n({model_name})",
+        fontsize=13,
+    )
+
+    ax.set_xlim(-5, 105)
+    ax.set_ylim(bottom=0)
+    ax.grid(True, alpha=0.3, linestyle="-", linewidth=0.5)
+    ax.legend(loc="upper left", fontsize=10)
+
+    # Add percentage labels on x-axis
+    ax.set_xticks([0, 20, 40, 60, 80, 100])
+
+    plt.tight_layout()
+
+    # Save
+    slope_ratio_path = output_path.replace(".png", "_slope_vs_ratio.png")
+    plt.savefig(slope_ratio_path, dpi=300, bbox_inches="tight")
+    print(f"Slope vs ratio plot saved to {slope_ratio_path}")
+
+    # Also save as PDF for paper
+    pdf_path = slope_ratio_path.replace(".png", ".pdf")
+    plt.savefig(pdf_path, bbox_inches="tight")
+    print(f"PDF saved to {pdf_path}")
+
+    return fig, ax
+
+
+def plot_dual_gpu_analysis(
+    h200_data: tuple,  # (pure_prefill, pure_decode, mixed_by_ratio)
+    A6000_data: tuple,
+    output_path: str,
+    highlight_ratios: list[float] | None = None,
+):
+    """
+    Combined 2x2 plot with H200 (left) and A6000 (right).
+    Top row: slope vs ratio, Bottom row: time vs tokens.
+    """
+    if highlight_ratios is None:
+        highlight_ratios = [0.20, 0.40, 0.60, 0.80, 0.90]
+
+    # GPU-specific settings
+    gpu_settings = {
+        "H200": {"ylim": 200, "xlim": 9000, "slope_ymin": 15},
+        "A6000": {"ylim": 250, "xlim": 4500, "slope_ymin": 20},
+    }
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9),
+                              gridspec_kw={'height_ratios': [0.5, 1.5]})
+
+    # Color mapping
+    color_prefill = "#1abc9c"
+    color_decode = "#2c3e50"
+    mixed_colors = ["#27ae60", "#f39c12", "#9b59b6", "#e74c3c", "#8b4513"]
+    markers_list = ["^", "v", "D", "p", "h"]
+
+    gpu_data = [("H200", h200_data), ("A6000", A6000_data)]
+
+    for col, (gpu_name, (pure_prefill, pure_decode, mixed_by_ratio)) in enumerate(gpu_data):
+        settings = gpu_settings[gpu_name]
+        ax1 = axes[0, col]  # Top row
+        ax2 = axes[1, col]  # Bottom row
+
+        # ========== Top subplot: Slope vs Ratio ==========
+        ratios = []
+        slopes = []
+        point_colors = []
+
+        if pure_prefill["x"].size > 0 and len(pure_prefill["x"]) >= 2:
+            prefill_slope, _ = np.polyfit(pure_prefill["x"], pure_prefill["y"], 1)
+            ratios.append(0.0)
+            slopes.append(prefill_slope)
+            point_colors.append(color_prefill)
+
+        for i, ratio in enumerate(highlight_ratios):
+            data = mixed_by_ratio.get(ratio, {"x": np.array([])})
+            if len(data["x"]) >= 2:
+                x_arr = np.array(data["x"])
+                y_arr = np.array(data["y"])
+                slope, _ = np.polyfit(x_arr, y_arr, 1)
+                ratios.append(ratio)
+                slopes.append(slope)
+                point_colors.append(mixed_colors[i % len(mixed_colors)])
+
+        decode_slope = None
+        if pure_decode["x"].size > 0 and len(pure_decode["x"]) >= 2:
+            decode_slope, _ = np.polyfit(pure_decode["x"], pure_decode["y"], 1)
+            ratios.append(1.0)
+            slopes.append(decode_slope)
+            point_colors.append(color_decode)
+
+        ratios = np.array(ratios)
+        slopes = np.array(slopes)
+
+        # Plot connecting line
+        ax1.plot(ratios * 100, slopes * 1000, "-", color="#888888", linewidth=1.5, zorder=1)
+
+        # Plot each point with its color
+        for r, s, c in zip(ratios, slopes, point_colors):
+            ax1.scatter(r * 100, s * 1000, color=c, s=80, zorder=10, edgecolors="white", linewidths=1)
+
+        # Reference line for pure decode
+        if decode_slope is not None:
+            ax1.axhline(y=decode_slope * 1000, color=color_decode, linestyle="--",
+                       linewidth=1.5, alpha=0.7, label="Pure decode (100%)")
+
+        ax1.set_xlabel("Decode Ratio (%)", fontsize=14)
+        if col == 0:  # Only show ylabel on first column
+            ax1.set_ylabel("Slope (μs/token)", fontsize=14)
+        ax1.set_title(f"(a) Slope vs Decode Ratio", fontsize=14, fontweight="bold")
+        ax1.set_xlim(-5, 105)
+        ax1.set_ylim(settings["slope_ymin"], max(slopes) * 1000 * 1.05)
+        ax1.grid(True, alpha=0.3)
+        ax1.legend(loc="lower right", fontsize=12)
+        ax1.set_xticks([0, 20, 40, 60, 80, 100])
+        ax1.tick_params(axis="both", labelsize=11)
+
+        # ========== Bottom subplot: Time vs Tokens ==========
+        line_width = 1.2
+        marker_size = 5
+
+        # Find max x for extending lines
+        all_x = list(pure_prefill["x"]) + list(pure_decode["x"])
+        for ratio in highlight_ratios:
+            data = mixed_by_ratio.get(ratio, {"x": np.array([])})
+            if len(data["x"]) > 0:
+                all_x.extend(data["x"])
+        max_x = max(all_x) if all_x else 10000
+
+        # Plot pure prefill
+        if pure_prefill["x"].size > 0:
+            ax2.plot(pure_prefill["x"], pure_prefill["y"], "o-", color=color_prefill,
+                    linewidth=line_width + 1, markersize=marker_size + 1,
+                    label="Pure Prefill (0%)", zorder=10)
+            if len(pure_prefill["x"]) >= 2:
+                prefill_slope_val, _ = np.polyfit(pure_prefill["x"], pure_prefill["y"], 1)
+                last_x, last_y = pure_prefill["x"][-1], pure_prefill["y"][-1]
+                extend_x = np.array([last_x, max_x * 1.1])
+                extend_y = np.array([last_y, last_y + prefill_slope_val * (max_x * 1.1 - last_x)])
+                ax2.plot(extend_x, extend_y, "--", color=color_prefill, linewidth=1.0, alpha=0.7)
+                ax2.annotate("0%", (last_x, last_y), textcoords="offset points",
+                           xytext=(25, -20), fontsize=11, color=color_prefill, fontweight="bold",
+                           arrowprops=dict(arrowstyle="->", color=color_prefill, lw=1.5))
+
+        # Plot pure decode
+        if pure_decode["x"].size > 0:
+            ax2.plot(pure_decode["x"], pure_decode["y"], "s-", color=color_decode,
+                    linewidth=line_width + 1, markersize=marker_size + 1,
+                    label="Pure Decode (100%)", zorder=10)
+            if len(pure_decode["x"]) >= 2:
+                decode_slope_val, _ = np.polyfit(pure_decode["x"], pure_decode["y"], 1)
+                last_x, last_y = pure_decode["x"][-1], pure_decode["y"][-1]
+                extend_x = np.array([last_x, max_x * 1.1])
+                extend_y = np.array([last_y, last_y + decode_slope_val * (max_x * 1.1 - last_x)])
+                ax2.plot(extend_x, extend_y, "--", color=color_decode, linewidth=1.0, alpha=0.7)
+                ax2.annotate("100%", (last_x, last_y), textcoords="offset points",
+                           xytext=(15, 30), fontsize=11, color=color_decode, fontweight="bold",
+                           arrowprops=dict(arrowstyle="->", color=color_decode, lw=1.5))
+
+        # Plot mixed ratios
+        for i, ratio in enumerate(highlight_ratios):
+            data = mixed_by_ratio.get(ratio, {"x": np.array([])})
+            if len(data["x"]) > 0:
+                percentage = int(ratio * 100)
+                color = mixed_colors[i % len(mixed_colors)]
+                marker = markers_list[i % len(markers_list)]
+                ax2.plot(data["x"], data["y"], f"{marker}-", color=color,
+                        linewidth=line_width, markersize=marker_size, label=f"{percentage}% Decode")
+
+        ax2.set_xlabel("Total Tokens", fontsize=14)
+        if col == 0:  # Only show ylabel on first column
+            ax2.set_ylabel("Execution Time (ms)", fontsize=14)
+        ax2.set_title(f"(b) Execution Time vs Total Tokens", fontsize=14, fontweight="bold")
+        ax2.legend(loc="upper left", fontsize=12, framealpha=0.9)
+        ax2.grid(True, alpha=0.3)
+        ax2.tick_params(axis="both", labelsize=11)
+        ax2.set_xlim(0, settings["xlim"])
+        ax2.set_ylim(0, settings["ylim"])
+
+        # Add GPU name as column title
+        axes[0, col].text(0.5, 1.15, gpu_name, transform=axes[0, col].transAxes,
+                         fontsize=16, fontweight="bold", ha="center")
+
+    plt.tight_layout()
+
+    # Save
+    dual_path = output_path.replace(".png", "_dual_gpu.png")
+    plt.savefig(dual_path, dpi=300, bbox_inches="tight")
+    print(f"Dual GPU plot saved to {dual_path}")
+
+    pdf_path = dual_path.replace(".png", ".pdf")
+    plt.savefig(pdf_path, bbox_inches="tight")
+    print(f"PDF saved to {pdf_path}")
+
+    return fig, axes
+
+
+def plot_combined_analysis(
+    pure_prefill: dict,
+    pure_decode: dict,
+    mixed_by_ratio: dict[float, dict],
+    config: dict,
+    output_path: str,
+    target_ratios: list[float],
+    highlight_ratios: list[float] | None = None,
+    gpu_name: str = "H200",
+):
+    """
+    Combined plot with slope vs ratio (top) and time vs tokens (bottom).
+    Best for papers - shows both the crossover phenomenon and raw data.
+    """
+    if highlight_ratios is None:
+        highlight_ratios = [0.20, 0.40, 0.60, 0.80, 0.90]
+
+    # GPU-specific settings
+    gpu_settings = {
+        "H200": {"ylim": 200, "xlim": 9000, "slope_ymin": 15},
+        "A6000": {"ylim": 250, "xlim": 4500, "slope_ymin": 40},
+    }
+    settings = gpu_settings.get(gpu_name, {"ylim": 200, "xlim": 9000, "slope_ymin": 10})
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6, 9),
+                                     gridspec_kw={'height_ratios': [0.5, 1.5]})
+
+    # ========== Top subplot: Slope vs Ratio ==========
+    # Color mapping to match bottom plot
+    color_prefill = "#1abc9c"
+    color_decode = "#2c3e50"
+    mixed_colors = ["#27ae60", "#f39c12", "#9b59b6", "#e74c3c", "#8b4513"]
+
+    ratios = []
+    slopes = []
+    point_colors = []
+
+    # Add pure prefill (0% decode)
+    if pure_prefill["x"].size > 0 and len(pure_prefill["x"]) >= 2:
+        prefill_slope, _ = np.polyfit(pure_prefill["x"], pure_prefill["y"], 1)
+        ratios.append(0.0)
+        slopes.append(prefill_slope)
+        point_colors.append(color_prefill)
+
+    # Add mixed ratios (only those in highlight_ratios)
+    for i, ratio in enumerate(highlight_ratios):
+        data = mixed_by_ratio.get(ratio, {"x": np.array([])})
+        if len(data["x"]) >= 2:
+            x_arr = np.array(data["x"])
+            y_arr = np.array(data["y"])
+            slope, _ = np.polyfit(x_arr, y_arr, 1)
+            ratios.append(ratio)
+            slopes.append(slope)
+            point_colors.append(mixed_colors[i % len(mixed_colors)])
+
+    # Add pure decode (100% decode)
+    decode_slope = None
+    if pure_decode["x"].size > 0 and len(pure_decode["x"]) >= 2:
+        decode_slope, _ = np.polyfit(pure_decode["x"], pure_decode["y"], 1)
+        ratios.append(1.0)
+        slopes.append(decode_slope)
+        point_colors.append(color_decode)
+
+    ratios = np.array(ratios)
+    slopes = np.array(slopes)
+
+    # Plot connecting line (gray)
+    ax1.plot(
+        ratios * 100,
+        slopes * 1000,
+        "-",
+        color="#888888",
+        linewidth=1.5,
+        zorder=1,
+    )
+
+    # Plot each point with its corresponding color
+    for r, s, c in zip(ratios, slopes, point_colors):
+        ax1.scatter(
+            r * 100,
+            s * 1000,
+            color=c,
+            s=80,
+            zorder=10,
+            edgecolors="white",
+            linewidths=1,
+        )
+
+    # Add horizontal reference line for pure decode
+    if decode_slope is not None:
+        ax1.axhline(
+            y=decode_slope * 1000,
+            color=color_decode,
+            linestyle="--",
+            linewidth=1.5,
+            alpha=0.7,
+            label="Pure decode (100%)",
+        )
+
+    ax1.set_xlabel("Decode Ratio (%)", fontsize=14)
+    ax1.set_ylabel("Slope (μs/token)", fontsize=14)
+    ax1.set_title("(a) Slope vs Decode Ratio", fontsize=14, fontweight="bold")
+    ax1.set_xlim(-5, 105)
+    ax1.set_ylim(settings["slope_ymin"], max(slopes) * 1000 * 1.05)  # Add 5% headroom above max
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc="lower right", fontsize=16)
+    ax1.set_xticks([0, 20, 40, 60, 80, 100])
+    ax1.tick_params(axis="both", labelsize=12)
+
+    # ========== Bottom subplot: Time vs Tokens ==========
+    line_width = 1.2
+    marker_size = 5
+
+    # Find max x across all data for extending lines
+    all_x = []
+    if pure_prefill["x"].size > 0:
+        all_x.extend(pure_prefill["x"])
+    if pure_decode["x"].size > 0:
+        all_x.extend(pure_decode["x"])
+    for ratio in highlight_ratios:
+        data = mixed_by_ratio.get(ratio, {"x": np.array([])})
+        if len(data["x"]) > 0:
+            all_x.extend(data["x"])
+    max_x = max(all_x) if all_x else 10000
+
+    # Plot pure prefill - thicker line
+    if pure_prefill["x"].size > 0:
+        ax2.plot(
+            pure_prefill["x"],
+            pure_prefill["y"],
+            "o-",
+            color="#1abc9c",
+            linewidth=line_width + 1,  # Thicker
+            markersize=marker_size + 1,
+            label="Pure Prefill (0%)",
+            zorder=10,
+        )
+        # Fit line and extend as dashed line to edge
+        if len(pure_prefill["x"]) >= 2:
+            prefill_slope_val, _ = np.polyfit(
+                pure_prefill["x"], pure_prefill["y"], 1
+            )
+            last_x = pure_prefill["x"][-1]
+            last_y = pure_prefill["y"][-1]
+            # Extend dashed line from actual endpoint using slope
+            extend_x = np.array([last_x, max_x * 1.1])
+            extend_y = np.array([last_y, last_y + prefill_slope_val * (max_x * 1.1 - last_x)])
+            ax2.plot(
+                extend_x, extend_y, "--",
+                color="#1abc9c", linewidth=1.0, alpha=0.7, zorder=5
+            )
+            # Add arrow annotation for 0% at line end
+            ax2.annotate(
+                "0%",
+                (last_x, last_y),
+                textcoords="offset points",
+                xytext=(10, 0),
+                fontsize=11,
+                color="#1abc9c",
+                fontweight="bold",
+                arrowprops=dict(
+                    arrowstyle="->",
+                    color="#1abc9c",
+                    lw=1.5,
+                ),
+            )
+
+    # Plot pure decode - thicker line
+    if pure_decode["x"].size > 0:
+        ax2.plot(
+            pure_decode["x"],
+            pure_decode["y"],
+            "s-",
+            color="#2c3e50",
+            linewidth=line_width + 1,  # Thicker
+            markersize=marker_size + 1,
+            label="Pure Decode (100%)",
+            zorder=10,
+        )
+        # Fit line and extend as dashed line to edge
+        if len(pure_decode["x"]) >= 2:
+            decode_slope_val, _ = np.polyfit(
+                pure_decode["x"], pure_decode["y"], 1
+            )
+            last_x = pure_decode["x"][-1]
+            last_y = pure_decode["y"][-1]
+            # Extend dashed line from actual endpoint using slope
+            extend_x = np.array([last_x, max_x * 1.1])
+            extend_y = np.array([last_y, last_y + decode_slope_val * (max_x * 1.1 - last_x)])
+            ax2.plot(
+                extend_x, extend_y, "--",
+                color="#2c3e50", linewidth=1.0, alpha=0.7, zorder=5
+            )
+            # Add arrow annotation for 100% at line end
+            ax2.annotate(
+                "100%",
+                (last_x, last_y),
+                textcoords="offset points",
+                xytext=(15, 2),
+                # xytext=(20, 40),
+                fontsize=11,
+                color="#2c3e50",
+                fontweight="bold",
+                arrowprops=dict(
+                    arrowstyle="->",
+                    color="#2c3e50",
+                    lw=1.5,
+                ),
+            )
+
+    # Plot highlighted ratios
+    colors = ["#27ae60", "#f39c12", "#9b59b6", "#e74c3c", "#8b4513"]
+    markers = ["^", "v", "D", "p", "h"]
+    for i, ratio in enumerate(highlight_ratios):
+        data = mixed_by_ratio.get(ratio, {"x": np.array([])})
+        actual_ratio = ratio
+        if len(data["x"]) == 0:
+            available = [r for r in mixed_by_ratio.keys()
+                        if len(mixed_by_ratio[r]["x"]) > 0]
+            if available:
+                closest = min(available, key=lambda r: abs(r - ratio))
+                data = mixed_by_ratio[closest]
+                actual_ratio = closest
+
+        if len(data["x"]) > 0:
+            percentage = int(actual_ratio * 100)
+            color = colors[i % len(colors)]
+            ax2.plot(
+                data["x"],
+                data["y"],
+                f"{markers[i % len(markers)]}-",
+                color=color,
+                linewidth=line_width,
+                markersize=marker_size,
+                label=f"{percentage}% Decode",
+            )
+
+    ax2.set_xlabel("Total Tokens", fontsize=14)
+    ax2.set_ylabel("Execution Time (ms)", fontsize=14)
+    ax2.set_title("(b) Execution Time vs Total Tokens", fontsize=14, fontweight="bold")
+    ax2.legend(loc="upper left", fontsize=12, framealpha=0.9)
+    ax2.grid(True, alpha=0.3)
+    ax2.tick_params(axis="both", labelsize=11)
+    ax2.set_xlim(0, settings["xlim"])
+    ax2.set_ylim(0, settings["ylim"])
+
+    plt.tight_layout()
+
+    # Save
+    combined_path = output_path.replace(".png", "_combined.png")
+    plt.savefig(combined_path, dpi=300, bbox_inches="tight")
+    print(f"Combined plot saved to {combined_path}")
+
+    pdf_path = combined_path.replace(".png", ".pdf")
+    plt.savefig(pdf_path, bbox_inches="tight")
+    print(f"PDF saved to {pdf_path}")
+
+    return fig, (ax1, ax2)
+
+
+def plot_ratio_analysis_simplified(
+    pure_prefill: dict,
+    pure_decode: dict,
+    mixed_by_ratio: dict[float, dict],
+    config: dict,
+    output_path: str,
+    highlight_ratios: list[float] | None = None,
+    use_log_scale: bool = False,
+):
+    """
+    Simplified ratio analysis plot for papers - shows only key curves.
+
+    Shows: Pure prefill, Pure decode, and highlighted ratio(s) to
+    clearly demonstrate the crossover phenomenon.
+
+    Args:
+        use_log_scale: If True, use log scale on both axes to separate curves
+    """
+    if highlight_ratios is None:
+        highlight_ratios = [0.20, 0.40, 0.60, 0.80, 0.90]
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    # Style settings for paper
+    line_width = 1.2
+    marker_size = 5
+
+    # Plot pure prefill - with markers
+    if pure_prefill["x"].size > 0:
+        ax.plot(
+            pure_prefill["x"],
+            pure_prefill["y"],
+            "o-",  # Line with circle markers
+            color="#1abc9c",  # Teal - distinct from other colors
+            linewidth=line_width,
+            markersize=marker_size,
+            label="Pure Prefill (0%)",
+            zorder=10,  # Draw on top
+        )
+        # Add arrow annotation for 0% at line end
+        if len(pure_prefill["x"]) >= 2:
+            last_x = pure_prefill["x"][-1]
+            last_y = pure_prefill["y"][-1]
+            ax.annotate(
+                "0%",
+                (last_x, last_y),
+                textcoords="offset points",
+                xytext=(25, -20),
+                fontsize=11,
+                color="#1abc9c",
+                fontweight="bold",
+                arrowprops=dict(
+                    arrowstyle="->",
+                    color="#1abc9c",
+                    lw=1.5,
+                ),
+            )
+
+    # Plot pure decode - with markers
+    if pure_decode["x"].size > 0:
+        ax.plot(
+            pure_decode["x"],
+            pure_decode["y"],
+            "s-",  # Line with square markers
+            color="#2c3e50",  # Dark blue-gray
+            linewidth=line_width,
+            markersize=marker_size,
+            label="Pure Decode (100%)",
+            zorder=10,  # Draw on top
+        )
+        # Add arrow annotation for 100% at line end
+        if len(pure_decode["x"]) >= 2:
+            last_x = pure_decode["x"][-1]
+            last_y = pure_decode["y"][-1]
+            ax.annotate(
+                "100%",
+                (last_x, last_y),
+                textcoords="offset points",
+                xytext=(20, 45),  # To the right of the endpoint
+                fontsize=11,
+                color="#2c3e50",
+                fontweight="bold",
+                arrowprops=dict(
+                    arrowstyle="->",
+                    color="#2c3e50",
+                    lw=1.5,
+                ),
+            )
+
+    # Plot highlighted ratios - distinct colors for easy comparison
+    # green, orange, purple, red, brown for 20%, 40%, 60%, 80%, 90%
+    colors = ["#27ae60", "#f39c12", "#9b59b6", "#e74c3c", "#8b4513"]
+    for i, ratio in enumerate(highlight_ratios):
+        data = mixed_by_ratio.get(ratio, {"x": np.array([])})
+        actual_ratio = ratio
+        if len(data["x"]) == 0:
+            # Try to find closest available ratio
+            available = [r for r in mixed_by_ratio.keys()
+                        if len(mixed_by_ratio[r]["x"]) > 0]
+            if available:
+                closest = min(available, key=lambda r: abs(r - ratio))
+                data = mixed_by_ratio[closest]
+                actual_ratio = closest
+
+        if len(data["x"]) > 0:
+            percentage = int(actual_ratio * 100)
+            color = colors[i % len(colors)]
+            markers = ["^", "v", "D", "p", "h"]
+            ax.plot(
+                data["x"],
+                data["y"],
+                f"{markers[i % len(markers)]}-",  # Line with markers
+                color=color,
+                linewidth=line_width,
+                markersize=marker_size,
+                label=f"{percentage}% Decode",
+            )
+
+    ax.set_xlabel("Total Tokens", fontsize=16)
+    ax.set_ylabel("Execution Time (ms)", fontsize=16)
+
+    ax.set_title(
+        "H200",
+        fontsize=18,
+    )
+
+    # Place legend outside or in best location
+    ax.legend(loc="upper left", fontsize=10, framealpha=0.9)
+    ax.grid(True, alpha=0.3, linestyle="-", linewidth=0.5)
+
+    if use_log_scale:
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+    # Don't force axes to start from 0 - let matplotlib auto-scale to show differences
+
+    # Ensure tick labels are readable
+    ax.tick_params(axis="both", labelsize=10)
+
+    plt.tight_layout()
+
+    # Save
+    simplified_path = output_path.replace(".png", "_ratio_simplified.png")
+    plt.savefig(simplified_path, dpi=300, bbox_inches="tight")
+    print(f"Simplified ratio plot saved to {simplified_path}")
+
+    # PDF for paper
+    pdf_path = simplified_path.replace(".png", ".pdf")
+    plt.savefig(pdf_path, bbox_inches="tight")
+    print(f"PDF saved to {pdf_path}")
+
+    return fig, ax
+
+
 def plot_throughput(
     pure_prefill: dict,
     pure_decode: dict,
@@ -909,6 +1617,23 @@ def main():
         default=0.10,
         help="Tolerance for matching decode ratios (default: 0.10 = ±10%%)",
     )
+    parser.add_argument(
+        "--log-scale",
+        action="store_true",
+        help="Use log scale on axes to better separate curves",
+    )
+    parser.add_argument(
+        "--gpu",
+        type=str,
+        default="H200",
+        help="GPU name for title and axis limits (H200 or A6000)",
+    )
+    parser.add_argument(
+        "--input-A6000",
+        type=str,
+        default=None,
+        help="Second input JSON file for A6000 (enables dual GPU plot)",
+    )
     args = parser.parse_args()
 
     # Handle annotate flag
@@ -946,10 +1671,11 @@ def main():
     if args.throughput:
         plot_throughput(pure_prefill, pure_decode, mixed, config, args.output)
 
-    if args.slope_analysis:
-        plot_slope_analysis(
-            pure_prefill, pure_decode, mixed_by_decode, config, args.output
-        )
+    # Commented out - too cluttered for paper
+    # if args.slope_analysis:
+    #     plot_slope_analysis(
+    #         pure_prefill, pure_decode, mixed_by_decode, config, args.output
+    #     )
 
     if args.ratio_analysis:
         target_ratios = [float(x) for x in args.target_ratios.split(",")]
@@ -958,10 +1684,33 @@ def main():
         )
         print(f"  Ratio groups: {len(mixed_by_ratio)} "
               f"({[f'{int(r*100)}%' for r in sorted(target_ratios)]})")
-        plot_ratio_analysis(
-            pure_prefill, pure_decode, mixed_by_ratio, config, args.output,
-            target_ratios=target_ratios
-        )
+
+        # Check if dual GPU mode
+        if args.input_A6000:
+            print(f"\nLoading A6000 results from {args.input_A6000}...")
+            A6000_data = load_results(args.input_A6000)
+            A6000_results = A6000_data.get("results", [])
+            A6000_prefill, A6000_decode, _, _ = extract_data(A6000_results)
+            A6000_mixed_by_ratio = extract_data_by_ratio(
+                A6000_results, target_ratios=target_ratios, tolerance=args.ratio_tolerance
+            )
+            print(f"  A6000 ratio groups: {len(A6000_mixed_by_ratio)}")
+
+            # Generate dual GPU plot
+            plot_dual_gpu_analysis(
+                h200_data=(pure_prefill, pure_decode, mixed_by_ratio),
+                A6000_data=(A6000_prefill, A6000_decode, A6000_mixed_by_ratio),
+                output_path=args.output,
+                highlight_ratios=[0.20, 0.40, 0.60, 0.80, 0.90],
+            )
+        else:
+            # Single GPU plot
+            plot_combined_analysis(
+                pure_prefill, pure_decode, mixed_by_ratio, config, args.output,
+                target_ratios=target_ratios,
+                highlight_ratios=[0.20, 0.40, 0.60, 0.80, 0.90],
+                gpu_name=args.gpu,
+            )
 
     plt.show()
 

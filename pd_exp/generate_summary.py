@@ -61,7 +61,7 @@ def find_result_dir(exp: str, model: str) -> Path | None:
 
 
 def collect_experiment_data(exp: str, model: str) -> dict | None:
-    """收集单个实验的数据，返回每个 scheduler 的最优配置（包括 tb, bs, throughput）和完整网格数据"""
+    """收集单个实验的数据，返回每个 scheduler 的最优配置（包括 tb, bs, throughput, 延迟指标）和完整网格数据"""
     result_dir = find_result_dir(exp, model)
     if not result_dir:
         return None
@@ -76,7 +76,7 @@ def collect_experiment_data(exp: str, model: str) -> dict | None:
             data = collect_grid_results_multiturn(result_dir)
             optimal = find_optimal_configs_multiturn(data)
 
-        # 提取每个 scheduler 的最优配置（包括 tb, bs, throughput）和完整网格数据
+        # 提取每个 scheduler 的最优配置（包括 tb, bs, throughput, 延迟指标）和完整网格数据
         results = {}
         for sched in SCHEDULERS:
             if sched in optimal:
@@ -90,8 +90,24 @@ def collect_experiment_data(exp: str, model: str) -> dict | None:
                             all_throughputs.append(tp)
                             grid_data[(tb, bs)] = tp
 
+                # 提取最优配置下的所有指标
+                metrics = optimal[sched]["metrics"]
                 results[sched] = {
-                    "throughput": optimal[sched]["metrics"].get("throughput", 0),
+                    "throughput": metrics.get("throughput", 0),
+                    "output_throughput": metrics.get("output_throughput", 0),
+                    # TTFT 指标
+                    "mean_ttft_ms": metrics.get("mean_ttft_ms", 0),
+                    "median_ttft_ms": metrics.get("median_ttft_ms", 0),
+                    "p99_ttft_ms": metrics.get("p99_ttft_ms", 0),
+                    # TPOT 指标
+                    "mean_tpot_ms": metrics.get("mean_tpot_ms", 0),
+                    "median_tpot_ms": metrics.get("median_tpot_ms", 0),
+                    "p99_tpot_ms": metrics.get("p99_tpot_ms", 0),
+                    # ITL 指标
+                    "mean_itl_ms": metrics.get("mean_itl_ms", 0),
+                    "median_itl_ms": metrics.get("median_itl_ms", 0),
+                    "p99_itl_ms": metrics.get("p99_itl_ms", 0),
+                    # 配置信息
                     "tb": optimal[sched].get("tb", 0),
                     "bs": optimal[sched].get("bs", 0),
                     "all_throughputs": all_throughputs,
@@ -244,6 +260,141 @@ def generate_markdown_report(
 
         lines.append("")
 
+        # 延迟指标汇总表格 (紧凑视图)
+        lines.append("### 延迟指标汇总 (Latency Summary)")
+        lines.append("")
+        lines.append("单位: 毫秒 (ms)")
+        lines.append("")
+
+        # 对于每个模型，显示关键延迟指标
+        for model in models:
+            lines.append(f"**{model}**")
+            lines.append("")
+            header = "| Strategy | TTFT (Mean) | TTFT (P99) | TPOT (Mean) | TPOT (P99) | ITL (Mean) | ITL (P99) |"
+            separator = "|----------|-------------|------------|-------------|------------|------------|-----------|"
+            lines.append(header)
+            lines.append(separator)
+
+            # 获取 baseline 数据用于计算改进
+            baseline_data = data[exp].get(model, {}).get("baseline", {})
+
+            for sched in SCHEDULERS:
+                sched_data = data[exp].get(model, {}).get(sched, {})
+                if not isinstance(sched_data, dict):
+                    continue
+
+                def fmt_val(key: str, lower_better: bool = True) -> str:
+                    val = sched_data.get(key, 0)
+                    if val <= 0:
+                        return "-"
+                    # 对于非 baseline，计算改进百分比
+                    if sched != "baseline" and isinstance(baseline_data, dict):
+                        base_val = baseline_data.get(key, 0)
+                        if base_val > 0:
+                            if lower_better:
+                                imp = (base_val - val) / base_val * 100
+                            else:
+                                imp = (val - base_val) / base_val * 100
+                            return f"{val:.1f} ({imp:+.1f}%)"
+                    return f"{val:.1f}"
+
+                row = f"| {sched} | {fmt_val('mean_ttft_ms')} | {fmt_val('p99_ttft_ms')} | "
+                row += f"{fmt_val('mean_tpot_ms')} | {fmt_val('p99_tpot_ms')} | "
+                row += f"{fmt_val('mean_itl_ms')} | {fmt_val('p99_itl_ms')} |"
+                lines.append(row)
+
+            lines.append("")
+
+        lines.append("---")
+        lines.append("")
+
+        # TTFT 表格 (详细视图)
+        lines.append("### TTFT (Time To First Token) - 详细")
+        lines.append("")
+        header = "| Strategy | Metric |"
+        separator = "|----------|--------|"
+        for model in models:
+            header += f" {model} |"
+            separator += "------------|"
+        lines.append(header)
+        lines.append(separator)
+
+        ttft_metrics = [("Mean", "mean_ttft_ms"), ("Median", "median_ttft_ms"), ("P99", "p99_ttft_ms")]
+        for sched in SCHEDULERS:
+            for metric_name, metric_key in ttft_metrics:
+                row = f"| {sched} | {metric_name} |"
+                for model in models:
+                    sched_data = data[exp].get(model, {}).get(sched, {})
+                    if isinstance(sched_data, dict):
+                        val = sched_data.get(metric_key, 0)
+                        if val > 0:
+                            row += f" {val:.2f} ms |"
+                        else:
+                            row += " - |"
+                    else:
+                        row += " - |"
+                lines.append(row)
+
+        lines.append("")
+
+        # TPOT 表格 (详细视图)
+        lines.append("### TPOT (Time Per Output Token) - 详细")
+        lines.append("")
+        header = "| Strategy | Metric |"
+        separator = "|----------|--------|"
+        for model in models:
+            header += f" {model} |"
+            separator += "------------|"
+        lines.append(header)
+        lines.append(separator)
+
+        tpot_metrics = [("Mean", "mean_tpot_ms"), ("Median", "median_tpot_ms"), ("P99", "p99_tpot_ms")]
+        for sched in SCHEDULERS:
+            for metric_name, metric_key in tpot_metrics:
+                row = f"| {sched} | {metric_name} |"
+                for model in models:
+                    sched_data = data[exp].get(model, {}).get(sched, {})
+                    if isinstance(sched_data, dict):
+                        val = sched_data.get(metric_key, 0)
+                        if val > 0:
+                            row += f" {val:.2f} ms |"
+                        else:
+                            row += " - |"
+                    else:
+                        row += " - |"
+                lines.append(row)
+
+        lines.append("")
+
+        # ITL 表格 (详细视图)
+        lines.append("### ITL (Inter-Token Latency) - 详细")
+        lines.append("")
+        header = "| Strategy | Metric |"
+        separator = "|----------|--------|"
+        for model in models:
+            header += f" {model} |"
+            separator += "------------|"
+        lines.append(header)
+        lines.append(separator)
+
+        itl_metrics = [("Mean", "mean_itl_ms"), ("Median", "median_itl_ms"), ("P99", "p99_itl_ms")]
+        for sched in SCHEDULERS:
+            for metric_name, metric_key in itl_metrics:
+                row = f"| {sched} | {metric_name} |"
+                for model in models:
+                    sched_data = data[exp].get(model, {}).get(sched, {})
+                    if isinstance(sched_data, dict):
+                        val = sched_data.get(metric_key, 0)
+                        if val > 0:
+                            row += f" {val:.2f} ms |"
+                        else:
+                            row += " - |"
+                    else:
+                        row += " - |"
+                lines.append(row)
+
+        lines.append("")
+
         # 最优配置表格 (TB, BS)
         lines.append("### 最优配置 (TB, BS)")
         lines.append("")
@@ -368,6 +519,41 @@ def generate_console_report(
             lines.append(row)
 
         lines.append("")
+
+        # 延迟指标表格
+        latency_metrics = [
+            ("TTFT", [("Mean", "mean_ttft_ms"), ("P99", "p99_ttft_ms")]),
+            ("TPOT", [("Mean", "mean_tpot_ms"), ("P99", "p99_tpot_ms")]),
+            ("ITL", [("Mean", "mean_itl_ms"), ("P99", "p99_itl_ms")]),
+        ]
+
+        for metric_group, metrics in latency_metrics:
+            lines.append(f"  {metric_group} (ms):")
+            lines.append("")
+            latency_col_width = max(20, max((len(m) for m in models), default=10) + 8)
+            header = f"{'Strategy':<12} {'Metric':<8}"
+            for model in models:
+                header += f" {model:<{latency_col_width}}"
+            lines.append(header)
+            lines.append("-" * len(header))
+
+            for sched in SCHEDULERS:
+                for metric_name, metric_key in metrics:
+                    row = f"{sched:<12} {metric_name:<8}"
+                    for model in models:
+                        sched_data = data[exp].get(model, {}).get(sched, {})
+                        if isinstance(sched_data, dict):
+                            val = sched_data.get(metric_key, 0)
+                            if val > 0:
+                                cell = f"{val:.2f}"
+                            else:
+                                cell = "-"
+                        else:
+                            cell = "-"
+                        row += f" {cell:<{latency_col_width}}"
+                    lines.append(row)
+
+            lines.append("")
 
         # 最优配置表格
         lines.append("  最优配置 (TB, BS):")
