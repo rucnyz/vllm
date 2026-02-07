@@ -74,7 +74,7 @@ class BenchmarkConfig:
     decode_percentages: list[int] = field(
         default_factory=lambda: [0, 20, 40, 60, 80, 100]
     )
-    decode_context_len: int = 256
+    decode_context_len: int = 32
     num_warmup: int = 3
     num_iterations: int = 5
     max_num_batched_tokens: int = 16384
@@ -422,12 +422,16 @@ def plot_results(input_json: str, output_dir: str):
                 "total_tokens": [],
                 "gemm_time_ms": [],
                 "attention_time_ms": [],
+                "other_time_ms": [],
+                "total_kernel_time_ms": [],
                 "gemm_std": [],
                 "attention_std": [],
             }
         by_decode_pct[pct]["total_tokens"].append(r["total_tokens"])
         by_decode_pct[pct]["gemm_time_ms"].append(r["gemm_time_ms"])
         by_decode_pct[pct]["attention_time_ms"].append(r["attention_time_ms"])
+        by_decode_pct[pct]["other_time_ms"].append(r.get("other_time_ms", 0))
+        by_decode_pct[pct]["total_kernel_time_ms"].append(r.get("total_kernel_time_ms", 0))
         by_decode_pct[pct]["gemm_std"].append(r.get("gemm_time_std", 0))
         by_decode_pct[pct]["attention_std"].append(r.get("attention_time_std", 0))
 
@@ -478,6 +482,66 @@ def plot_results(input_json: str, output_dir: str):
     make_plot("attention_time_ms", "attention_std",
               "Attention Time vs Total Tokens by Decode Percentage",
               "Attention Time (ms)", "attention_time.png")
+
+    # Plot total kernel time
+    make_plot("total_kernel_time_ms", None,
+              "Total Kernel Time vs Total Tokens by Decode Percentage",
+              "Total Kernel Time (ms)", "total_kernel_time.png")
+
+    # Plot kernel breakdown (stacked bar chart)
+    def plot_kernel_breakdown():
+        fig, axes = plt.subplots(1, len(all_tokens), figsize=(4 * len(all_tokens), 6), sharey=True)
+        if len(all_tokens) == 1:
+            axes = [axes]
+
+        bar_width = 0.8
+        kernel_colors = {'GEMM': '#2ecc71', 'Attention': '#e74c3c', 'Other': '#3498db'}
+
+        for ax, total_tok in zip(axes, all_tokens):
+            # Get data for this total_tokens value
+            decode_pcts = []
+            gemm_vals = []
+            attn_vals = []
+            other_vals = []
+
+            for pct in sorted(by_decode_pct.keys()):
+                pct_data = by_decode_pct[pct]
+                for i, tok in enumerate(pct_data["total_tokens"]):
+                    if tok == total_tok:
+                        decode_pcts.append(pct)
+                        gemm_vals.append(pct_data["gemm_time_ms"][i])
+                        attn_vals.append(pct_data["attention_time_ms"][i])
+                        other_vals.append(pct_data["other_time_ms"][i])
+                        break
+
+            if not decode_pcts:
+                continue
+
+            x = np.arange(len(decode_pcts))
+            gemm_vals = np.array(gemm_vals)
+            attn_vals = np.array(attn_vals)
+            other_vals = np.array(other_vals)
+
+            ax.bar(x, gemm_vals, bar_width, label='GEMM', color=kernel_colors['GEMM'])
+            ax.bar(x, attn_vals, bar_width, bottom=gemm_vals, label='Attention', color=kernel_colors['Attention'])
+            ax.bar(x, other_vals, bar_width, bottom=gemm_vals + attn_vals, label='Other', color=kernel_colors['Other'])
+
+            ax.set_xlabel("Decode %", fontsize=11)
+            ax.set_xticks(x)
+            ax.set_xticklabels([f"{p}%" for p in decode_pcts], rotation=45)
+            ax.set_title(f"Total Tokens = {total_tok}", fontsize=12)
+            ax.grid(True, alpha=0.3, axis='y')
+
+        axes[0].set_ylabel("Kernel Time (ms)", fontsize=12)
+        axes[-1].legend(loc='upper left', fontsize=10)
+
+        fig.suptitle("Kernel Time Breakdown by Decode Percentage", fontsize=14, y=1.02)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "kernel_breakdown.png"), dpi=150, bbox_inches='tight')
+        print(f"Plot saved to {os.path.join(output_dir, 'kernel_breakdown.png')}")
+        plt.close()
+
+    plot_kernel_breakdown()
 
 
 def main():
