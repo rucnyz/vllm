@@ -31,10 +31,14 @@ except ImportError:
 
 
 def load_bench_result_fast(filepath: Path) -> Optional[Dict]:
-    """快速加载 benchmark 结果文件（只读取开头的元数据）
+    """快速加载 benchmark 结果文件（只读取开头和结尾的元数据）
 
-    对于大文件（100MB+），只读取前 100KB 来提取关键指标，
+    对于大文件（100MB+），只读取前 100KB 和后 100KB 来提取关键指标，
     避免加载整个文件到内存。
+
+    注意：vLLM benchmark JSON 文件结构为：
+    - 开头包含：吞吐量指标、completed、failed 等
+    - 结尾包含：TTFT、TPOT、ITL 等延迟指标
     """
     if not filepath.exists():
         return None
@@ -47,13 +51,20 @@ def load_bench_result_fast(filepath: Path) -> Optional[Dict]:
             with open(filepath) as f:
                 return json.load(f)
 
-        # 大文件只读取开头
+        # 大文件：读取开头和结尾
         with open(filepath, 'r') as f:
             header = f.read(100 * 1024)  # 读取前 100KB
+            # 读取后 100KB（延迟指标在文件末尾）
+            f.seek(max(0, file_size - 100 * 1024))
+            footer = f.read()
+
+        # 合并开头和结尾的内容用于搜索
+        combined = header + footer
 
         result = {}
 
-        # 需要提取的字段（都在文件开头）
+        # 需要提取的字段
+        # 吞吐量等在开头，延迟指标在结尾
         fields = [
             'request_throughput', 'output_throughput', 'total_token_throughput',
             'mean_ttft_ms', 'median_ttft_ms', 'p99_ttft_ms',
@@ -65,7 +76,7 @@ def load_bench_result_fast(filepath: Path) -> Optional[Dict]:
         for field in fields:
             # 匹配 "field": value 模式
             pattern = rf'"{field}":\s*([^,\}}\]]+)'
-            match = re.search(pattern, header)
+            match = re.search(pattern, combined)
             if match:
                 value_str = match.group(1).strip()
                 try:

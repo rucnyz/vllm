@@ -14,6 +14,7 @@ VERSION=1 SCHEDULERS=pd_ifr SKIP_EXISTING=1 ./pd_exp/run_all_experiments.sh Qwen
 ./pd_exp/run_all_experiments.sh Qwen/Qwen3-30B-A3B 4 # ongoing
 DTYPE=bfloat16 ./pd_exp/run_all_experiments.sh google/gemma-3-1b-it 4 # ongoing
 ./pd_exp/run_all_experiments.sh openai/gpt-oss-20b 5 # 
+DTYPE=bfloat16 EXPERIMENTS=wildchat ./pd_exp/run_all_experiments.sh openai/gpt-oss-120b 5 # 
 
 # 可选参数
 SKIP_CALIBRATION=true ./pd_exp/run_all_experiments.sh ...  # 跳过校准

@@ -273,7 +273,7 @@ def calculate_slopes(results: Dict) -> Dict:
 def plot_sweep_results(results: Dict, slopes: Dict, output_path: str, gpu_name: str):
     """绘制 sweep 结果的多线折线图"""
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(18, 6))
 
     colors = plt.cm.tab10(np.linspace(0, 1, 10))
 
@@ -307,7 +307,7 @@ def plot_sweep_results(results: Dict, slopes: Dict, output_path: str, gpu_name: 
     ax1.set_xlabel('Sequence Length / Context Length', fontsize=12)
     ax1.set_ylabel('Kernel Time (ms)', fontsize=12)
     ax1.set_title(f'FlashAttention Kernel Time vs Sequence Length\n({gpu_name})', fontsize=14)
-    ax1.legend(loc='upper left', fontsize=9)
+    ax1.legend(loc='upper left', fontsize=19)
     ax1.grid(True, alpha=0.3)
     ax1.set_xscale('linear')
 
@@ -346,6 +346,91 @@ def plot_sweep_results(results: Dict, slopes: Dict, output_path: str, gpu_name: 
     print(f"\nPlot saved to {output_path}")
 
 
+def plot_comparison_bar(json_file1: str, json_file2: str,
+                        gpu_name1: str, gpu_name2: str,
+                        output_path: str):
+    """
+    绘制两个GPU的对比柱状图
+
+    Args:
+        json_file1: 第一个GPU的结果JSON文件路径
+        json_file2: 第二个GPU的结果JSON文件路径
+        gpu_name1: 第一个GPU的名称 (e.g., "H200")
+        gpu_name2: 第二个GPU的名称 (e.g., "A6000")
+        output_path: 输出图片路径
+    """
+    # 读取两个JSON文件
+    with open(json_file1, 'r') as f:
+        data1 = json.load(f)
+    with open(json_file2, 'r') as f:
+        data2 = json.load(f)
+
+    slopes1 = data1["slopes"]
+    slopes2 = data2["slopes"]
+
+    # 构建标签和数据
+    labels = ['Pure\nPrefill', 'Pure\nDecode']
+    values1 = [
+        slopes1["pure_prefill"]["slope_ms_per_token"] * 1000,  # μs
+        slopes1["pure_decode"]["slope_ms_per_context"] * 1000,
+    ]
+    values2 = [
+        slopes2["pure_prefill"]["slope_ms_per_token"] * 1000,
+        slopes2["pure_decode"]["slope_ms_per_context"] * 1000,
+    ]
+
+    # 添加 Mixed 场景
+    for pct_key in slopes1["mixed"].keys():
+        labels.append(f'Mixed\n{pct_key}')
+        values1.append(slopes1["mixed"][pct_key]["slope_ms_per_prefill_len"] * 1000)
+        values2.append(slopes2["mixed"][pct_key]["slope_ms_per_prefill_len"] * 1000)
+
+    # 绘图
+    fig, ax = plt.subplots(figsize=(16, 6))
+
+    x = np.arange(len(labels))
+    width = 0.35  # 柱子宽度
+
+    # 使用两种颜色
+    color1 = '#2E86AB'  # 深蓝色 for H200
+    color2 = '#E94F37'  # 红色 for A6000
+
+    bars1 = ax.bar(x - width/2, values1, width, label=gpu_name1,
+                   color=color1, edgecolor='black', linewidth=1.2)
+    bars2 = ax.bar(x + width/2, values2, width, label=gpu_name2,
+                   color=color2, edgecolor='black', linewidth=1.2)
+
+    # 在柱子上标注数值
+    def add_labels(bars):
+        for bar in bars:
+            height = bar.get_height()
+            ax.annotate(f'{height:.2f}',
+                       xy=(bar.get_x() + bar.get_width()/2, height),
+                       xytext=(0, 3),  # 3 points vertical offset
+                       textcoords="offset points",
+                       ha='center', va='bottom', fontsize=15, fontweight='bold')
+
+    add_labels(bars1)
+    add_labels(bars2)
+
+    # 设置坐标轴
+    ax.set_xlabel('Scenario', fontsize=20)
+    ax.set_ylabel('Slope (μs per unit length increase)', fontsize=20)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=18)
+    ax.tick_params(axis='y', labelsize=18)
+    ax.legend(fontsize=30, loc='upper left')
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # 设置y轴从0开始
+    ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Comparison plot saved to {output_path}")
+
+
 def print_slope_summary(slopes: Dict):
     """打印斜率摘要"""
     print(f"\n{'='*70}")
@@ -363,6 +448,22 @@ def print_slope_summary(slopes: Dict):
 
 def main():
     parser = argparse.ArgumentParser(description="FlashAttention Comprehensive Sweep Benchmark")
+
+    # 比较模式参数
+    parser.add_argument("--compare", action="store_true",
+                       help="Compare two GPU results (requires --json1, --json2)")
+    parser.add_argument("--json1", type=str, default=None,
+                       help="First GPU result JSON file (for --compare mode)")
+    parser.add_argument("--json2", type=str, default=None,
+                       help="Second GPU result JSON file (for --compare mode)")
+    parser.add_argument("--gpu1", type=str, default="H200",
+                       help="Name of first GPU (default: H200)")
+    parser.add_argument("--gpu2", type=str, default="RTX PRO 6000",
+                       help="Name of second GPU (default: A6000)")
+    parser.add_argument("--compare-output", type=str, default="comparison.pdf",
+                       help="Output path for comparison plot")
+
+    # Benchmark 参数
     parser.add_argument("--batch-size", type=int, default=512,
                        help="Batch size for decode/mixed scenarios")
     parser.add_argument("--num-heads", type=int, default=32,
@@ -374,6 +475,19 @@ def main():
     parser.add_argument("--output", type=str, default=None,
                        help="Output JSON file path")
     args = parser.parse_args()
+
+    # 比较模式
+    if args.compare:
+        if not args.json1 or not args.json2:
+            parser.error("--compare requires --json1 and --json2")
+        plot_comparison_bar(
+            json_file1=args.json1,
+            json_file2=args.json2,
+            gpu_name1=args.gpu1,
+            gpu_name2=args.gpu2,
+            output_path=args.compare_output
+        )
+        return
 
     # 运行 sweep
     results = run_sweep(args)

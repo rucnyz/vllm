@@ -1,0 +1,251 @@
+{
+  "timestamp": "2026-01-29T11:20:31.534597",
+  "args": {
+    "compare": false,
+    "json1": null,
+    "json2": null,
+    "gpu1": "H200",
+    "gpu2": "A6000",
+    "compare_output": "comparison.png",
+    "batch_size": 512,
+    "num_heads": 32,
+    "num_kv_heads": 8,
+    "head_size": 128,
+    "output": "results_a6000.json"
+  },
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "results": {
+    "pure_prefill": [
+      {
+        "seq_len": 128,
+        "total_tokens": 128,
+        "time_ms": 0.019143680073320866
+      },
+      {
+        "seq_len": 256,
+        "total_tokens": 256,
+        "time_ms": 0.02198911990970373
+      },
+      {
+        "seq_len": 512,
+        "total_tokens": 512,
+        "time_ms": 0.03517951995134354
+      },
+      {
+        "seq_len": 1024,
+        "total_tokens": 1024,
+        "time_ms": 0.07537983983755112
+      },
+      {
+        "seq_len": 2048,
+        "total_tokens": 2048,
+        "time_ms": 0.19415616035461425
+      }
+    ],
+    "pure_decode": [
+      {
+        "context_len": 128,
+        "total_query_tokens": 512,
+        "time_ms": 0.23011264055967331
+      },
+      {
+        "context_len": 256,
+        "total_query_tokens": 512,
+        "time_ms": 0.4114367991685867
+      },
+      {
+        "context_len": 512,
+        "total_query_tokens": 512,
+        "time_ms": 0.7697798407077789
+      },
+      {
+        "context_len": 1024,
+        "total_query_tokens": 512,
+        "time_ms": 1.478564474582672
+      },
+      {
+        "context_len": 2048,
+        "total_query_tokens": 512,
+        "time_ms": 2.880761594772339
+      }
+    ],
+    "mixed": {
+      "10pct": [
+        {
+          "prefill_len": 128,
+          "num_prefill": 51,
+          "num_decode": 461,
+          "total_query_tokens": 6989,
+          "time_ms": 0.6085094392299653
+        },
+        {
+          "prefill_len": 256,
+          "num_prefill": 51,
+          "num_decode": 461,
+          "total_query_tokens": 13517,
+          "time_ms": 1.2027430438995361
+        },
+        {
+          "prefill_len": 512,
+          "num_prefill": 51,
+          "num_decode": 461,
+          "total_query_tokens": 26573,
+          "time_ms": 2.7717030525207518
+        },
+        {
+          "prefill_len": 1024,
+          "num_prefill": 51,
+          "num_decode": 461,
+          "total_query_tokens": 52685,
+          "time_ms": 7.493804149627685
+        },
+        {
+          "prefill_len": 2048,
+          "num_prefill": 51,
+          "num_decode": 461,
+          "total_query_tokens": 104909,
+          "time_ms": 17.775893898010253
+        }
+      ],
+      "20pct": [
+        {
+          "prefill_len": 128,
+          "num_prefill": 102,
+          "num_decode": 410,
+          "total_query_tokens": 13466,
+          "time_ms": 0.6933548820018768
+        },
+        {
+          "prefill_len": 256,
+          "num_prefill": 102,
+          "num_decode": 410,
+          "total_query_tokens": 26522,
+          "time_ms": 1.4025318360328674
+        },
+        {
+          "prefill_len": 512,
+          "num_prefill": 102,
+          "num_decode": 410,
+          "total_query_tokens": 52634,
+          "time_ms": 3.813131527900696
+        },
+        {
+          "prefill_len": 1024,
+          "num_prefill": 102,
+          "num_decode": 410,
+          "total_query_tokens": 104858,
+          "time_ms": 9.491580123901366
+        },
+        {
+          "prefill_len": 2048,
+          "num_prefill": 102,
+          "num_decode": 410,
+          "total_query_tokens": 209306,
+          "time_ms": 23.553774223327636
+        }
+      ],
+      "40pct": [
+        {
+          "prefill_len": 128,
+          "num_prefill": 204,
+          "num_decode": 308,
+          "total_query_tokens": 26420,
+          "time_ms": 0.7445158362388611
+        },
+        {
+          "prefill_len": 256,
+          "num_prefill": 204,
+          "num_decode": 308,
+          "total_query_tokens": 52532,
+          "time_ms": 1.6477369594573974
+        },
+        {
+          "prefill_len": 512,
+          "num_prefill": 204,
+          "num_decode": 308,
+          "total_query_tokens": 104756,
+          "time_ms": 4.857670421600342
+        },
+        {
+          "prefill_len": 1024,
+          "num_prefill": 204,
+          "num_decode": 308,
+          "total_query_tokens": 209204,
+          "time_ms": 12.496481227874757
+        },
+        {
+          "prefill_len": 2048,
+          "num_prefill": 204,
+          "num_decode": 308,
+          "total_query_tokens": 418100,
+          "time_ms": 35.43300231933594
+        }
+      ],
+      "80pct": [
+        {
+          "prefill_len": 128,
+          "num_prefill": 409,
+          "num_decode": 103,
+          "total_query_tokens": 52455,
+          "time_ms": 0.9689267206192017
+        },
+        {
+          "prefill_len": 256,
+          "num_prefill": 409,
+          "num_decode": 103,
+          "total_query_tokens": 104807,
+          "time_ms": 2.276018557548523
+        },
+        {
+          "prefill_len": 512,
+          "num_prefill": 409,
+          "num_decode": 103,
+          "total_query_tokens": 209511,
+          "time_ms": 6.374455699920654
+        },
+        {
+          "prefill_len": 1024,
+          "num_prefill": 409,
+          "num_decode": 103,
+          "total_query_tokens": 418919,
+          "time_ms": 18.2170361328125
+        },
+        {
+          "prefill_len": 2048,
+          "num_prefill": 409,
+          "num_decode": 103,
+          "total_query_tokens": 837735,
+          "time_ms": 61.083070831298826
+        }
+      ]
+    }
+  },
+  "slopes": {
+    "pure_prefill": {
+      "slope_ms_per_token": 9.288462382853625e-05,
+      "intercept_ms": -0.004543573445019604
+    },
+    "pure_decode": {
+      "slope_ms_per_context": 0.001379512335456688,
+      "intercept_ms": 0.0593500805397829
+    },
+    "mixed": {
+      "10pct": {
+        "slope_ms_per_prefill_len": 0.009102984873042196,
+        "intercept_ms": -1.2535980785886438
+      },
+      "20pct": {
+        "slope_ms_per_prefill_len": 0.0120771832552348,
+        "intercept_ms": -1.7935781127214425
+      },
+      "40pct": {
+        "slope_ms_per_prefill_len": 0.01828472763535277,
+        "intercept_ms": -3.4748784985144914
+      },
+      "80pct": {
+        "slope_ms_per_prefill_len": 0.03164814661862831,
+        "intercept_ms": -7.332067568103471
+      }
+    }
+  }
+}

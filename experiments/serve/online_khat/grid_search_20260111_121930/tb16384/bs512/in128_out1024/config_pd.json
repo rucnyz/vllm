@@ -1,0 +1,14 @@
+{
+    "scheduler": "pd",
+    "max_num_seqs": 512,
+    "max_num_batched_tokens": 16384,
+    "input_len": 128,
+    "output_len": 1024,
+    "gpu_id": 3,
+    "port": 8203,
+    "model": "Qwen/Qwen3-8B",
+    "num_prompts": 4000,
+    "max_concurrency": 2048,
+    "k_ratio": 0.8,
+    "timestamp": "2026-01-11T14:23:19+00:00"
+}

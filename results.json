@@ -1,0 +1,94 @@
+{
+  "timestamp": "2026-01-12T04:30:56.214698",
+  "args": {
+    "batch_size": 512,
+    "prefill_len": 512,
+    "context_len": 512,
+    "num_heads": 32,
+    "num_kv_heads": 8,
+    "head_size": 128,
+    "warmup": 10,
+    "repeat": 100,
+    "output": "results.json"
+  },
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "results": [
+    {
+      "scenario": "pure_prefill",
+      "batch_size": 1,
+      "total_query_tokens": 512,
+      "total_context_tokens": 512,
+      "max_query_len": 512,
+      "max_context_len": 512,
+      "avg_time_ms": 0.03391424007713795,
+      "min_time_ms": 0.032255999743938446,
+      "max_time_ms": 0.04665600135922432,
+      "tokens_per_sec": 15096903.2133834,
+      "query_lens_sample": [
+        512
+      ]
+    },
+    {
+      "scenario": "pure_decode",
+      "batch_size": 512,
+      "total_query_tokens": 512,
+      "total_context_tokens": 262144,
+      "max_query_len": 1,
+      "max_context_len": 512,
+      "avg_time_ms": 0.7684287977218628,
+      "min_time_ms": 0.7591040134429932,
+      "max_time_ms": 0.8946880102157593,
+      "tokens_per_sec": 666294.6541278914,
+      "query_lens_sample": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "scenario": "mixed_1prefill",
+      "batch_size": 512,
+      "total_query_tokens": 1023,
+      "total_context_tokens": 262144,
+      "max_query_len": 512,
+      "max_context_len": 512,
+      "avg_time_ms": 1.7310243213176728,
+      "min_time_ms": 1.69542396068573,
+      "max_time_ms": 1.783136010169983,
+      "tokens_per_sec": 590979.5647592532,
+      "query_lens_sample": [
+        512,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "scenario": "mixed_10pct_prefill",
+      "batch_size": 512,
+      "total_query_tokens": 26573,
+      "total_context_tokens": 262144,
+      "max_query_len": 512,
+      "max_context_len": 512,
+      "avg_time_ms": 2.8234556818008425,
+      "min_time_ms": 2.8014719486236572,
+      "max_time_ms": 2.8994240760803223,
+      "tokens_per_sec": 9411516.593400659,
+      "query_lens_sample": [
+        512,
+        512,
+        512,
+        512,
+        512
+      ]
+    }
+  ],
+  "analysis": {
+    "pure_decode_time_ms": 0.7684287977218628,
+    "mixed_1prefill_slowdown": 2.2526801786314974,
+    "mixed_10pct_slowdown": 3.67432309951352
+  }
+}
