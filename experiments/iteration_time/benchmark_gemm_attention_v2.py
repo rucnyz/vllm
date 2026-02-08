@@ -572,7 +572,7 @@ def main():
     run_parser.add_argument("--dtype", type=str, default="float16")
     run_parser.add_argument("--total-tokens", type=str, default="256,512,1024,2048")
     run_parser.add_argument("--decode-percentages", type=str, default="0,20,40,60,80,100")
-    run_parser.add_argument("--decode-context-len", type=int, default=256)
+    run_parser.add_argument("--decode-context-len", type=int, default=16)
     run_parser.add_argument("--num-warmup", type=int, default=3)
     run_parser.add_argument("--num-iterations", type=int, default=5)
     run_parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
