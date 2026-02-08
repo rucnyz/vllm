@@ -30,8 +30,6 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import torch
-from torch.profiler import profile, ProfilerActivity
 
 # Add vllm project root to path
 VLLM_ROOT = Path(__file__).parent.parent
@@ -74,7 +72,7 @@ class BenchmarkConfig:
     decode_percentages: list[int] = field(
         default_factory=lambda: [0, 20, 40, 60, 80, 100]
     )
-    decode_context_len: int = 32
+    decode_context_len: int = 16
     num_warmup: int = 3
     num_iterations: int = 5
     max_num_batched_tokens: int = 16384
@@ -140,6 +138,7 @@ class GEMMAttentionBenchmark:
 
     def setup(self):
         """Initialize EngineCore."""
+        import torch
         from vllm import SamplingParams
         from vllm.engine.arg_utils import EngineArgs
         from vllm.utils.torch_utils import set_default_torch_num_threads
@@ -259,6 +258,9 @@ class GEMMAttentionBenchmark:
 
     def _run_single_step_with_profiler(self) -> Optional[KernelTimes]:
         """Run a single step and profile kernel times."""
+        import torch
+        from torch.profiler import ProfilerActivity, profile
+
         if not self.engine_core.scheduler.has_requests():
             return None
 
@@ -356,6 +358,8 @@ class GEMMAttentionBenchmark:
 
     def run_all_benchmarks(self):
         """Run all benchmark configurations."""
+        import torch
+
         print(f"\n{'='*60}")
         print("GEMM/Attention Benchmark")
         print(f"{'='*60}")
@@ -412,6 +416,18 @@ def plot_results(input_json: str, output_dir: str):
 
     results = data["results"]
     os.makedirs(output_dir, exist_ok=True)
+
+    def _save_png_and_pdf(fig, filename_png: str) -> None:
+        """Save figure as PNG and PDF (same stem)."""
+        out_png = os.path.join(output_dir, filename_png)
+        fig.savefig(out_png, dpi=150, bbox_inches='tight')
+        print(f"Plot saved to {out_png}")
+
+        stem, ext = os.path.splitext(filename_png)
+        filename_pdf = f"{stem}.pdf" if ext.lower() == ".png" else f"{filename_png}.pdf"
+        out_pdf = os.path.join(output_dir, filename_pdf)
+        fig.savefig(out_pdf, bbox_inches='tight')
+        print(f"Plot saved to {out_pdf}")
 
     # Group by decode percentage
     by_decode_pct = {}
@@ -472,8 +488,7 @@ def plot_results(input_json: str, output_dir: str):
         ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, output_file), dpi=150, bbox_inches='tight')
-        print(f"Plot saved to {os.path.join(output_dir, output_file)}")
+        _save_png_and_pdf(fig, output_file)
         plt.close()
 
     make_plot("gemm_time_ms", "gemm_std",
@@ -495,7 +510,12 @@ def plot_results(input_json: str, output_dir: str):
             axes = [axes]
 
         bar_width = 0.8
-        kernel_colors = {'GEMM': '#2ecc71', 'Attention': '#e74c3c', 'Other': '#3498db'}
+        # Colorblind-friendly-ish palette (Tableau-like)
+        kernel_colors = {
+            'GEMM': '#4E79A7',       # blue
+            'Attention': '#F28E2B',  # orange
+            'Other': '#59A14F',      # green
+        }
 
         for ax, total_tok in zip(axes, all_tokens):
             # Get data for this total_tokens value
@@ -537,8 +557,7 @@ def plot_results(input_json: str, output_dir: str):
 
         fig.suptitle("Kernel Time Breakdown by Decode Percentage", fontsize=14, y=1.02)
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, "kernel_breakdown.png"), dpi=150, bbox_inches='tight')
-        print(f"Plot saved to {os.path.join(output_dir, 'kernel_breakdown.png')}")
+        _save_png_and_pdf(fig, "kernel_breakdown.png")
         plt.close()
 
     plot_kernel_breakdown()
