@@ -433,7 +433,12 @@ class GEMMAttentionBenchmark:
         print(f"Results saved to {filepath}")
 
 
-def plot_results(input_json: str, output_dir: str, title: str = "NVIDIA RTX PRO 6000", total_tokens_filter: list[int] | None = None):
+def _get_model_short_name(model: str) -> str:
+    """Extract short model name from full path (e.g. 'Qwen/Qwen3-4B' -> 'Qwen3-4B')."""
+    return model.split("/")[-1]
+
+
+def plot_results(input_json: str, output_dir: str, title: str | None = None, total_tokens_filter: list[int] | None = None):
     """Generate GEMM and Attention time plots from results."""
     import matplotlib.pyplot as plt
 
@@ -441,6 +446,9 @@ def plot_results(input_json: str, output_dir: str, title: str = "NVIDIA RTX PRO 
         data = json.load(f)
 
     results = data["results"]
+    if title is None:
+        model_name = _get_model_short_name(data.get("config", {}).get("model", ""))
+        title = f"{model_name} (NVIDIA RTX PRO 6000)" if model_name else "NVIDIA RTX PRO 6000"
     os.makedirs(output_dir, exist_ok=True)
 
     def _save_png_and_pdf(fig, filename_png: str) -> None:
@@ -642,7 +650,7 @@ def main():
     plot_parser = subparsers.add_parser("plot", help="Generate plots from results")
     plot_parser.add_argument("--input-json", type=str, required=True)
     plot_parser.add_argument("--output-dir", type=str, default="./plots")
-    plot_parser.add_argument("--title", type=str, default="NVIDIA RTX PRO 6000", help="Plot title")
+    plot_parser.add_argument("--title", type=str, default=None, help="Plot title (auto-detected from JSON if not set)")
     plot_parser.add_argument("--total-tokens", type=str, default=None, help="Filter total_tokens for kernel breakdown (e.g. 1024,2048,4096)")
 
     args = parser.parse_args()

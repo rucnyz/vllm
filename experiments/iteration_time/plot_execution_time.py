@@ -14,12 +14,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def plot_results(input_json: str, output_dir: str):
+def _get_model_short_name(model: str) -> str:
+    """Extract short model name from full path (e.g. 'Qwen/Qwen3-4B' -> 'Qwen3-4B')."""
+    return model.split("/")[-1]
+
+
+def plot_results(input_json: str, output_dir: str, title: str | None = None):
     """Generate execution time plots from results."""
     with open(input_json, 'r') as f:
         data = json.load(f)
 
     results = data["results"]
+    if title is None:
+        model_name = _get_model_short_name(data.get("config", {}).get("model", ""))
+        title = f"{model_name} (NVIDIA H200)" if model_name else "NVIDIA H200"
     os.makedirs(output_dir, exist_ok=True)
 
     def _save_png_and_pdf(fig, filename_png: str) -> None:
@@ -80,7 +88,7 @@ def plot_results(input_json: str, output_dir: str):
     ax.tick_params(axis='y', labelsize=14)
     ax.set_xlabel("Total Tokens", fontsize=16)
     ax.set_ylabel("Execution Time (ms)", fontsize=16)
-    ax.set_title("NVIDIA H200", fontsize=18)
+    ax.set_title(title, fontsize=18)
     ax.legend(loc='best', fontsize=12)
     ax.grid(True, alpha=0.3)
 
@@ -114,7 +122,7 @@ def plot_results(input_json: str, output_dir: str):
     ax.tick_params(axis='y', labelsize=14)
     ax.set_xlabel("Total Tokens", fontsize=16)
     ax.set_ylabel("Marginal Cost (ms/token)", fontsize=16)
-    ax.set_title("Marginal Cost per Token", fontsize=18)
+    ax.set_title(f"{title} - Marginal Cost", fontsize=18)
     ax.legend(loc='best', fontsize=12)
     ax.grid(True, alpha=0.3)
 
@@ -127,9 +135,10 @@ def main():
     parser = argparse.ArgumentParser(description="Plot execution time results")
     parser.add_argument("--input-json", type=str, required=True, help="Input JSON file")
     parser.add_argument("--output-dir", type=str, default="./plots", help="Output directory")
+    parser.add_argument("--title", type=str, default=None, help="Plot title (auto-detected from JSON if not set)")
     args = parser.parse_args()
 
-    plot_results(args.input_json, args.output_dir)
+    plot_results(args.input_json, args.output_dir, title=args.title)
 
 
 if __name__ == "__main__":
