@@ -80,7 +80,7 @@ def plot_results(input_json: str, output_dir: str):
     ax.tick_params(axis='y', labelsize=14)
     ax.set_xlabel("Total Tokens", fontsize=16)
     ax.set_ylabel("Execution Time (ms)", fontsize=16)
-    ax.set_title("NVIDIA RTX PRO 6000", fontsize=18)
+    ax.set_title("NVIDIA H200", fontsize=18)
     ax.legend(loc='best', fontsize=12)
     ax.grid(True, alpha=0.3)
 

@@ -41,6 +41,7 @@ class KernelTimes:
     """Kernel timing breakdown for a single step."""
     gemm_time_ms: float = 0.0
     attention_time_ms: float = 0.0
+    moe_time_ms: float = 0.0
     other_time_ms: float = 0.0
     total_kernel_time_ms: float = 0.0
 
@@ -54,11 +55,13 @@ class BenchmarkResult:
     num_prefill_tokens: int
     gemm_time_ms: float
     attention_time_ms: float
+    moe_time_ms: float
     other_time_ms: float
     total_kernel_time_ms: float
     # Standard deviations
     gemm_time_std: float = 0.0
     attention_time_std: float = 0.0
+    moe_time_std: float = 0.0
 
 
 @dataclass
@@ -81,13 +84,26 @@ class BenchmarkConfig:
 
 
 def classify_kernel(name: str) -> str:
-    """Classify a CUDA kernel as GEMM, Attention, or Other."""
+    """Classify a CUDA kernel as GEMM, Attention, MoE, or Other."""
     name_lower = name.lower()
 
     # Attention patterns (check first as some attention uses cutlass)
     attn_patterns = ['flash', 'fmha', 'flashattn', 'attention']
     if any(p in name_lower for p in attn_patterns):
         return 'attention'
+
+    # MoE patterns (check before GEMM since fused_moe includes GEMM work)
+    moe_patterns = [
+        'fused_moe', 'moe_align_block_size', 'count_and_sort_expert_tokens',
+        'topkgatingsoftmax', 'moe_sum', 'moetopk', 'moe_permute',
+        'moe_unpermute', 'expandinputrows', 'finalizemoerou',
+        'shuffleinputrows', 'topk_with_k2', 'group_idx_and_topk_idx',
+        'preprocesstopkid', 'computeexpertfirsttokenoffset', 'getmindices',
+        'moe_wna16', 'moe_lora_align', 'lora_count_and_sort_expert',
+        'cutlass_moe', 'ggml_moe',
+    ]
+    if any(p in name_lower for p in moe_patterns):
+        return 'moe'
 
     # GEMM patterns
     gemm_patterns = ['nvjet', 'gemm', 'xmma', 'cublas', 'matmul', 'ampere']
@@ -98,9 +114,10 @@ def classify_kernel(name: str) -> str:
 
 
 def extract_kernel_times_from_profiler(prof) -> KernelTimes:
-    """Extract GEMM and Attention kernel times from torch.profiler."""
+    """Extract GEMM, Attention, MoE, and Other kernel times from torch.profiler."""
     gemm_time_us = 0
     attention_time_us = 0
+    moe_time_us = 0
     other_time_us = 0
 
     for event in prof.key_averages():
@@ -117,14 +134,18 @@ def extract_kernel_times_from_profiler(prof) -> KernelTimes:
             gemm_time_us += cuda_time
         elif category == 'attention':
             attention_time_us += cuda_time
+        elif category == 'moe':
+            moe_time_us += cuda_time
         else:
             other_time_us += cuda_time
 
+    total = gemm_time_us + attention_time_us + moe_time_us + other_time_us
     return KernelTimes(
         gemm_time_ms=gemm_time_us / 1000,
         attention_time_ms=attention_time_us / 1000,
+        moe_time_ms=moe_time_us / 1000,
         other_time_ms=other_time_us / 1000,
-        total_kernel_time_ms=(gemm_time_us + attention_time_us + other_time_us) / 1000,
+        total_kernel_time_ms=total / 1000,
     )
 
 
@@ -309,6 +330,7 @@ class GEMMAttentionBenchmark:
 
         gemm_times = []
         attention_times = []
+        moe_times = []
         other_times = []
 
         for i in range(self.config.num_warmup + self.config.num_iterations):
@@ -333,6 +355,7 @@ class GEMMAttentionBenchmark:
             if i >= self.config.num_warmup and kernel_times is not None:
                 gemm_times.append(kernel_times.gemm_time_ms)
                 attention_times.append(kernel_times.attention_time_ms)
+                moe_times.append(kernel_times.moe_time_ms)
                 other_times.append(kernel_times.other_time_ms)
 
         if not gemm_times:
@@ -345,14 +368,17 @@ class GEMMAttentionBenchmark:
             num_prefill_tokens=num_prefill_tokens,
             gemm_time_ms=float(np.mean(gemm_times)),
             attention_time_ms=float(np.mean(attention_times)),
+            moe_time_ms=float(np.mean(moe_times)),
             other_time_ms=float(np.mean(other_times)),
-            total_kernel_time_ms=float(np.mean(gemm_times) + np.mean(attention_times) + np.mean(other_times)),
+            total_kernel_time_ms=float(np.mean(gemm_times) + np.mean(attention_times) + np.mean(moe_times) + np.mean(other_times)),
             gemm_time_std=float(np.std(gemm_times)),
             attention_time_std=float(np.std(attention_times)),
+            moe_time_std=float(np.std(moe_times)),
         )
 
         print(f"    GEMM: {result.gemm_time_ms:.3f}±{result.gemm_time_std:.3f}ms, "
               f"Attn: {result.attention_time_ms:.3f}±{result.attention_time_std:.3f}ms, "
+              f"MoE: {result.moe_time_ms:.3f}±{result.moe_time_std:.3f}ms, "
               f"Other: {result.other_time_ms:.3f}ms")
         return result
 
@@ -407,7 +433,7 @@ class GEMMAttentionBenchmark:
         print(f"Results saved to {filepath}")
 
 
-def plot_results(input_json: str, output_dir: str):
+def plot_results(input_json: str, output_dir: str, title: str = "NVIDIA RTX PRO 6000", total_tokens_filter: list[int] | None = None):
     """Generate GEMM and Attention time plots from results."""
     import matplotlib.pyplot as plt
 
@@ -429,6 +455,9 @@ def plot_results(input_json: str, output_dir: str):
         fig.savefig(out_pdf, bbox_inches='tight')
         print(f"Plot saved to {out_pdf}")
 
+    # Check if data has MoE field
+    has_moe = any("moe_time_ms" in r for r in results)
+
     # Group by decode percentage
     by_decode_pct = {}
     for r in results:
@@ -438,6 +467,7 @@ def plot_results(input_json: str, output_dir: str):
                 "total_tokens": [],
                 "gemm_time_ms": [],
                 "attention_time_ms": [],
+                "moe_time_ms": [],
                 "other_time_ms": [],
                 "total_kernel_time_ms": [],
                 "gemm_std": [],
@@ -446,12 +476,17 @@ def plot_results(input_json: str, output_dir: str):
         by_decode_pct[pct]["total_tokens"].append(r["total_tokens"])
         by_decode_pct[pct]["gemm_time_ms"].append(r["gemm_time_ms"])
         by_decode_pct[pct]["attention_time_ms"].append(r["attention_time_ms"])
+        by_decode_pct[pct]["moe_time_ms"].append(r.get("moe_time_ms", 0))
         by_decode_pct[pct]["other_time_ms"].append(r.get("other_time_ms", 0))
         by_decode_pct[pct]["total_kernel_time_ms"].append(r.get("total_kernel_time_ms", 0))
         by_decode_pct[pct]["gemm_std"].append(r.get("gemm_time_std", 0))
         by_decode_pct[pct]["attention_std"].append(r.get("attention_time_std", 0))
 
     all_tokens = sorted(set(r["total_tokens"] for r in results))
+    if total_tokens_filter:
+        all_tokens_for_breakdown = sorted(t for t in all_tokens if t in total_tokens_filter)
+    else:
+        all_tokens_for_breakdown = all_tokens
     token_to_idx = {t: i for i, t in enumerate(all_tokens)}
 
     colors = plt.cm.viridis(np.linspace(0, 1, len(by_decode_pct)))
@@ -505,23 +540,24 @@ def plot_results(input_json: str, output_dir: str):
 
     # Plot kernel breakdown (stacked bar chart)
     def plot_kernel_breakdown():
-        fig, axes = plt.subplots(1, len(all_tokens), figsize=(4 * len(all_tokens), 6), sharey=True)
-        if len(all_tokens) == 1:
+        fig, axes = plt.subplots(1, len(all_tokens_for_breakdown), figsize=(4.5 * len(all_tokens_for_breakdown), 6), sharey=True)
+        if len(all_tokens_for_breakdown) == 1:
             axes = [axes]
 
-        bar_width = 0.8
-        # Colorblind-friendly-ish palette (Tableau-like)
+        bar_width = 0.7
         kernel_colors = {
-            'GEMM': '#4E79A7',       # blue
-            'Attention': '#F28E2B',  # orange
-            'Other': '#59A14F',      # green
+            'GEMM': '#1f77b4',       # blue
+            'Attention': '#ff7f0e',  # orange
+            'MoE': '#d62728',        # red
+            'Other': '#2ca02c',      # green
         }
 
-        for ax, total_tok in zip(axes, all_tokens):
+        for ax, total_tok in zip(axes, all_tokens_for_breakdown):
             # Get data for this total_tokens value
             decode_pcts = []
             gemm_vals = []
             attn_vals = []
+            moe_vals = []
             other_vals = []
 
             for pct in sorted(by_decode_pct.keys()):
@@ -531,6 +567,7 @@ def plot_results(input_json: str, output_dir: str):
                         decode_pcts.append(pct)
                         gemm_vals.append(pct_data["gemm_time_ms"][i])
                         attn_vals.append(pct_data["attention_time_ms"][i])
+                        moe_vals.append(pct_data["moe_time_ms"][i])
                         other_vals.append(pct_data["other_time_ms"][i])
                         break
 
@@ -540,22 +577,36 @@ def plot_results(input_json: str, output_dir: str):
             x = np.arange(len(decode_pcts))
             gemm_vals = np.array(gemm_vals)
             attn_vals = np.array(attn_vals)
+            moe_vals = np.array(moe_vals)
             other_vals = np.array(other_vals)
 
-            ax.bar(x, gemm_vals, bar_width, label='GEMM', color=kernel_colors['GEMM'])
-            ax.bar(x, attn_vals, bar_width, bottom=gemm_vals, label='Attention', color=kernel_colors['Attention'])
-            ax.bar(x, other_vals, bar_width, bottom=gemm_vals + attn_vals, label='Other', color=kernel_colors['Other'])
+            # Draw stacked bars
+            bottom = np.zeros(len(x))
+            ax.bar(x, gemm_vals, bar_width, bottom=bottom, label='GEMM', color=kernel_colors['GEMM'])
+            bottom += gemm_vals
+            ax.bar(x, attn_vals, bar_width, bottom=bottom, label='Attention', color=kernel_colors['Attention'])
+            bottom += attn_vals
+            if has_moe and moe_vals.sum() > 0:
+                ax.bar(x, moe_vals, bar_width, bottom=bottom, label='MoE', color=kernel_colors['MoE'])
+                bottom += moe_vals
+            ax.bar(x, other_vals, bar_width, bottom=bottom, label='Other', color=kernel_colors['Other'])
 
-            ax.set_xlabel("Decode %", fontsize=11)
+            # Draw line connecting GEMM+Attention tops (excluding MoE and Other)
+            attn_tops = gemm_vals + attn_vals
+            ax.plot(x, attn_tops, color='#2D3436', linewidth=2, linestyle='-', zorder=5,
+                    marker='o', markersize=6, markerfacecolor='white', markeredgecolor='#2D3436', markeredgewidth=1.5)
+
+            ax.set_xlabel("Decode %", fontsize=16)
             ax.set_xticks(x)
-            ax.set_xticklabels([f"{p}%" for p in decode_pcts], rotation=45)
-            ax.set_title(f"Total Tokens = {total_tok}", fontsize=12)
+            ax.set_xticklabels([f"{p}%" for p in decode_pcts], rotation=45, fontsize=14)
+            ax.tick_params(axis='y', labelsize=14)
+            ax.set_title(f"Total Tokens = {total_tok}", fontsize=16)
             ax.grid(True, alpha=0.3, axis='y')
 
-        axes[0].set_ylabel("Kernel Time (ms)", fontsize=12)
-        axes[-1].legend(loc='upper left', fontsize=10)
+        axes[0].set_ylabel("Kernel Time (ms)", fontsize=16)
+        axes[0].legend(loc='upper left', fontsize=14)
 
-        fig.suptitle("Kernel Time Breakdown by Decode Percentage", fontsize=14, y=1.02)
+        fig.suptitle(title, fontsize=20, y=0.97)
         plt.tight_layout()
         _save_png_and_pdf(fig, "kernel_breakdown.png")
         plt.close()
@@ -579,9 +630,20 @@ def main():
     run_parser.add_argument("--max-num-seqs", type=int, default=5000)
     run_parser.add_argument("--output-json", type=str, default="gemm_attention_results.json")
 
+    dump_parser = subparsers.add_parser("dump-kernels", help="Dump all kernel names from one profiling step")
+    dump_parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B")
+    dump_parser.add_argument("--dtype", type=str, default="float16")
+    dump_parser.add_argument("--total-tokens", type=int, default=1024)
+    dump_parser.add_argument("--decode-percentage", type=int, default=50)
+    dump_parser.add_argument("--decode-context-len", type=int, default=16)
+    dump_parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
+    dump_parser.add_argument("--max-num-seqs", type=int, default=5000)
+
     plot_parser = subparsers.add_parser("plot", help="Generate plots from results")
     plot_parser.add_argument("--input-json", type=str, required=True)
     plot_parser.add_argument("--output-dir", type=str, default="./plots")
+    plot_parser.add_argument("--title", type=str, default="NVIDIA RTX PRO 6000", help="Plot title")
+    plot_parser.add_argument("--total-tokens", type=str, default=None, help="Filter total_tokens for kernel breakdown (e.g. 1024,2048,4096)")
 
     args = parser.parse_args()
 
@@ -604,8 +666,88 @@ def main():
         benchmark.run_all_benchmarks()
         benchmark.save_results(args.output_json)
 
+    elif args.command == "dump-kernels":
+        config = BenchmarkConfig(
+            model=args.model,
+            dtype=args.dtype,
+            total_tokens_list=[args.total_tokens],
+            decode_percentages=[args.decode_percentage],
+            decode_context_len=args.decode_context_len,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+        )
+        benchmark = GEMMAttentionBenchmark(config)
+        benchmark.setup()
+
+        import torch
+        from torch.profiler import ProfilerActivity, profile
+
+        # Warmup
+        for _ in range(3):
+            benchmark._cleanup_all_requests()
+            benchmark._add_request(512, max_tokens=5)
+            for _ in range(3):
+                if not benchmark.engine_core.scheduler.has_requests():
+                    break
+                try:
+                    benchmark.engine_core.step_fn()
+                except Exception:
+                    break
+        benchmark._cleanup_all_requests()
+        torch.cuda.synchronize()
+
+        # Prepare workload
+        total_tokens = args.total_tokens
+        decode_pct = args.decode_percentage
+        num_decode = int(total_tokens * decode_pct / 100)
+        num_prefill_tokens = total_tokens - num_decode
+
+        if num_decode > 0:
+            benchmark._prepare_decode_requests(num_decode, config.decode_context_len)
+        if num_prefill_tokens > 0:
+            benchmark._add_request(num_prefill_tokens, max_tokens=1)
+
+        # Profile one step
+        scheduler_output = benchmark.engine_core.scheduler.schedule()
+        with profile(activities=[ProfilerActivity.CUDA], record_shapes=False, with_stack=False) as prof:
+            torch.cuda.synchronize()
+            model_output = benchmark.engine_core.model_executor.execute_model(scheduler_output, non_block=False)
+            if model_output is None:
+                model_output = benchmark.engine_core.model_executor.sample_tokens(None)
+            torch.cuda.synchronize()
+
+        # Dump all kernels sorted by time
+        print(f"\n{'='*80}")
+        print(f"Kernel dump: {args.model}, total_tokens={total_tokens}, decode%={decode_pct}")
+        print(f"  num_decode={num_decode}, num_prefill_tokens={num_prefill_tokens}")
+        print(f"{'='*80}")
+        print(f"{'Category':<12} {'Time(ms)':>10} {'Kernel Name'}")
+        print(f"{'-'*12} {'-'*10} {'-'*60}")
+
+        entries = []
+        for event in prof.key_averages():
+            cuda_time = getattr(event, 'self_device_time_total', 0)
+            if cuda_time is None or cuda_time <= 0:
+                continue
+            entries.append((event.key, cuda_time / 1000, classify_kernel(event.key)))
+
+        entries.sort(key=lambda x: -x[1])
+        total_by_cat = {}
+        for name, time_ms, cat in entries:
+            total_by_cat[cat] = total_by_cat.get(cat, 0) + time_ms
+            print(f"{cat:<12} {time_ms:>10.3f} {name}")
+
+        print(f"\n{'='*40}")
+        print("Summary:")
+        for cat in ['gemm', 'attention', 'other']:
+            print(f"  {cat:<12}: {total_by_cat.get(cat, 0):.3f} ms")
+        print(f"  {'total':<12}: {sum(total_by_cat.values()):.3f} ms")
+
     elif args.command == "plot":
-        plot_results(args.input_json, args.output_dir)
+        total_tokens_filter = None
+        if args.total_tokens:
+            total_tokens_filter = [int(x) for x in args.total_tokens.split(",")]
+        plot_results(args.input_json, args.output_dir, title=args.title, total_tokens_filter=total_tokens_filter)
 
     else:
         parser.print_help()
