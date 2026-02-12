@@ -19,12 +19,14 @@ def _get_model_short_name(model: str) -> str:
     return model.split("/")[-1]
 
 
-def plot_results(input_json: str, output_dir: str, title: str | None = None):
+def plot_results(input_json: str, output_dir: str, title: str | None = None, total_tokens_filter: list[int] | None = None):
     """Generate execution time plots from results."""
     with open(input_json, 'r') as f:
         data = json.load(f)
 
     results = data["results"]
+    if total_tokens_filter:
+        results = [r for r in results if r["total_tokens"] in total_tokens_filter]
     if title is None:
         model_name = _get_model_short_name(data.get("config", {}).get("model", ""))
         title = f"{model_name} (NVIDIA H200)" if model_name else "NVIDIA H200"
@@ -136,9 +138,13 @@ def main():
     parser.add_argument("--input-json", type=str, required=True, help="Input JSON file")
     parser.add_argument("--output-dir", type=str, default="./plots", help="Output directory")
     parser.add_argument("--title", type=str, default=None, help="Plot title (auto-detected from JSON if not set)")
+    parser.add_argument("--total-tokens", type=str, default=None, help="Filter total_tokens (e.g. 1024,2048,4096)")
     args = parser.parse_args()
 
-    plot_results(args.input_json, args.output_dir, title=args.title)
+    total_tokens_filter = None
+    if args.total_tokens:
+        total_tokens_filter = [int(x) for x in args.total_tokens.split(",")]
+    plot_results(args.input_json, args.output_dir, title=args.title, total_tokens_filter=total_tokens_filter)
 
 
 if __name__ == "__main__":
