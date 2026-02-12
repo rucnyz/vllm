@@ -62,6 +62,7 @@ class BenchmarkConfig:
     num_iterations: int = 10
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 5000
+    max_model_len: int | None = None
     output_json: str = "execution_time_results.json"
 
 
@@ -89,6 +90,7 @@ class ExecutionTimeBenchmark:
             dtype=self.config.dtype,
             max_num_batched_tokens=self.config.max_num_batched_tokens,
             max_num_seqs=self.config.max_num_seqs,
+            max_model_len=self.config.max_model_len,
             gpu_memory_utilization=0.9,
             enable_chunked_prefill=True,
             enable_prefix_caching=False,
@@ -335,7 +337,12 @@ class ExecutionTimeBenchmark:
         print(f"Results saved to {filepath}")
 
 
-def plot_results(input_json: str, output_dir: str):
+def _get_model_short_name(model: str) -> str:
+    """Extract short model name from full path (e.g. 'Qwen/Qwen3-4B' -> 'Qwen3-4B')."""
+    return model.split("/")[-1]
+
+
+def plot_results(input_json: str, output_dir: str, title: str | None = None, total_tokens_filter: list[int] | None = None):
     """Generate execution time plots from results."""
     import matplotlib.pyplot as plt
 
@@ -343,6 +350,15 @@ def plot_results(input_json: str, output_dir: str):
         data = json.load(f)
 
     results = data["results"]
+
+    # Filter by total_tokens if specified
+    if total_tokens_filter:
+        results = [r for r in results if r["total_tokens"] in total_tokens_filter]
+
+    if title is None:
+        model_name = _get_model_short_name(data.get("config", {}).get("model", ""))
+        title = f"{model_name} (NVIDIA RTX PRO 6000)" if model_name else "NVIDIA RTX PRO 6000"
+
     os.makedirs(output_dir, exist_ok=True)
 
     def _save_png_and_pdf(fig, filename_png: str) -> None:
@@ -402,7 +418,7 @@ def plot_results(input_json: str, output_dir: str):
     ax.set_xticklabels([str(t) for t in all_tokens])
     ax.set_xlabel("Total Tokens", fontsize=12)
     ax.set_ylabel("Execution Time (ms)", fontsize=12)
-    ax.set_title("Execution Time vs Total Tokens by Decode Percentage", fontsize=14)
+    ax.set_title(f"{title}: Execution Time", fontsize=14)
     ax.legend(loc='best', fontsize=10)
     ax.grid(True, alpha=0.3)
 
@@ -435,7 +451,7 @@ def plot_results(input_json: str, output_dir: str):
     ax.set_xticklabels([str(t) for t in all_tokens])
     ax.set_xlabel("Total Tokens", fontsize=12)
     ax.set_ylabel("Marginal Cost (ms/token)", fontsize=12)
-    ax.set_title("Marginal Cost per Token by Decode Percentage", fontsize=14)
+    ax.set_title(f"{title}: Marginal Cost", fontsize=14)
     ax.legend(loc='best', fontsize=10)
     ax.grid(True, alpha=0.3)
 
@@ -459,12 +475,15 @@ def main():
     run_parser.add_argument("--num-iterations", type=int, default=10)
     run_parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
     run_parser.add_argument("--max-num-seqs", type=int, default=5000)
+    run_parser.add_argument("--max-model-len", type=int, default=None)
     run_parser.add_argument("--output-json", type=str, default="execution_time_results.json")
 
     # Plot subcommand
     plot_parser = subparsers.add_parser("plot", help="Generate plots from results")
     plot_parser.add_argument("--input-json", type=str, required=True)
     plot_parser.add_argument("--output-dir", type=str, default="./plots")
+    plot_parser.add_argument("--title", type=str, default=None, help="Plot title (auto-detected from JSON if not set)")
+    plot_parser.add_argument("--total-tokens", type=str, default=None, help="Filter total_tokens (e.g. 1024,2048,4096)")
 
     args = parser.parse_args()
 
@@ -479,6 +498,7 @@ def main():
             num_iterations=args.num_iterations,
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_num_seqs=args.max_num_seqs,
+            max_model_len=args.max_model_len,
             output_json=args.output_json,
         )
 
@@ -491,7 +511,10 @@ def main():
         plot_results(config.output_json, "./plots")
 
     elif args.command == "plot":
-        plot_results(args.input_json, args.output_dir)
+        total_tokens_filter = None
+        if args.total_tokens:
+            total_tokens_filter = [int(x) for x in args.total_tokens.split(",")]
+        plot_results(args.input_json, args.output_dir, title=args.title, total_tokens_filter=total_tokens_filter)
 
     else:
         parser.print_help()

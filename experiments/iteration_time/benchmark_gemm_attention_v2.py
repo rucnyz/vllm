@@ -80,6 +80,7 @@ class BenchmarkConfig:
     num_iterations: int = 5
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 5000
+    max_model_len: int | None = None
     output_json: str = "gemm_attention_results.json"
 
 
@@ -173,6 +174,7 @@ class GEMMAttentionBenchmark:
             dtype=self.config.dtype,
             max_num_batched_tokens=self.config.max_num_batched_tokens,
             max_num_seqs=self.config.max_num_seqs,
+            max_model_len=self.config.max_model_len,
             gpu_memory_utilization=0.9,
             enable_chunked_prefill=True,
             enable_prefix_caching=False,
@@ -636,6 +638,7 @@ def main():
     run_parser.add_argument("--num-iterations", type=int, default=5)
     run_parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
     run_parser.add_argument("--max-num-seqs", type=int, default=5000)
+    run_parser.add_argument("--max-model-len", type=int, default=None)
     run_parser.add_argument("--output-json", type=str, default="gemm_attention_results.json")
 
     dump_parser = subparsers.add_parser("dump-kernels", help="Dump all kernel names from one profiling step")
@@ -666,6 +669,7 @@ def main():
             num_iterations=args.num_iterations,
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_num_seqs=args.max_num_seqs,
+            max_model_len=args.max_model_len,
             output_json=args.output_json,
         )
 
