@@ -163,9 +163,8 @@ class GEMMAttentionBenchmark:
         import torch
         from vllm import SamplingParams
         from vllm.engine.arg_utils import EngineArgs
-        from vllm.utils.torch_utils import set_default_torch_num_threads
         from vllm.v1.engine.core import EngineCore
-        from vllm.v1.executor import Executor
+        from vllm.v1.executor.abstract import Executor
 
         print(f"Initializing model: {self.config.model}")
 
@@ -185,12 +184,17 @@ class GEMMAttentionBenchmark:
         vllm_config = engine_args.create_engine_config()
         executor_class = Executor.get_class(vllm_config)
 
-        with set_default_torch_num_threads(1):
+        # Set torch threads to 1 for consistent benchmarking
+        old_num_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
             self.engine_core = EngineCore(
                 vllm_config=vllm_config,
                 executor_class=executor_class,
                 log_stats=False,
             )
+        finally:
+            torch.set_num_threads(old_num_threads)
 
         print("Setup complete!")
 
@@ -260,7 +264,7 @@ class GEMMAttentionBenchmark:
         tokens_to_process = context_len * num_decode
         max_steps = (tokens_to_process // self.config.max_num_batched_tokens) + 100
 
-        for _ in range(max_steps):
+        for step in range(max_steps):
             num_running = len(self.engine_core.scheduler.running)
             if num_running >= num_decode:
                 all_in_decode = all(
@@ -268,8 +272,17 @@ class GEMMAttentionBenchmark:
                     for req in self.engine_core.scheduler.running
                 )
                 if all_in_decode:
-                    return True
+                    # Verify we have exactly the expected number of decode requests
+                    actual_decode = len([
+                        req for req in self.engine_core.scheduler.running
+                        if req.num_computed_tokens >= req.num_prompt_tokens
+                    ])
+                    if actual_decode == num_decode:
+                        return True
+                    else:
+                        print(f"    Warning: Expected {num_decode} decode requests, got {actual_decode}")
             if not self.engine_core.scheduler.has_requests():
+                print(f"    Warning: No requests remaining after {step} steps")
                 break
             try:
                 self.engine_core.step_fn()
@@ -277,6 +290,10 @@ class GEMMAttentionBenchmark:
                 print(f"  Error during prefill: {e}")
                 return False
 
+        # Log why we failed
+        num_running = len(self.engine_core.scheduler.running)
+        num_waiting = len(self.engine_core.scheduler.waiting)
+        print(f"    Failed: running={num_running}, waiting={num_waiting}, expected={num_decode}")
         return False
 
     def _run_single_step_with_profiler(self) -> Optional[KernelTimes]:
