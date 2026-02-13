@@ -79,9 +79,8 @@ class ExecutionTimeBenchmark:
         import torch
         from vllm import SamplingParams
         from vllm.engine.arg_utils import EngineArgs
-        from vllm.utils.torch_utils import set_default_torch_num_threads
         from vllm.v1.engine.core import EngineCore
-        from vllm.v1.executor import Executor
+        from vllm.v1.executor.abstract import Executor
 
         print(f"Initializing model: {self.config.model}")
 
@@ -101,12 +100,17 @@ class ExecutionTimeBenchmark:
         vllm_config = engine_args.create_engine_config()
         executor_class = Executor.get_class(vllm_config)
 
-        with set_default_torch_num_threads(1):
+        # Set torch threads to 1 for consistent benchmarking
+        old_num_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
             self.engine_core = EngineCore(
                 vllm_config=vllm_config,
                 executor_class=executor_class,
                 log_stats=False,
             )
+        finally:
+            torch.set_num_threads(old_num_threads)
 
         print("Setup complete!")
 
@@ -284,8 +288,13 @@ class ExecutionTimeBenchmark:
         print(f"    Execution time: {result.execution_time_ms:.3f}±{result.execution_time_std:.3f}ms")
         return result
 
-    def run_all_benchmarks(self):
-        """Run all benchmark configurations."""
+    def run_all_benchmarks(self, stop_on_incomplete: bool = False):
+        """Run all benchmark configurations.
+
+        Args:
+            stop_on_incomplete: If True, stop when a total_tokens value cannot
+                generate all decode percentages.
+        """
         import torch
 
         print(f"\n{'='*60}")
@@ -293,6 +302,8 @@ class ExecutionTimeBenchmark:
         print(f"{'='*60}")
         print(f"Total tokens: {self.config.total_tokens_list}")
         print(f"Decode percentages: {self.config.decode_percentages}")
+        if stop_on_incomplete:
+            print("Mode: Stop on first incomplete total_tokens")
 
         # Global warmup
         print("\nGlobal warmup...")
@@ -313,10 +324,26 @@ class ExecutionTimeBenchmark:
         # Run benchmarks
         for total_tokens in self.config.total_tokens_list:
             print(f"\n=== Total tokens: {total_tokens} ===")
+            batch_results = []
+            batch_complete = True
+
             for decode_pct in self.config.decode_percentages:
                 result = self.run_benchmark(decode_pct, total_tokens)
                 if result:
-                    self.results.append(result)
+                    batch_results.append(result)
+                else:
+                    batch_complete = False
+                    print(f"  Failed at {decode_pct}% decode for total_tokens={total_tokens}")
+                    break
+
+            if batch_complete:
+                self.results.extend(batch_results)
+            else:
+                if stop_on_incomplete:
+                    print(f"\nStopping: total_tokens={total_tokens} incomplete")
+                    break
+                else:
+                    self.results.extend(batch_results)
 
         print(f"\n{'='*60}")
         print(f"Completed {len(self.results)} benchmarks!")
@@ -477,6 +504,8 @@ def main():
     run_parser.add_argument("--max-num-seqs", type=int, default=5000)
     run_parser.add_argument("--max-model-len", type=int, default=None)
     run_parser.add_argument("--output-json", type=str, default="execution_time_results.json")
+    run_parser.add_argument("--stop-on-incomplete", action="store_true",
+                           help="Stop when a total_tokens cannot generate all decode ratios")
 
     # Plot subcommand
     plot_parser = subparsers.add_parser("plot", help="Generate plots from results")
@@ -504,11 +533,8 @@ def main():
 
         benchmark = ExecutionTimeBenchmark(config)
         benchmark.setup()
-        benchmark.run_all_benchmarks()
+        benchmark.run_all_benchmarks(stop_on_incomplete=args.stop_on_incomplete)
         benchmark.save_results(config.output_json)
-
-        # Auto-generate plots
-        plot_results(config.output_json, "./plots")
 
     elif args.command == "plot":
         total_tokens_filter = None

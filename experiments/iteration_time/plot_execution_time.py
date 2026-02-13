@@ -9,27 +9,117 @@ Usage:
 import argparse
 import json
 import os
+import subprocess
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 
+def _get_gpu_name() -> str:
+    """Auto-detect GPU name using nvidia-smi."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            # Get first GPU name and clean it up
+            gpu_name = result.stdout.strip().split("\n")[0].strip()
+            # Simplify common names
+            if "RTX PRO 6000" in gpu_name:
+                return "NVIDIA RTX PRO 6000"
+            elif "H200" in gpu_name:
+                return "NVIDIA H200"
+            elif "H100" in gpu_name:
+                return "NVIDIA H100"
+            elif "A100" in gpu_name:
+                return "NVIDIA A100"
+            elif "RTX 4090" in gpu_name:
+                return "NVIDIA RTX 4090"
+            return gpu_name
+    except Exception:
+        pass
+    return "GPU"  # Fallback
+
+
 def _get_model_short_name(model: str) -> str:
     """Extract short model name from full path (e.g. 'Qwen/Qwen3-4B' -> 'Qwen3-4B')."""
-    return model.split("/")[-1]
+    name = model.split("/")[-1]
+    # Format specific model names
+    name_mapping = {
+        "gemma-3-1b-it": "Gemma-3-1B-IT",
+        "gemma-3-4b-it": "Gemma-3-4B-IT",
+        "gemma-3-12b-it": "Gemma-3-12B-IT",
+        "gemma-3-27b-it": "Gemma-3-27B-IT",
+    }
+    return name_mapping.get(name.lower(), name)
 
 
-def plot_results(input_json: str, output_dir: str, title: str | None = None, total_tokens_filter: list[int] | None = None):
-    """Generate execution time plots from results."""
+def plot_results(
+    input_json: str,
+    output_dir: str,
+    title: str | None = None,
+    total_tokens_filter: list[int] | None = None,
+    stop_on_incomplete: bool = False,
+):
+    """Generate execution time plots from results.
+
+    Args:
+        input_json: Path to input JSON file
+        output_dir: Output directory for plots
+        title: Plot title (auto-detected from JSON if not set)
+        total_tokens_filter: List of total_tokens to include
+        stop_on_incomplete: If True, stop at first total_tokens that doesn't
+            have all decode percentages
+    """
     with open(input_json, 'r') as f:
         data = json.load(f)
 
     results = data["results"]
+    config = data.get("config", {})
+
+    # Get expected decode percentages
+    expected_decode_pcts = set(config.get("decode_percentages", [0, 20, 40, 60, 80, 100]))
+
+    # Determine target total_tokens
     if total_tokens_filter:
-        results = [r for r in results if r["total_tokens"] in total_tokens_filter]
+        target_tokens = sorted(total_tokens_filter)
+    else:
+        target_tokens = sorted(set(r["total_tokens"] for r in results))
+
+    # Apply stop_on_incomplete logic
+    if stop_on_incomplete:
+        valid_tokens = []
+        for tt in target_tokens:
+            available_pcts = set(
+                r["decode_percentage"] for r in results if r["total_tokens"] == tt
+            )
+            if expected_decode_pcts.issubset(available_pcts):
+                valid_tokens.append(tt)
+            else:
+                missing = expected_decode_pcts - available_pcts
+                print(f"Stopping at total_tokens={tt}: missing decode percentages {sorted(missing)}")
+                break
+        target_tokens = valid_tokens
+    else:
+        # Just filter to tokens that exist in data
+        available_tokens = set(r["total_tokens"] for r in results)
+        target_tokens = [t for t in target_tokens if t in available_tokens]
+
+    results = [r for r in results if r["total_tokens"] in target_tokens]
+
+    if not results:
+        print("No valid results to plot!")
+        return
+
+    print(f"Plotting with total_tokens: {sorted(set(r['total_tokens'] for r in results))}")
+
     if title is None:
-        model_name = _get_model_short_name(data.get("config", {}).get("model", ""))
-        title = f"{model_name} (NVIDIA H200)" if model_name else "NVIDIA H200"
+        model_name = _get_model_short_name(config.get("model", ""))
+        gpu_name = _get_gpu_name()
+        title = f"{model_name} ({gpu_name})" if model_name else gpu_name
     os.makedirs(output_dir, exist_ok=True)
 
     def _save_png_and_pdf(fig, filename_png: str) -> None:
@@ -139,12 +229,20 @@ def main():
     parser.add_argument("--output-dir", type=str, default="./plots", help="Output directory")
     parser.add_argument("--title", type=str, default=None, help="Plot title (auto-detected from JSON if not set)")
     parser.add_argument("--total-tokens", type=str, default=None, help="Filter total_tokens (e.g. 1024,2048,4096)")
+    parser.add_argument("--stop-on-incomplete", action="store_true",
+                       help="Stop at first total_tokens missing any decode percentage")
     args = parser.parse_args()
 
     total_tokens_filter = None
     if args.total_tokens:
         total_tokens_filter = [int(x) for x in args.total_tokens.split(",")]
-    plot_results(args.input_json, args.output_dir, title=args.title, total_tokens_filter=total_tokens_filter)
+    plot_results(
+        args.input_json,
+        args.output_dir,
+        title=args.title,
+        total_tokens_filter=total_tokens_filter,
+        stop_on_incomplete=args.stop_on_incomplete,
+    )
 
 
 if __name__ == "__main__":
