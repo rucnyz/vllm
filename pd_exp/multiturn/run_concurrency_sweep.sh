@@ -59,25 +59,28 @@ get_optimal_config() {
                 return 1
                 ;;
         esac
-    elif [ "$gpu_type" = "rtx_pro_6000" ]; then
-        # RTX PRO 6000 配置 (待填充，运行后根据实验结果更新)
+    elif [ "$gpu_type" = "rtx_pro_6000" ] || [ "$gpu_type" = "a6000" ]; then
+        # RTX PRO 6000 / A6000 WildChat 最优配置 (来自论文 Table)
         case "${model_short}|${scheduler}" in
-            "Qwen3-8B|pd_ratio")       echo "18432 1536" ;;
-            "Qwen3-30B-A3B|pd_ratio")  echo "16384 1024" ;;
-            "gemma-3-1b-it|pd_ratio")  echo "16384 1024" ;;
-            "Qwen3-8B|baseline")       echo "4096 2048" ;;
-            "Qwen3-30B-A3B|baseline")  echo "4096 1536" ;;
-            "gemma-3-1b-it|baseline")  echo "18432 256" ;;
-            "Qwen3-8B|pd_ifr")        echo "16384 1024" ;;
-            "Qwen3-30B-A3B|pd_ifr")   echo "14336 1024" ;;
-            "gemma-3-1b-it|pd_ifr")   echo "18432 1536" ;;
+            # EB(1) = pd_ratio
+            "Qwen3-8B|pd_ratio")       echo "18432 1024" ;;
+            "Qwen3-30B-A3B|pd_ratio")  echo "10240 512" ;;
+            "gemma-3-1b-it|pd_ratio")  echo "14336 1536" ;;
+            # CP = baseline
+            "Qwen3-8B|baseline")       echo "18432 1024" ;;
+            "Qwen3-30B-A3B|baseline")  echo "14336 1024" ;;
+            "gemma-3-1b-it|baseline")  echo "8192 256" ;;
+            # EB(k̂*) = pd_ifr
+            "Qwen3-8B|pd_ifr")        echo "10240 1024" ;;
+            "Qwen3-30B-A3B|pd_ifr")   echo "18432 512" ;;
+            "gemma-3-1b-it|pd_ifr")   echo "14336 2048" ;;
             *)
                 echo "错误: 未知配置 gpu=${gpu_type} model=${model_short} scheduler=${scheduler}" >&2
                 return 1
                 ;;
         esac
     else
-        echo "错误: 未知 GPU 类型: ${gpu_type} (支持: h200, rtx_pro_6000)" >&2
+        echo "错误: 未知 GPU 类型: ${gpu_type} (支持: h200, rtx_pro_6000, a6000)" >&2
         return 1
     fi
 }
