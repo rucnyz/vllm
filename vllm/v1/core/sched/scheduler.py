@@ -4,7 +4,7 @@ import atexit
 import itertools
 import os
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable
 from typing import Any
 
@@ -284,8 +284,14 @@ class Scheduler(SchedulerInterface):
             # Used for online adaptive threshold selection (Algorithm 2)
             # Must be initialized before k* mode selection below
             if self.pd_k_mode == "ifr":
-                # All output length samples (no sliding window, use all data)
-                self.pd_ifr_samples: list[int] = []
+                # Sliding window of output length samples for hazard
+                # rate estimation.  Keeps only the most recent W samples
+                # so the estimator adapts to distribution shifts within
+                # O(W) completions.
+                self.pd_ifr_window_size = int(os.environ.get(
+                    "VLLM_PD_IFR_WINDOW_SIZE", "500"))
+                self.pd_ifr_samples: deque[int] = deque(
+                    maxlen=self.pd_ifr_window_size)
                 # M: Update interval (re-estimate every M completions)
                 self.pd_ifr_update_interval = int(os.environ.get(
                     "VLLM_PD_IFR_UPDATE_INTERVAL", "100"))
@@ -345,14 +351,15 @@ class Scheduler(SchedulerInterface):
 
             # Phase tracking:
             # Phase 0: Initial prefill - prefill N requests
-            # Phase 1: Decode - decode until k requests complete
-            # Phase 2: Refill prefill - prefill k new requests (no decode)
+            # Phase 1: Decode - switch when min(q,N-n)/n >= θ*/(1-θ*)
+            # Phase 2: Refill prefill - prefill min(q,N-n) requests (no decode)
             # Then back to Phase 1
             self.pd_phase = 0
 
             # Counters
             self.pd_prefilled_count = 0  # Prefills completed in current batch
             self.pd_completed_decode_count = 0  # Decodes completed since last switch
+            self.pd_refill_target = 0  # Number of requests to prefill in Phase 2
 
             # Track which requests are in decode phase
             self.pd_decoding_requests: set[str] = set()
@@ -428,6 +435,7 @@ class Scheduler(SchedulerInterface):
             "N": self.pd_batch_size_N,
             "prefilled_count": self.pd_prefilled_count,
             "completed_decode_count": self.pd_completed_decode_count,
+            "refill_target": self.pd_refill_target,
             "decoding_requests": len(self.pd_decoding_requests),
             "running_requests": len(self.running),
             "waiting_requests": len(self.waiting),
@@ -445,6 +453,7 @@ class Scheduler(SchedulerInterface):
                 "ifr_sample_count": len(self.pd_ifr_samples),
                 "ifr_update_counter": self.pd_ifr_update_counter,
                 "ifr_update_interval": self.pd_ifr_update_interval,
+                "ifr_window_size": self.pd_ifr_window_size,
                 "theta_max": self.pd_theta_max,
             })
         return stats
@@ -580,7 +589,7 @@ class Scheduler(SchedulerInterface):
         Returns:
             tuple[float, float]: (p_0, η) where η >= 0 for IFR distributions
         """
-        # Use all historical samples for estimation
+        # Use sliding window samples for estimation
         samples = self.pd_ifr_samples
         if len(samples) < self.pd_ifr_min_samples:
             # Not enough samples, return current estimates
@@ -912,7 +921,7 @@ class Scheduler(SchedulerInterface):
 
         # IFR mode: online adaptive update (Algorithm 2)
         if self.pd_k_mode == "ifr":
-            # Append to sample list (use all historical data)
+            # Append to sliding window (deque with maxlen auto-evicts)
             self.pd_ifr_samples.append(output_tokens)
             self.pd_ifr_update_counter += 1
 
@@ -1153,13 +1162,21 @@ class Scheduler(SchedulerInterface):
                 self.pd_completed_decode_count = 0
 
         elif self.pd_phase == 1:
-            # Decode -> prefill when k decoded AND k waiting
-            # NOTE: If k* exceeds num_decoding, the RESET condition below
-            # (all decode complete) serves as a fallback to prevent getting stuck.
-            if (self.pd_completed_decode_count >= self.pd_switch_threshold_k
-                    and waiting_count >= self.pd_switch_threshold_k):
-                self.pd_phase = 2
-                self.pd_prefilled_count = 0
+            # Decode -> prefill when ratio condition met:
+            #   min(q, N-n) / n >= k* / (N-k*)  i.e.  θ*/(1-θ*)
+            # Preserves steady-state ratio θ* regardless of batch size,
+            # naturally degrading to continuous-batching behavior under light load.
+            # Uses integer arithmetic to avoid float division:
+            #   fillable * (N - k*) >= n * k*
+            if num_decoding > 0:
+                N = self.pd_batch_size_N
+                k_star = self.pd_switch_threshold_k
+                fillable = min(waiting_count, max(0, N - num_decoding))
+                denom = N - k_star
+                if denom > 0 and fillable * denom >= num_decoding * k_star:
+                    self.pd_refill_target = fillable
+                    self.pd_phase = 2
+                    self.pd_prefilled_count = 0
             # RESET: All decode requests completed, go back to Phase 0
             # Note: running may still have chunked prefill requests that will
             # continue in Phase 0. We only check has_decoding (pd_decoding_requests)
@@ -1187,10 +1204,10 @@ class Scheduler(SchedulerInterface):
                     )
 
         elif self.pd_phase == 2:
-            # Refill prefill -> decode when k prefilled OR no more waiting
+            # Refill prefill -> decode when refill target met OR no more waiting
             # OR KV cache is full (to prevent deadlock)
             ready_to_decode = (
-                self.pd_prefilled_count >= self.pd_switch_threshold_k
+                self.pd_prefilled_count >= self.pd_refill_target
                 or (not has_waiting and has_decoding)
                 or kv_cache_full)  # KV cache full escape
             if ready_to_decode:
@@ -1222,6 +1239,7 @@ class Scheduler(SchedulerInterface):
                 f"prefilled={self.pd_prefilled_count}, "
                 f"decoded={self.pd_completed_decode_count}, "
                 f"k*={self.pd_switch_threshold_k}, "
+                f"refill_target={self.pd_refill_target}, "
                 f"decoding={num_decoding}, N={self.pd_batch_size_N}, "
                 f"avg_out={self.pd_avg_output_tokens:.1f}, "
                 f"kv_thresh={adaptive_threshold:.2%}"
@@ -1254,6 +1272,7 @@ class Scheduler(SchedulerInterface):
         self.pd_phase = 0
         self.pd_prefilled_count = 0
         self.pd_completed_decode_count = 0
+        self.pd_refill_target = 0
 
     def schedule_pd(self) -> SchedulerOutput:
         """
@@ -1285,7 +1304,7 @@ class Scheduler(SchedulerInterface):
         # ===== PREFILL SCHEDULING (Phase 0 or Phase 2) =====
         if self.pd_phase in (0, 2):
             target = (self.pd_batch_size_N if self.pd_phase == 0
-                      else self.pd_switch_threshold_k)
+                      else self.pd_refill_target)
             remaining = target - self.pd_prefilled_count
 
             # Continue chunked prefills first
@@ -3233,6 +3252,7 @@ class Scheduler(SchedulerInterface):
             "num_scheduled_reqs": len(output.num_scheduled_tokens),
             "k_star": self.pd_switch_threshold_k if self.use_pd_scheduler else 0,
             "k_ratio": self.pd_k_ratio if self.use_pd_scheduler else 0,
+            "refill_target": self.pd_refill_target if self.use_pd_scheduler else 0,
             "N": self.pd_batch_size_N if self.use_pd_scheduler else 0,
             "num_decoding_reqs": len(self.pd_decoding_requests) if self.use_pd_scheduler else 0,
             "num_preempted_reqs": num_preempted_reqs,
