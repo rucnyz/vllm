@@ -243,20 +243,19 @@ def plot_distribution_shift(
             si, color="black", linestyle="--",
             linewidth=1.5, alpha=0.7,
         )
-    # Add single legend entry for shift lines
-    if shift_iters:
-        ax1.axvline(
-            shift_iters[0], color="black", linestyle="--",
-            linewidth=0, alpha=0, label="Distribution shift",
-        )
-
     ax1.set_ylabel(r"$\theta^{*}$ (k_ratio)")
     ax1.set_title(
         r"$\theta^{*}$ Convergence Under Distribution Shift"
         f" (W={window_size})",
         fontweight="bold",
     )
-    ax1.legend(loc="best", framealpha=0.9)
+    # Build legend with shift-line entry
+    handles, labels = ax1.get_legend_handles_labels()
+    if shift_iters:
+        from matplotlib.lines import Line2D
+        handles.append(Line2D([0], [0], color="black", linestyle="--", linewidth=1.5))
+        labels.append("Distribution shift")
+    ax1.legend(handles, labels, loc="best", framealpha=0.9)
     ax1.grid(True, alpha=0.3)
 
     # ── Panel 2: Sliding-window throughput ──
