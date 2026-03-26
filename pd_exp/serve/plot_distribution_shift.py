@@ -10,7 +10,7 @@ Reads schedule stats from pd_ifr and pd_ratio runs, and generates:
 Supports both 2-phase (legacy) and multi-phase experiments.
 
 Usage:
-    python pd_exp/plot_distribution_shift.py \
+    python pd_exp/serve/plot_distribution_shift.py \
         pd_exp/outputs/distribution_shift_Qwen3-8B_20260325_120000
 """
 

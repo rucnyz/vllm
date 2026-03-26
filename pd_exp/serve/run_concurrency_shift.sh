@@ -1,26 +1,27 @@
 #!/bin/bash
 
-# Distribution Shift 实验脚本 (3-phase synthetic data)
-# 验证 THETA 的 IFR 在线 controller 在 workload 突变时的行为:
-#   1. θ* 能在 ~W 个样本内收敛到新最优值
+# Concurrency Shift 实验脚本
+# 验证 THETA 的 IFR 在线 controller 在并发突变时的行为:
+#   1. θ* 能在并发变化后快速收敛到新最优值
 #   2. 系统保持 memory-safe (无 OOM)
-#   3. 吞吐量暂时下降幅度有限
+#   3. 吞吐量能跟随并发变化
 #
-# 实验设计 (3 phases):
-#   Phase 1: prefill-heavy  (input~1024, output~128)
-#   Phase 2: balanced        (input~512,  output~512)
-#   Phase 3: decode-heavy   (input~128,  output~1024)
+# 实验设计 (默认 3 phases):
+#   Phase 1: 低并发   (concurrency=32)
+#   Phase 2: 高并发   (concurrency=2048)
+#   Phase 3: 中并发   (concurrency=500)
+#   Server 保持运行，顺序发送不同并发的 benchmark
 #   对比: pd_ifr (自适应 θ*) vs pd_ratio (固定 θ*=0.8)
 #
-# 用法: ./run_distribution_shift.sh [GPU_ID]
+# 用法: ./run_concurrency_shift.sh [GPU_ID]
 #
 # 环境变量:
 #   MODEL: 模型路径，默认 Qwen/Qwen3-8B
 #   NUM_PROMPTS_PER_PHASE: 每个阶段的请求数，默认 2000
-#   MAX_CONCURRENCY: 最大并发，默认 2048
+#   CONCURRENCY_PHASES: 并发阶段，默认 "32,2048,500"
+#   INPUT_LEN: 固定 input 长度，默认 512
+#   OUTPUT_LEN: 固定 output 长度，默认 256
 #   IFR_WINDOW_SIZE: IFR 滑动窗口大小，默认 500
-#   PHASES: phase 定义，默认 "1024:128,512:512,128:1024"
-#   OUTPUT_VARIANCE: output_len 方差比例，默认 0.25
 
 set -e
 
@@ -32,21 +33,22 @@ GPU_ID=${1:-0}
 MODEL=${MODEL:-"Qwen/Qwen3-8B"}
 MODEL_SHORT=$(echo "$MODEL" | sed 's|.*/||')
 NUM_PROMPTS_PER_PHASE=${NUM_PROMPTS_PER_PHASE:-2000}
-MAX_CONCURRENCY=${MAX_CONCURRENCY:-2048}
+CONCURRENCY_PHASES=${CONCURRENCY_PHASES:-"32,2048,500"}
+INPUT_LEN=${INPUT_LEN:-512}
+OUTPUT_LEN=${OUTPUT_LEN:-256}
+OUTPUT_VARIANCE=${OUTPUT_VARIANCE:-0.25}
 K_RATIO=${K_RATIO:-0.8}
 BASE_PORT=${BASE_PORT:-13000}
 IFR_WINDOW_SIZE=${IFR_WINDOW_SIZE:-500}
-PHASES=${PHASES:-"1024:128,512:512,128:1024"}
-OUTPUT_VARIANCE=${OUTPUT_VARIANCE:-0.25}
 SOURCE_DATASET=${SOURCE_DATASET:-"alpaca"}
 
 # 最优配置 (H200)
 TB=${TB:-18432}
 BS=${BS:-2048}
 
-# 计算 phase 数量和总请求数
-NUM_PHASES=$(echo "$PHASES" | tr ',' '\n' | wc -l)
-TOTAL_PROMPTS=$((NUM_PROMPTS_PER_PHASE * NUM_PHASES))
+# 解析并发阶段
+IFS=',' read -ra CONCURRENCY_ARRAY <<< "$CONCURRENCY_PHASES"
+NUM_PHASES=${#CONCURRENCY_ARRAY[@]}
 
 # 硬件校准文件
 if [ -z "${VLLM_PD_CALIBRATION_FILE:-}" ]; then
@@ -60,14 +62,14 @@ if [ -z "${VLLM_PD_CALIBRATION_FILE:-}" ]; then
 fi
 
 # 输出目录
-OUTPUT_DIR="${SCRIPT_DIR}/../outputs/distribution_shift_${MODEL_SHORT}_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR="${SCRIPT_DIR}/../outputs/concurrency_shift_${MODEL_SHORT}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUTPUT_DIR/logs"
 
 # 初始化环境
 init_experiment_env
 
 echo "========================================"
-echo "Distribution Shift 实验 (${NUM_PHASES}-phase)"
+echo "Concurrency Shift 实验 (${NUM_PHASES}-phase)"
 echo "========================================"
 echo ""
 echo "实验配置:"
@@ -75,23 +77,22 @@ echo "  MODEL: $MODEL"
 echo "  GPU: $GPU_ID"
 echo "  TB: $TB, BS: $BS"
 echo "  NUM_PROMPTS_PER_PHASE: $NUM_PROMPTS_PER_PHASE"
-echo "  TOTAL_PROMPTS: $TOTAL_PROMPTS"
-echo "  MAX_CONCURRENCY: $MAX_CONCURRENCY"
+echo "  CONCURRENCY_PHASES: $CONCURRENCY_PHASES"
+echo "  INPUT_LEN: $INPUT_LEN, OUTPUT_LEN: $OUTPUT_LEN"
 echo "  IFR_WINDOW_SIZE: $IFR_WINDOW_SIZE"
-echo "  PHASES: $PHASES"
-echo "  OUTPUT_VARIANCE: $OUTPUT_VARIANCE"
 echo ""
 
 # ========================================
-# Step 1: 生成合成数据集
+# Step 1: 生成统一分布的合成数据集
 # ========================================
-SYNTHETIC_DATASET="${OUTPUT_DIR}/synthetic_${NUM_PHASES}phase.jsonl"
-echo "生成合成数据集..."
+# 每个 phase 复用同一批 prompts，只改变并发度
+SYNTHETIC_DATASET="${OUTPUT_DIR}/synthetic_uniform.jsonl"
+echo "生成合成数据集 (uniform: input~${INPUT_LEN}, output~${OUTPUT_LEN})..."
 
 python3 "${SCRIPT_DIR}/generate_distribution_shift_dataset.py" \
     --model "$MODEL" \
     --num-prompts-per-phase "$NUM_PROMPTS_PER_PHASE" \
-    --phases "$PHASES" \
+    --phases "${INPUT_LEN}:${OUTPUT_LEN}" \
     --variance "$OUTPUT_VARIANCE" \
     --source-dataset "$SOURCE_DATASET" \
     --output "$SYNTHETIC_DATASET" \
@@ -100,42 +101,31 @@ python3 "${SCRIPT_DIR}/generate_distribution_shift_dataset.py" \
 echo ""
 echo "数据集已生成: $SYNTHETIC_DATASET"
 
-# 构建 phases JSON array
+# 构建 concurrency phases JSON array
 PHASES_JSON=$(python3 -c "
 import json
-phases = '$PHASES'.split(',')
-result = []
-for p in phases:
-    inp, out = p.strip().split(':')
-    inp, out = int(inp), int(out)
-    ratio = out / max(inp, 1)
-    if ratio > 1.5:
-        name = 'decode-heavy'
-    elif ratio < 0.5:
-        name = 'prefill-heavy'
-    else:
-        name = 'balanced'
-    result.append({'name': name, 'input_mean': inp, 'output_mean': out})
+phases = '$CONCURRENCY_PHASES'.split(',')
+result = [{'concurrency': int(c.strip())} for c in phases]
 print(json.dumps(result))
 ")
 
 # 保存实验配置
 cat > "${OUTPUT_DIR}/experiment_config.json" << EOF
 {
-    "experiment_type": "distribution_shift",
-    "purpose": "Validate IFR controller convergence under workload distribution shift",
+    "experiment_type": "concurrency_shift",
+    "purpose": "Validate IFR controller adaptation under concurrency level changes",
     "model": "${MODEL}",
     "gpu_id": ${GPU_ID},
     "tb": ${TB},
     "bs": ${BS},
     "num_prompts_per_phase": ${NUM_PROMPTS_PER_PHASE},
-    "total_prompts": ${TOTAL_PROMPTS},
     "num_phases": ${NUM_PHASES},
-    "phases": ${PHASES_JSON},
-    "max_concurrency": ${MAX_CONCURRENCY},
+    "concurrency_phases": ${PHASES_JSON},
+    "input_len": ${INPUT_LEN},
+    "output_len": ${OUTPUT_LEN},
+    "output_variance": ${OUTPUT_VARIANCE},
     "ifr_window_size": ${IFR_WINDOW_SIZE},
     "k_ratio": ${K_RATIO},
-    "output_variance": ${OUTPUT_VARIANCE},
     "schedulers": ["pd_ifr", "pd_ratio"],
     "calibration_file": "${VLLM_PD_CALIBRATION_FILE}",
     "timestamp": "$(date -Iseconds)"
@@ -172,13 +162,13 @@ run_single_experiment() {
             export VLLM_USE_PD_SCHEDULER=1
             export VLLM_PD_K_MODE=ratio
             export VLLM_PD_K_RATIO=$K_RATIO
-            unset VLLM_PD_K_STAR
+            unset VLLM_PD_K_STAR VLLM_PD_IFR_WINDOW_SIZE
             ;;
     esac
 
     wait_for_gpu_memory $GPU_ID 60 || return 1
 
-    # 启动服务
+    # 启动服务 (整个实验期间保持运行)
     local dtype_arg=""
     if [ -n "${DTYPE:-}" ]; then
         dtype_arg="--dtype $DTYPE"
@@ -200,38 +190,53 @@ run_single_experiment() {
     fi
 
     echo "服务已启动 (PID: $server_pid, port: $port)"
-    echo "开始 benchmark..."
 
-    # 运行 benchmark
-    # --custom-output-len -1: 使用 JSONL 中每个请求的 output_len
-    # --ignore-eos: 强制生成指定长度（否则模型遇到 EOS 就停止，无法控制输出长度）
-    local bench_status=0
-    vllm bench serve \
-        --model "$MODEL" \
-        --base-url "http://localhost:${port}" \
-        --dataset-name custom \
-        --dataset-path "$SYNTHETIC_DATASET" \
-        --custom-output-len -1 \
-        --ignore-eos \
-        --num-prompts "$TOTAL_PROMPTS" \
-        --num-warmups 0 \
-        --request-rate inf \
-        --max-concurrency "$MAX_CONCURRENCY" \
-        --save-result \
-        --save-detailed \
-        --result-dir "${OUTPUT_DIR}" \
-        --result-filename "bench_${scheduler}.json" \
-        >> "$log_file" 2>&1 || bench_status=$?
+    # 顺序运行每个并发阶段 (server 保持运行，IFR 状态连续)
+    local phase_idx=0
+    local overall_status=0
+
+    for concurrency in "${CONCURRENCY_ARRAY[@]}"; do
+        concurrency=$(echo "$concurrency" | tr -d ' ')
+        phase_idx=$((phase_idx + 1))
+
+        echo ""
+        echo "--- Phase ${phase_idx}/${NUM_PHASES}: concurrency=${concurrency} ---"
+
+        local bench_status=0
+        vllm bench serve \
+            --model "$MODEL" \
+            --base-url "http://localhost:${port}" \
+            --dataset-name custom \
+            --dataset-path "$SYNTHETIC_DATASET" \
+            --custom-output-len -1 \
+            --ignore-eos \
+            --num-prompts "$NUM_PROMPTS_PER_PHASE" \
+            --num-warmups 0 \
+            --request-rate inf \
+            --max-concurrency "$concurrency" \
+            --save-result \
+            --save-detailed \
+            --result-dir "${OUTPUT_DIR}" \
+            --result-filename "bench_${scheduler}_phase${phase_idx}_c${concurrency}.json" \
+            >> "$log_file" 2>&1 || bench_status=$?
+
+        if [ $bench_status -eq 0 ]; then
+            echo "Phase ${phase_idx} 完成 (concurrency=${concurrency})"
+        else
+            echo "Phase ${phase_idx} 失败 (concurrency=${concurrency}, exit=$bench_status)"
+            overall_status=$bench_status
+        fi
+    done
 
     kill_server $server_pid $GPU_ID
 
-    if [ $bench_status -eq 0 ]; then
+    if [ $overall_status -eq 0 ]; then
         echo "完成: ${scheduler}"
     else
-        echo "失败: ${scheduler}"
+        echo "部分失败: ${scheduler}"
     fi
 
-    return $bench_status
+    return $overall_status
 }
 
 # 顺序运行两个 scheduler
@@ -246,4 +251,4 @@ echo ""
 echo "结果目录: $OUTPUT_DIR"
 echo ""
 echo "运行分析脚本:"
-echo "  python pd_exp/serve/plot_distribution_shift.py $OUTPUT_DIR"
+echo "  python pd_exp/serve/plot_concurrency_shift.py $OUTPUT_DIR"

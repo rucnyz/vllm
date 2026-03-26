@@ -30,10 +30,9 @@ select_gpus() {
     echo "使用 ${#GPUS_TO_USE[@]} 张 GPU: ${GPUS_TO_USE[*]}"
 }
 
-# 检查端口是否可用
+# 检查端口是否可用 (只检查 LISTEN 状态，避免 TIME_WAIT/ESTABLISHED 误判)
 check_port_available() {
     local port=$1 gpu_id=${2:-""}
-    # 只检查 LISTEN 状态，避免被 TIME_WAIT/ESTABLISHED 误判为占用
     if lsof -nP -iTCP:$port -sTCP:LISTEN >/dev/null 2>&1; then
         echo "[GPU $gpu_id] 端口 $port 被占用"
         return 1
@@ -134,7 +133,7 @@ kill_server() {
         for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i $gpu_id 2>/dev/null | tr -d ' '); do
             [ -n "$pid" ] && kill -9 $pid 2>/dev/null || true
         done
-        wait_for_gpu_memory "$gpu_id" 30
+        wait_for_gpu_memory "$gpu_id" 30 || true
     else
         sleep 2
     fi
@@ -167,7 +166,9 @@ update_progress() {
 
 # 初始化实验环境
 init_experiment_env() {
-    local venv_path=${1:-"/scratch/yuzhou/aproj/vllm/.venv"}
+    # common.sh is at pd_exp/common.sh, project root is ..
+    local _common_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local venv_path=${1:-"${_common_dir}/../.venv"}
     ulimit -n 65535 2>/dev/null || true
     if [ -f "${venv_path}/bin/activate" ]; then
         source "${venv_path}/bin/activate"
