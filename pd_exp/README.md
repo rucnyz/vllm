@@ -2,12 +2,11 @@
 
 ## 前置条件: 硬件校准
 
-所有 PD Scheduler 实验都需要硬件校准文件，运行前必须先执行：
+所有 PD Scheduler 实验都需要硬件校准文件。serve/ 下的脚本会**自动运行校准**（如果文件不存在）。
+也可手动运行或通过 `VLLM_PD_CALIBRATION_FILE` 环境变量指定：
 
 ```bash
 python -m vllm.v1.core.sched.calibration --model Qwen/Qwen3-8B
-# 输出: pd_exp/outputs/pd_calibration_Qwen3-8B.json
-# 也可通过 VLLM_PD_CALIBRATION_FILE 环境变量指定其他路径
 ```
 
 ## 目录结构
@@ -33,7 +32,7 @@ pd_exp/
 
 ## serve/ - Online Serving 实验
 
-验证 IFR controller 在 workload 突变时的适应能力。对比 `pd_ifr`（自适应 θ\*）vs `pd_ratio`（固定 θ\*）。
+验证 IFR controller 在 workload 突变时的适应能力。对比 `baseline`（vLLM v1 默认）vs `pd_ifr`（自适应 θ\*）vs `pd_ratio`（固定 θ\*）。
 
 ### Distribution Shift (input/output 分布突变)
 
@@ -57,12 +56,42 @@ Server 全程不重启，IFR 状态连续。每个 phase 相同 prompt 分布，
 ```bash
 bash pd_exp/serve/run_concurrency_shift.sh [GPU_ID]
 
-# 自定义
-TB=8192 BS=1024 CONCURRENCY_PHASES="64,1024,256" \
+# 自定义并发阶段 (每个 phase 独立控制数量: concurrency:num_prompts)
+CONCURRENCY_PHASES="32:500,2048:4000,500:2000" \
+    bash pd_exp/serve/run_concurrency_shift.sh 0
+
+# 不指定数量则使用默认值 NUM_PROMPTS_PER_PHASE=2000
+CONCURRENCY_PHASES="64,1024,256" \
     bash pd_exp/serve/run_concurrency_shift.sh 0
 ```
 
 > 所有环境变量及默认值见各脚本头部注释。
+
+#### 标准 test case (H200, Qwen3-8B)
+
+```bash
+CONCURRENCY_PHASES="32:1000,2048:3000,256:2000" \
+    bash pd_exp/serve/run_concurrency_shift.sh 0
+```
+
+参考结果 (TB=18432, BS=2048, input~512, output~256):
+
+| Phase | Conc. | Scheduler | Throughput (tok/s) | TTFT (ms) | TPOT (ms) |
+|-------|-------|-----------|--------------------|-----------|-----------|
+| 1 (低) | 32 | baseline | **4166** | **41** | 7.45 |
+| | | pd_ifr | 3039 | 963 | **6.59** |
+| | | pd_ratio | 2960 | 964 | 6.77 |
+| 2 (高) | 2048 | baseline | 10104 | **16823** | 104.71 |
+| | | pd_ifr | **10875** | 23172 | **49.53** |
+| | | pd_ratio | 10757 | 23050 | 51.70 |
+| 3 (中) | 256 | baseline | **9144** | **337** | 25.99 |
+| | | pd_ifr | 8770 | 2498 | **18.30** |
+| | | pd_ratio | 8623 | 2732 | 17.68 |
+
+要点:
+- 高并发 (2048) 时 PD 吞吐反超 baseline (+7.6%)，**TPOT 仅为 baseline 的一半** (49.5 vs 104.7ms)
+- PD 的 TPOT 在所有 phase 均优于 baseline，prefill/decode 分离有效减少了 decode 被 prefill 打断的干扰
+- 代价是 TTFT 更高，prefill 需要等待 decode slot
 
 ## syn/ - 参数搜索实验
 

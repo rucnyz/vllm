@@ -48,16 +48,8 @@ BS=${BS:-2048}
 NUM_PHASES=$(echo "$PHASES" | tr ',' '\n' | wc -l)
 TOTAL_PROMPTS=$((NUM_PROMPTS_PER_PHASE * NUM_PHASES))
 
-# 硬件校准文件
-if [ -z "${VLLM_PD_CALIBRATION_FILE:-}" ]; then
-    DEFAULT_CALIBRATION="${SCRIPT_DIR}/../outputs/pd_calibration_${MODEL_SHORT}.json"
-    if [ -f "$DEFAULT_CALIBRATION" ]; then
-        export VLLM_PD_CALIBRATION_FILE="$DEFAULT_CALIBRATION"
-    else
-        echo "错误: 未找到硬件校准文件: $DEFAULT_CALIBRATION"
-        exit 1
-    fi
-fi
+# 硬件校准文件 (不存在则自动运行校准)
+ensure_calibration "$MODEL" "$MODEL_SHORT"
 
 # 输出目录
 OUTPUT_DIR="${SCRIPT_DIR}/../outputs/distribution_shift_${MODEL_SHORT}_$(date +%Y%m%d_%H%M%S)"
@@ -136,7 +128,7 @@ cat > "${OUTPUT_DIR}/experiment_config.json" << EOF
     "ifr_window_size": ${IFR_WINDOW_SIZE},
     "k_ratio": ${K_RATIO},
     "output_variance": ${OUTPUT_VARIANCE},
-    "schedulers": ["pd_ifr", "pd_ratio"],
+    "schedulers": ["baseline", "pd_ifr", "pd_ratio"],
     "calibration_file": "${VLLM_PD_CALIBRATION_FILE}",
     "timestamp": "$(date -Iseconds)"
 }
@@ -162,6 +154,10 @@ run_single_experiment() {
     export VLLM_COLLECT_SCHEDULE_STATS=1
 
     case "$scheduler" in
+        baseline)
+            unset VLLM_USE_PD_SCHEDULER VLLM_PD_K_MODE VLLM_PD_K_RATIO \
+                  VLLM_PD_K_STAR VLLM_PD_IFR_WINDOW_SIZE
+            ;;
         pd_ifr)
             export VLLM_USE_PD_SCHEDULER=1
             export VLLM_PD_K_MODE=ifr
@@ -172,7 +168,7 @@ run_single_experiment() {
             export VLLM_USE_PD_SCHEDULER=1
             export VLLM_PD_K_MODE=ratio
             export VLLM_PD_K_RATIO=$K_RATIO
-            unset VLLM_PD_K_STAR
+            unset VLLM_PD_K_STAR VLLM_PD_IFR_WINDOW_SIZE
             ;;
     esac
 
@@ -234,7 +230,8 @@ run_single_experiment() {
     return $bench_status
 }
 
-# 顺序运行两个 scheduler
+# 顺序运行三个 scheduler
+run_single_experiment "baseline" || echo "警告: baseline 实验失败 (exit=$?)"
 run_single_experiment "pd_ifr" || echo "警告: pd_ifr 实验失败 (exit=$?)"
 run_single_experiment "pd_ratio" || echo "警告: pd_ratio 实验失败 (exit=$?)"
 

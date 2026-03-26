@@ -18,7 +18,8 @@
 # 环境变量:
 #   MODEL: 模型路径，默认 Qwen/Qwen3-8B
 #   NUM_PROMPTS_PER_PHASE: 每个阶段的请求数，默认 2000
-#   CONCURRENCY_PHASES: 并发阶段，默认 "32,2048,500"
+#   CONCURRENCY_PHASES: 并发阶段，格式 "concurrency[:num_prompts],..."
+#                      例: "32:500,2048:4000,500:2000" 或 "32,2048,500" (用默认数量)
 #   INPUT_LEN: 固定 input 长度，默认 512
 #   OUTPUT_LEN: 固定 output 长度，默认 256
 #   IFR_WINDOW_SIZE: IFR 滑动窗口大小，默认 500
@@ -33,7 +34,7 @@ GPU_ID=${1:-0}
 MODEL=${MODEL:-"Qwen/Qwen3-8B"}
 MODEL_SHORT=$(echo "$MODEL" | sed 's|.*/||')
 NUM_PROMPTS_PER_PHASE=${NUM_PROMPTS_PER_PHASE:-2000}
-CONCURRENCY_PHASES=${CONCURRENCY_PHASES:-"32,2048,500"}
+CONCURRENCY_PHASES=${CONCURRENCY_PHASES:-"32:500,2048:4000,500:2000"}
 INPUT_LEN=${INPUT_LEN:-512}
 OUTPUT_LEN=${OUTPUT_LEN:-256}
 OUTPUT_VARIANCE=${OUTPUT_VARIANCE:-0.25}
@@ -46,20 +47,27 @@ SOURCE_DATASET=${SOURCE_DATASET:-"alpaca"}
 TB=${TB:-18432}
 BS=${BS:-2048}
 
-# 解析并发阶段
-IFS=',' read -ra CONCURRENCY_ARRAY <<< "$CONCURRENCY_PHASES"
-NUM_PHASES=${#CONCURRENCY_ARRAY[@]}
-
-# 硬件校准文件
-if [ -z "${VLLM_PD_CALIBRATION_FILE:-}" ]; then
-    DEFAULT_CALIBRATION="${SCRIPT_DIR}/../outputs/pd_calibration_${MODEL_SHORT}.json"
-    if [ -f "$DEFAULT_CALIBRATION" ]; then
-        export VLLM_PD_CALIBRATION_FILE="$DEFAULT_CALIBRATION"
+# 解析并发阶段 (格式: concurrency[:num_prompts],...)
+IFS=',' read -ra _RAW_PHASES <<< "$CONCURRENCY_PHASES"
+NUM_PHASES=${#_RAW_PHASES[@]}
+PHASE_CONCURRENCIES=()
+PHASE_NUM_PROMPTS=()
+MAX_PHASE_PROMPTS=0
+for _p in "${_RAW_PHASES[@]}"; do
+    _p=$(echo "$_p" | tr -d ' ')
+    if [[ "$_p" == *:* ]]; then
+        PHASE_CONCURRENCIES+=("${_p%%:*}")
+        PHASE_NUM_PROMPTS+=("${_p##*:}")
     else
-        echo "错误: 未找到硬件校准文件: $DEFAULT_CALIBRATION"
-        exit 1
+        PHASE_CONCURRENCIES+=("$_p")
+        PHASE_NUM_PROMPTS+=("$NUM_PROMPTS_PER_PHASE")
     fi
-fi
+    local_n=${PHASE_NUM_PROMPTS[-1]}
+    [ "$local_n" -gt "$MAX_PHASE_PROMPTS" ] && MAX_PHASE_PROMPTS=$local_n
+done
+
+# 硬件校准文件 (不存在则自动运行校准)
+ensure_calibration "$MODEL" "$MODEL_SHORT"
 
 # 输出目录
 OUTPUT_DIR="${SCRIPT_DIR}/../outputs/concurrency_shift_${MODEL_SHORT}_$(date +%Y%m%d_%H%M%S)"
@@ -91,7 +99,7 @@ echo "生成合成数据集 (uniform: input~${INPUT_LEN}, output~${OUTPUT_LEN}).
 
 python3 "${SCRIPT_DIR}/generate_distribution_shift_dataset.py" \
     --model "$MODEL" \
-    --num-prompts-per-phase "$NUM_PROMPTS_PER_PHASE" \
+    --num-prompts-per-phase "$MAX_PHASE_PROMPTS" \
     --phases "${INPUT_LEN}:${OUTPUT_LEN}" \
     --variance "$OUTPUT_VARIANCE" \
     --source-dataset "$SOURCE_DATASET" \
@@ -104,8 +112,9 @@ echo "数据集已生成: $SYNTHETIC_DATASET"
 # 构建 concurrency phases JSON array
 PHASES_JSON=$(python3 -c "
 import json
-phases = '$CONCURRENCY_PHASES'.split(',')
-result = [{'concurrency': int(c.strip())} for c in phases]
+concurrencies = '${PHASE_CONCURRENCIES[*]}'.split()
+num_prompts = '${PHASE_NUM_PROMPTS[*]}'.split()
+result = [{'concurrency': int(c), 'num_prompts': int(n)} for c, n in zip(concurrencies, num_prompts)]
 print(json.dumps(result))
 ")
 
@@ -118,7 +127,7 @@ cat > "${OUTPUT_DIR}/experiment_config.json" << EOF
     "gpu_id": ${GPU_ID},
     "tb": ${TB},
     "bs": ${BS},
-    "num_prompts_per_phase": ${NUM_PROMPTS_PER_PHASE},
+    "default_num_prompts_per_phase": ${NUM_PROMPTS_PER_PHASE},
     "num_phases": ${NUM_PHASES},
     "concurrency_phases": ${PHASES_JSON},
     "input_len": ${INPUT_LEN},
@@ -126,7 +135,7 @@ cat > "${OUTPUT_DIR}/experiment_config.json" << EOF
     "output_variance": ${OUTPUT_VARIANCE},
     "ifr_window_size": ${IFR_WINDOW_SIZE},
     "k_ratio": ${K_RATIO},
-    "schedulers": ["pd_ifr", "pd_ratio"],
+    "schedulers": ["baseline", "pd_ifr", "pd_ratio"],
     "calibration_file": "${VLLM_PD_CALIBRATION_FILE}",
     "timestamp": "$(date -Iseconds)"
 }
@@ -152,6 +161,10 @@ run_single_experiment() {
     export VLLM_COLLECT_SCHEDULE_STATS=1
 
     case "$scheduler" in
+        baseline)
+            unset VLLM_USE_PD_SCHEDULER VLLM_PD_K_MODE VLLM_PD_K_RATIO \
+                  VLLM_PD_K_STAR VLLM_PD_IFR_WINDOW_SIZE
+            ;;
         pd_ifr)
             export VLLM_USE_PD_SCHEDULER=1
             export VLLM_PD_K_MODE=ifr
@@ -195,12 +208,13 @@ run_single_experiment() {
     local phase_idx=0
     local overall_status=0
 
-    for concurrency in "${CONCURRENCY_ARRAY[@]}"; do
-        concurrency=$(echo "$concurrency" | tr -d ' ')
-        phase_idx=$((phase_idx + 1))
+    for phase_idx_0 in $(seq 0 $((NUM_PHASES - 1))); do
+        local concurrency=${PHASE_CONCURRENCIES[$phase_idx_0]}
+        local phase_prompts=${PHASE_NUM_PROMPTS[$phase_idx_0]}
+        phase_idx=$((phase_idx_0 + 1))
 
         echo ""
-        echo "--- Phase ${phase_idx}/${NUM_PHASES}: concurrency=${concurrency} ---"
+        echo "--- Phase ${phase_idx}/${NUM_PHASES}: concurrency=${concurrency}, num_prompts=${phase_prompts} ---"
 
         local bench_status=0
         vllm bench serve \
@@ -210,7 +224,7 @@ run_single_experiment() {
             --dataset-path "$SYNTHETIC_DATASET" \
             --custom-output-len -1 \
             --ignore-eos \
-            --num-prompts "$NUM_PROMPTS_PER_PHASE" \
+            --num-prompts "$phase_prompts" \
             --num-warmups 0 \
             --request-rate inf \
             --max-concurrency "$concurrency" \
@@ -221,7 +235,7 @@ run_single_experiment() {
             >> "$log_file" 2>&1 || bench_status=$?
 
         if [ $bench_status -eq 0 ]; then
-            echo "Phase ${phase_idx} 完成 (concurrency=${concurrency})"
+            echo "Phase ${phase_idx} 完成 (concurrency=${concurrency}, prompts=${phase_prompts})"
         else
             echo "Phase ${phase_idx} 失败 (concurrency=${concurrency}, exit=$bench_status)"
             overall_status=$bench_status
@@ -239,7 +253,8 @@ run_single_experiment() {
     return $overall_status
 }
 
-# 顺序运行两个 scheduler
+# 顺序运行三个 scheduler
+run_single_experiment "baseline" || echo "警告: baseline 实验失败 (exit=$?)"
 run_single_experiment "pd_ifr" || echo "警告: pd_ifr 实验失败 (exit=$?)"
 run_single_experiment "pd_ratio" || echo "警告: pd_ratio 实验失败 (exit=$?)"
 

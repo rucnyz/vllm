@@ -164,6 +164,38 @@ update_progress() {
     ) 200>"$lock_file"
 }
 
+# 确保硬件校准文件存在，不存在则自动运行校准
+# 用法: ensure_calibration <model> <model_short>
+# 结果: 设置 VLLM_PD_CALIBRATION_FILE 环境变量
+ensure_calibration() {
+    local model=$1 model_short=$2
+    local _common_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local calibration_dir="${_common_dir}/outputs"
+
+    if [ -n "${VLLM_PD_CALIBRATION_FILE:-}" ]; then
+        if [ -f "$VLLM_PD_CALIBRATION_FILE" ]; then
+            return 0
+        else
+            echo "错误: 指定的校准文件不存在: $VLLM_PD_CALIBRATION_FILE"
+            return 1
+        fi
+    fi
+
+    local calibration_file="${calibration_dir}/pd_calibration_${model_short}.json"
+    if [ -f "$calibration_file" ]; then
+        export VLLM_PD_CALIBRATION_FILE="$calibration_file"
+        return 0
+    fi
+
+    echo "未找到校准文件，自动运行硬件校准..."
+    mkdir -p "$calibration_dir"
+    python -m vllm.v1.core.sched.calibration \
+        --model "$model" \
+        --output "$calibration_file" || return 1
+    export VLLM_PD_CALIBRATION_FILE="$calibration_file"
+    echo "校准完成: $calibration_file"
+}
+
 # 初始化实验环境
 init_experiment_env() {
     # common.sh is at pd_exp/common.sh, project root is ..
