@@ -212,13 +212,21 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
-        # Scheduler mode selection via environment variable
-        # VLLM_USE_PD_SCHEDULER=1: Use P/D competition scheduler
-        # VLLM_USE_PD_SCHEDULER=0 (default): Use original vLLM scheduler
-        self.use_pd_scheduler = os.environ.get(
-            "VLLM_USE_PD_SCHEDULER", "0") == "1"
+        # Scheduler mode: "cp" (default), "eb" (exclusive batching), "auto" (THETA+)
+        # VLLM_PD_SCHEDULER_MODE takes precedence over VLLM_USE_PD_SCHEDULER
+        _mode_env = os.environ.get("VLLM_PD_SCHEDULER_MODE", "")
+        if _mode_env:
+            self.scheduler_mode = _mode_env.lower()
+        elif os.environ.get("VLLM_USE_PD_SCHEDULER", "0") == "1":
+            self.scheduler_mode = "eb"
+        else:
+            self.scheduler_mode = "cp"
 
-        # P/D competition scheduling state - only initialize if PD scheduler is enabled
+        # Backward-compatible flag — True for both "eb" and "auto"
+        # so all existing PD state initialization and guards work unchanged
+        self.use_pd_scheduler = self.scheduler_mode in ("eb", "auto")
+
+        # P/D competition scheduling state - initialize for "eb" and "auto" modes
         if self.use_pd_scheduler:
             # N: batch size - number of requests to prefill before starting decode
             self.pd_batch_size_N = self.max_num_running_reqs
@@ -397,6 +405,52 @@ class Scheduler(SchedulerInterface):
             )
         else:
             logger.info("[Scheduler] Using original vLLM scheduler")
+
+        # --- THETA+ auto mode state ---
+        if self.scheduler_mode == "auto":
+            # Current active scheduler: "cp" or "eb"
+            self._active_scheduler = os.environ.get(
+                "VLLM_PD_AUTO_COLD_START_MODE", "cp")
+
+            # CP effective marginal cost: f(r) = a + b*r + c*r² (offline profiled)
+            self._cp_cost_a = float(os.environ.get("VLLM_PD_CP_COST_A", "0"))
+            self._cp_cost_b = float(os.environ.get("VLLM_PD_CP_COST_B", "0"))
+            self._cp_cost_c = float(os.environ.get("VLLM_PD_CP_COST_C", "0"))
+            self._cp_cost_profiled = any(
+                os.environ.get(k)
+                for k in ["VLLM_PD_CP_COST_A", "VLLM_PD_CP_COST_B",
+                           "VLLM_PD_CP_COST_C"])
+
+            # α_CP: defaults to α_p (paper approximation α_p ≈ α_d ≈ α_CP)
+            _acp = os.environ.get("VLLM_PD_ALPHA_CP", "")
+            self._alpha_cp = float(_acp) if _acp else self.pd_alpha_p
+
+            # Hysteresis band and cooldown for mode switching
+            self._mode_switch_delta = float(os.environ.get(
+                "VLLM_PD_MODE_SWITCH_DELTA", "0.0001"))
+            self._mode_cooldown_max = int(os.environ.get(
+                "VLLM_PD_MODE_COOLDOWN", "3"))
+            self._mode_cooldown = 0
+
+            # Batch occupancy EMA (N_obs) — uses asymmetric EMA in schedule()
+            self._n_obs = float(self.max_num_running_reqs)
+
+            # Average prompt length EMA (μ_L tracking)
+            self._avg_prompt_len = 512.0  # initial estimate
+            self._avg_prompt_ema_alpha = 0.05  # slow EMA for prompt length
+
+            # Mode switch tracking for stats/debugging
+            self._mode_switch_history: list[dict] = []
+            self._mode_switch_count = 0
+
+            logger.info(
+                f"[THETA+] Auto mode initialized: "
+                f"cold_start={self._active_scheduler}, "
+                f"cp_cost_profiled={self._cp_cost_profiled}, "
+                f"alpha_cp={self._alpha_cp:.6f}, "
+                f"delta={self._mode_switch_delta}, "
+                f"cooldown={self._mode_cooldown_max}"
+            )
 
         self.chunk_prefilling: list[Request] = []
 
@@ -986,6 +1040,10 @@ class Scheduler(SchedulerInterface):
             # Note: IFR mode uses independent online update mechanism
             # (see _update_ifr_threshold called from hot path)
 
+        # THETA+ mode selection (only in auto mode)
+        if self.scheduler_mode == "auto":
+            self._evaluate_mode_switch()
+
         # Reset batch accumulators
         self.pd_batch_completed_count = 0
         self.pd_batch_total_output_tokens = 0
@@ -995,6 +1053,181 @@ class Scheduler(SchedulerInterface):
         self._param_update_count += 1
         self._param_update_total_us += _cold_path_elapsed
         self._last_param_update_us = _cold_path_elapsed
+
+    # ================================================================
+    # THETA+ Adaptive Mode Selection (Algorithm 2 extension)
+    # ================================================================
+
+    def _evaluate_mode_switch(self) -> None:
+        """Evaluate the Proposition 2 crossover condition and switch mode.
+
+        Called every pd_param_update_interval completions from the cold path.
+        Decision:
+          LHS = β_CP_e(r̂) - β_EB_w
+          RHS = (1/(μ_L+μ_o)) * [
+                  (α_p - α_d·ln(1-θ₀)·μ_o)/(θ₀·N_obs)
+                  - α_CP·(1+μ_o)/N_obs
+                ]
+          Switch to EB if LHS > RHS + δ  (contention dominates)
+          Switch to CP if LHS < RHS - δ  (amortization dominates)
+        """
+        import math
+
+        # Wait for enough samples before making decisions
+        if not self.pd_param_initialized:
+            return
+
+        # --- Compute workload statistics ---
+        mu_o = self.pd_avg_output_tokens
+        mu_L = self._avg_prompt_len
+        if mu_L + mu_o <= 0:
+            return
+
+        # Steady-state decode ratio: r = μ_o / (μ_L + μ_o)
+        r = mu_o / (mu_L + mu_o)
+        # Batch occupancy
+        N_obs = max(1.0, self._n_obs)
+
+        # --- LHS: β_CP_e(r̂) - β_EB_w ---
+        # β_EB_w: workload-weighted exclusive marginal cost
+        beta_EB_w = ((self.pd_beta_p * mu_L + self.pd_beta_d * mu_o)
+                     / (mu_L + mu_o))
+
+        # β_CP_e(r): CP effective marginal cost from offline profile
+        if self._cp_cost_profiled:
+            beta_CP_e = (self._cp_cost_a
+                         + self._cp_cost_b * r
+                         + self._cp_cost_c * r * r)
+        else:
+            # Fallback: no profiled CP cost → LHS = 0
+            # Decision driven entirely by overhead comparison (RHS)
+            beta_CP_e = beta_EB_w
+
+        LHS = beta_CP_e - beta_EB_w
+
+        # --- RHS: amortized fixed-cost comparison ---
+        # θ₀: current ratio (from IFR or ratio estimator)
+        theta0 = self.pd_k_ratio if hasattr(self, 'pd_k_ratio') else 0.5
+        if theta0 <= 0 or theta0 >= 1:
+            return  # invalid, skip
+
+        log_1_minus_theta = math.log(1 - theta0)  # negative
+        eb_overhead = ((self.pd_alpha_p
+                        - self.pd_alpha_d * log_1_minus_theta * mu_o)
+                       / (theta0 * N_obs))
+        cp_overhead = self._alpha_cp * (1 + mu_o) / N_obs
+
+        RHS = (1.0 / (mu_L + mu_o)) * (eb_overhead - cp_overhead)
+
+        # --- Decision with hysteresis ---
+        delta = self._mode_switch_delta
+
+        if self._mode_cooldown > 0:
+            self._mode_cooldown -= 1
+            return
+
+        old_mode = self._active_scheduler
+        if LHS > RHS + delta:
+            # Contention dominates → EB is better
+            if self._active_scheduler != "eb":
+                self._transition_to_eb()
+                self._mode_cooldown = self._mode_cooldown_max
+        elif LHS < RHS - delta:
+            # Amortization dominates → CP is better
+            if self._active_scheduler != "cp":
+                self._transition_to_cp()
+                self._mode_cooldown = self._mode_cooldown_max
+
+        # Log mode switch
+        if self._active_scheduler != old_mode:
+            self._mode_switch_count += 1
+            switch_record = {
+                "timestamp": time.monotonic() - self._pd_start_time,
+                "old_mode": old_mode,
+                "new_mode": self._active_scheduler,
+                "LHS": LHS,
+                "RHS": RHS,
+                "delta": delta,
+                "r": r,
+                "mu_L": mu_L,
+                "mu_o": mu_o,
+                "N_obs": N_obs,
+                "theta0": theta0,
+                "beta_CP_e": beta_CP_e,
+                "beta_EB_w": beta_EB_w,
+                "total_completed": self.pd_total_completed,
+            }
+            self._mode_switch_history.append(switch_record)
+            logger.info(
+                f"[THETA+] Mode switch: {old_mode} -> "
+                f"{self._active_scheduler} | "
+                f"LHS={LHS:.6f}, RHS={RHS:.6f}, r={r:.3f}, "
+                f"N_obs={N_obs:.1f}, θ₀={theta0:.4f}, "
+                f"β_CP_e={beta_CP_e:.6f}, β_EB_w={beta_EB_w:.6f}"
+            )
+
+    def _transition_to_eb(self) -> None:
+        """Transition from CP mode to EB mode.
+
+        Build pd_decoding_requests from current running set and set
+        appropriate PD phase state.
+        """
+        self._active_scheduler = "eb"
+
+        # Populate pd_decoding_requests from running requests in decode phase
+        self.pd_decoding_requests.clear()
+        for req in self.running:
+            if req.num_computed_tokens >= req.num_prompt_tokens:
+                self.pd_decoding_requests.add(req.request_id)
+
+        num_decoding = len(self.pd_decoding_requests)
+        has_waiting = len(self.waiting) > 0
+
+        if num_decoding > 0:
+            # We have decoding requests → enter Phase 1 (Decode)
+            self.pd_phase = 1
+            self.pd_completed_decode_count = 0
+            self.pd_prefilled_count = num_decoding
+            self.pd_refill_target = 0
+            # Update N to current batch occupancy
+            self.pd_batch_size_N = max(num_decoding, len(self.running))
+            self._update_k_star()
+        elif has_waiting:
+            # No decoding but have waiting → start fresh at Phase 0
+            self._reset_pd_to_initial()
+        else:
+            # Nothing to do
+            self.pd_phase = 0
+            self.pd_prefilled_count = 0
+            self.pd_completed_decode_count = 0
+            self.pd_refill_target = 0
+
+        logger.info(
+            f"[THETA+] CP -> EB: phase={self.pd_phase}, "
+            f"decoding={num_decoding}, running={len(self.running)}, "
+            f"N={self.pd_batch_size_N}, k*={self.pd_switch_threshold_k}"
+        )
+
+    def _transition_to_cp(self) -> None:
+        """Transition from EB mode to CP mode.
+
+        The running list is shared so CP can immediately schedule all
+        requests. Clear PD-specific tracking state.
+        """
+        self._active_scheduler = "cp"
+
+        # Clear PD tracking state — CP doesn't use it.
+        # Will be rebuilt if we switch back to EB.
+        self.pd_decoding_requests.clear()
+        self.pd_phase = 0
+        self.pd_prefilled_count = 0
+        self.pd_completed_decode_count = 0
+        self.pd_refill_target = 0
+
+        logger.info(
+            f"[THETA+] EB -> CP: running={len(self.running)}, "
+            f"waiting={len(self.waiting)}"
+        )
 
     def _preempt_chunk_prefilling(self) -> tuple[int, int]:
         """Preempt all chunk_prefilling requests to free KV cache.
@@ -1545,11 +1778,39 @@ class Scheduler(SchedulerInterface):
         return scheduler_output
 
     def schedule(self) -> SchedulerOutput:
-        """Entry point for scheduling. Dispatches to P/D or default scheduler."""
+        """Entry point for scheduling. Dispatches to P/D, default, or auto."""
         if self._schedule_stats_enabled:
             t_start = time.perf_counter()
 
-        if self.use_pd_scheduler:
+        # Track demand EMA for auto mode (running + waiting = true load)
+        # Using only len(running) is wrong under EB: phase separation
+        # drains running while filling waiting, but total demand is constant.
+        if self.scheduler_mode == "auto":
+            demand = float(len(self.running) + len(self.waiting))
+            # Asymmetric EMA: fast ramp-up (0.3), slow ramp-down (0.03)
+            # so we react quickly to traffic surges but don't prematurely
+            # switch back when demand dips briefly
+            if demand > self._n_obs:
+                a = 0.3   # fast follow upward
+            else:
+                a = 0.03  # slow follow downward
+            self._n_obs = a * demand + (1 - a) * self._n_obs
+
+            # Demand surge detection: if instantaneous demand is 2x the
+            # current EMA AND we haven't evaluated recently, trigger
+            # immediate mode evaluation without waiting for cold path.
+            if (demand > self._n_obs * 2
+                    and self._mode_cooldown == 0
+                    and self.pd_param_initialized):
+                self._evaluate_mode_switch()
+
+        # Dispatch based on scheduler mode
+        if self.scheduler_mode == "auto":
+            if self._active_scheduler == "eb":
+                output = self.schedule_pd()
+            else:
+                output = self._schedule_default()
+        elif self.use_pd_scheduler:
             output = self.schedule_pd()
         else:
             output = self._schedule_default()
@@ -2489,12 +2750,31 @@ class Scheduler(SchedulerInterface):
                 # P/D scheduling: count completed decode requests
                 if self.use_pd_scheduler:
                     if request.request_id in self.pd_decoding_requests:
+                        # EB path: request was tracked in pd_decoding_requests
                         self.pd_completed_decode_count += 1
                         self.pd_decoding_requests.discard(request.request_id)
-                        # Update p/avg_output estimation
                         output_tokens = request.num_tokens - request.num_prompt_tokens
                         if output_tokens > 0:
                             self._update_params_online(output_tokens)
+                        # Track prompt length in auto mode for mode selection
+                        if self.scheduler_mode == "auto":
+                            pl = float(request.num_prompt_tokens)
+                            a = self._avg_prompt_ema_alpha
+                            self._avg_prompt_len = (
+                                a * pl + (1 - a) * self._avg_prompt_len)
+                    elif (self.scheduler_mode == "auto"
+                          and self._active_scheduler == "cp"):
+                        # Auto+CP path: still feed output samples for
+                        # parameter tracking and mode selection
+                        output_tokens = request.num_tokens - request.num_prompt_tokens
+                        if output_tokens > 0:
+                            self._update_params_online(output_tokens)
+                        # Track prompt length EMA for mode selection
+                        prompt_len = float(request.num_prompt_tokens)
+                        a = self._avg_prompt_ema_alpha
+                        self._avg_prompt_len = (
+                            a * prompt_len
+                            + (1 - a) * self._avg_prompt_len)
 
                 kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
@@ -3241,7 +3521,11 @@ class Scheduler(SchedulerInterface):
             "timestamp": timestamp,
             "elapsed_us": elapsed_time * 1e6,
             "execution_time_us": 0,  # Will be updated by next schedule() call
-            "scheduler_type": "pd" if self.use_pd_scheduler else "default",
+            "scheduler_type": (
+                self._active_scheduler
+                if self.scheduler_mode == "auto"
+                else ("pd" if self.use_pd_scheduler else "default")),
+            "scheduler_mode": self.scheduler_mode,
             "phase": self.pd_phase if self.use_pd_scheduler else -1,
             "total_tokens": output.total_num_scheduled_tokens,
             "prefill_tokens": prefill_tokens,
@@ -3260,9 +3544,23 @@ class Scheduler(SchedulerInterface):
             # Adaptive scheduling values
             "avg_output_tokens": self.pd_avg_output_tokens if self.use_pd_scheduler else 0,
             "adaptive_kv_threshold": self._compute_adaptive_kv_threshold() if self.use_pd_scheduler else 0,
+            # Hazard rate estimation (IFR mode)
+            "hazard_p0": self.pd_hazard_p0 if (self.use_pd_scheduler and self.pd_k_mode == "ifr") else 0,
+            "hazard_eta": self.pd_hazard_eta if (self.use_pd_scheduler and self.pd_k_mode == "ifr") else 0,
+            "ifr_sample_count": len(self.pd_ifr_samples) if (self.use_pd_scheduler and self.pd_k_mode == "ifr") else 0,
             # Parameter update overhead (cold path)
             "param_update_count": self._param_update_count,
             "last_param_update_us": self._last_param_update_us,
+            # THETA+ auto mode stats
+            "active_scheduler": (
+                self._active_scheduler
+                if self.scheduler_mode == "auto" else ""),
+            "n_obs": (
+                self._n_obs
+                if self.scheduler_mode == "auto" else 0),
+            "mode_switch_count": (
+                self._mode_switch_count
+                if self.scheduler_mode == "auto" else 0),
         })
 
     def save_schedule_stats(self, filepath: str = "schedule_stats.json") -> None:
@@ -3273,6 +3571,9 @@ class Scheduler(SchedulerInterface):
                 "stats": self._schedule_stats,
                 "summary": self.get_schedule_stats_summary(),
                 "n_update_history": self.pd_n_update_history if self.use_pd_scheduler else [],
+                "mode_switch_history": (
+                    self._mode_switch_history
+                    if self.scheduler_mode == "auto" else []),
             }, f, indent=2)
         logger.info(f"[Schedule Stats] Saved {len(self._schedule_stats)} records to {filepath}")
 

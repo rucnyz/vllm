@@ -128,7 +128,7 @@ cat > "${OUTPUT_DIR}/experiment_config.json" << EOF
     "ifr_window_size": ${IFR_WINDOW_SIZE},
     "k_ratio": ${K_RATIO},
     "output_variance": ${OUTPUT_VARIANCE},
-    "schedulers": ["baseline", "pd_ifr", "pd_ratio"],
+    "schedulers": ["baseline", "pd_ifr", "pd_ratio", "pd_auto"],
     "calibration_file": "${VLLM_PD_CALIBRATION_FILE}",
     "timestamp": "$(date -Iseconds)"
 }
@@ -153,22 +153,27 @@ run_single_experiment() {
     export CUDA_VISIBLE_DEVICES=$GPU_ID
     export VLLM_COLLECT_SCHEDULE_STATS=1
 
+    # Clean all PD env vars first, then set only what's needed
+    unset VLLM_USE_PD_SCHEDULER VLLM_PD_K_MODE VLLM_PD_K_RATIO \
+          VLLM_PD_K_STAR VLLM_PD_IFR_WINDOW_SIZE VLLM_PD_SCHEDULER_MODE
+
     case "$scheduler" in
         baseline)
-            unset VLLM_USE_PD_SCHEDULER VLLM_PD_K_MODE VLLM_PD_K_RATIO \
-                  VLLM_PD_K_STAR VLLM_PD_IFR_WINDOW_SIZE
             ;;
         pd_ifr)
             export VLLM_USE_PD_SCHEDULER=1
             export VLLM_PD_K_MODE=ifr
             export VLLM_PD_IFR_WINDOW_SIZE=$IFR_WINDOW_SIZE
-            unset VLLM_PD_K_RATIO VLLM_PD_K_STAR
             ;;
         pd_ratio)
             export VLLM_USE_PD_SCHEDULER=1
             export VLLM_PD_K_MODE=ratio
             export VLLM_PD_K_RATIO=$K_RATIO
-            unset VLLM_PD_K_STAR VLLM_PD_IFR_WINDOW_SIZE
+            ;;
+        pd_auto)
+            export VLLM_PD_SCHEDULER_MODE=auto
+            export VLLM_PD_K_MODE=ifr
+            export VLLM_PD_IFR_WINDOW_SIZE=$IFR_WINDOW_SIZE
             ;;
     esac
 
@@ -230,10 +235,14 @@ run_single_experiment() {
     return $bench_status
 }
 
-# 顺序运行三个 scheduler
-run_single_experiment "baseline" || echo "警告: baseline 实验失败 (exit=$?)"
-run_single_experiment "pd_ifr" || echo "警告: pd_ifr 实验失败 (exit=$?)"
-run_single_experiment "pd_ratio" || echo "警告: pd_ratio 实验失败 (exit=$?)"
+# 运行指定的 scheduler (可通过 SCHEDULERS 环境变量控制)
+# 例: SCHEDULERS="baseline,pd_auto" bash run_distribution_shift.sh 0
+DEFAULT_SCHEDULERS="baseline,pd_ifr,pd_ratio,pd_auto"
+IFS=',' read -ra SCHEDULER_LIST <<< "${SCHEDULERS:-$DEFAULT_SCHEDULERS}"
+for sched in "${SCHEDULER_LIST[@]}"; do
+    sched=$(echo "$sched" | tr -d ' ')
+    run_single_experiment "$sched" || echo "警告: ${sched} 实验失败 (exit=$?)"
+done
 
 echo ""
 echo "========================================"
