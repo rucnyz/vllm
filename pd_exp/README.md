@@ -93,6 +93,36 @@ CONCURRENCY_PHASES="32:1000,2048:3000,256:2000" \
 - PD 的 TPOT 在所有 phase 均优于 baseline，prefill/decode 分离有效减少了 decode 被 prefill 打断的干扰
 - 代价是 TTFT 更高，prefill 需要等待 decode slot
 
+### 2-GPU 公平对比 (baseline vs pd_ifr vs pd_ratio vs disagg)
+
+在相同 GPU 数量 (2) 下对比：baseline/pd_ifr/pd_ratio 用 TP=2 单实例，disagg 用 vLLM 官方 P/D 分离（1 prefill GPU + 1 decode GPU）。
+
+```bash
+bash pd_exp/serve/run_2gpu_comparison.sh [GPU1] [GPU2]
+
+# 自定义
+MAX_CONCURRENCY=64 NUM_PROMPTS=1000 \
+    bash pd_exp/serve/run_2gpu_comparison.sh 0 1
+
+# 跳过 disagg (高并发下可能 hang)
+SKIP_DISAGG=1 MAX_CONCURRENCY=512 \
+    bash pd_exp/serve/run_2gpu_comparison.sh 0 1
+```
+
+参考结果 (H200 x2, Qwen3-8B, concurrency=64, input~512, output~256):
+
+| Scheduler | 方案 | Throughput (tok/s) | TTFT (ms) | TPOT (ms) |
+|-----------|------|--------------------|-----------|-----------|
+| baseline | TP=2 | **8538** | **56** | 7.12 |
+| disagg | P/D 分离 | 7147 | 138 | 8.19 |
+| pd_ratio | TP=2 | 6723 | 831 | **5.94** |
+| pd_ifr | TP=2 | 6569 | 799 | 6.20 |
+
+要点:
+- baseline 在低并发下吞吐最高，chunked prefill 开销足够小
+- disagg TTFT 优于 PD scheduler (138 vs ~800ms)，因为有专用 prefill GPU，但高并发 (512+) 下 KV transfer 会 hang
+- PD scheduler 的 TPOT 最优 (5.94ms)，decode 质量最好
+
 ## syn/ - 参数搜索实验
 
 ### kstar_sweep - 参数扫描
