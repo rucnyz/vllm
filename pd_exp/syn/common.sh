@@ -99,7 +99,7 @@ kill_server() {
         for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i $gpu_id 2>/dev/null | tr -d ' '); do
             [ -n "$pid" ] && kill -9 $pid 2>/dev/null || true
         done
-        wait_for_gpu_memory "$gpu_id" 30
+        wait_for_gpu_memory "$gpu_id" 30 || true
     else
         sleep 2
     fi

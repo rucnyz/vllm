@@ -205,6 +205,7 @@ run_single_experiment() {
     # 运行 benchmark
     # --custom-output-len -1: 使用 JSONL 中每个请求的 output_len
     # --ignore-eos: 强制生成指定长度（否则模型遇到 EOS 就停止，无法控制输出长度）
+    local bench_status=0
     vllm bench serve \
         --model "$MODEL" \
         --base-url "http://localhost:${port}" \
@@ -220,8 +221,7 @@ run_single_experiment() {
         --save-detailed \
         --result-dir "${OUTPUT_DIR}" \
         --result-filename "bench_${scheduler}.json" \
-        >> "$log_file" 2>&1
-    local bench_status=$?
+        >> "$log_file" 2>&1 || bench_status=$?
 
     kill_server $server_pid $GPU_ID
 
@@ -235,8 +235,8 @@ run_single_experiment() {
 }
 
 # 顺序运行两个 scheduler
-run_single_experiment "pd_ifr"
-run_single_experiment "pd_ratio"
+run_single_experiment "pd_ifr" || echo "警告: pd_ifr 实验失败 (exit=$?)"
+run_single_experiment "pd_ratio" || echo "警告: pd_ratio 实验失败 (exit=$?)"
 
 echo ""
 echo "========================================"
