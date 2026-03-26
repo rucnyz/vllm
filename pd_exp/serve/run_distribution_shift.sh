@@ -1,14 +1,15 @@
 #!/bin/bash
 
-# Distribution Shift 实验脚本
+# Distribution Shift 实验脚本 (3-phase synthetic data)
 # 验证 THETA 的 IFR 在线 controller 在 workload 突变时的行为:
 #   1. θ* 能在 ~W 个样本内收敛到新最优值
 #   2. 系统保持 memory-safe (无 OOM)
 #   3. 吞吐量暂时下降幅度有限
 #
-# 实验设计:
-#   前半段: ShareGPT (中等输出 ~300-500 tokens)
-#   后半段: LongBench (短输出 ~50-100 tokens)
+# 实验设计 (3 phases):
+#   Phase 1: prefill-heavy  (input~1024, output~128)
+#   Phase 2: balanced        (input~512,  output~512)
+#   Phase 3: decode-heavy   (input~128,  output~1024)
 #   对比: pd_ifr (自适应 θ*) vs pd_ratio (固定 θ*=0.8)
 #
 # 用法: ./run_distribution_shift.sh [GPU_ID]
@@ -18,6 +19,8 @@
 #   NUM_PROMPTS_PER_PHASE: 每个阶段的请求数，默认 2000
 #   MAX_CONCURRENCY: 最大并发，默认 2048
 #   IFR_WINDOW_SIZE: IFR 滑动窗口大小，默认 500
+#   PHASES: phase 定义，默认 "1024:128,512:512,128:1024"
+#   OUTPUT_VARIANCE: output_len 方差比例，默认 0.25
 
 set -e
 
@@ -30,29 +33,20 @@ MODEL=${MODEL:-"Qwen/Qwen3-8B"}
 MODEL_SHORT=$(echo "$MODEL" | sed 's|.*/||')
 NUM_PROMPTS_PER_PHASE=${NUM_PROMPTS_PER_PHASE:-2000}
 MAX_CONCURRENCY=${MAX_CONCURRENCY:-2048}
-CUSTOM_OUTPUT_LEN=${CUSTOM_OUTPUT_LEN:-4000}
 K_RATIO=${K_RATIO:-0.8}
 BASE_PORT=${BASE_PORT:-13000}
 IFR_WINDOW_SIZE=${IFR_WINDOW_SIZE:-500}
+PHASES=${PHASES:-"1024:128,512:512,128:1024"}
+OUTPUT_VARIANCE=${OUTPUT_VARIANCE:-0.25}
+SOURCE_DATASET=${SOURCE_DATASET:-"alpaca"}
 
-# 最优配置 (H200, 取 ShareGPT 的最优值作为初始配置)
+# 最优配置 (H200)
 TB=${TB:-18432}
 BS=${BS:-2048}
 
-# 数据集路径
-SHAREGPT_PATH="${SCRIPT_DIR}/../outputs/sharegpt_prompts.jsonl"
-LONGBENCH_PATH="${SCRIPT_DIR}/../outputs/longbench_prefill.jsonl"
-
-if [ ! -f "$SHAREGPT_PATH" ] || [ ! -f "$LONGBENCH_PATH" ]; then
-    echo "错误: 需要以下数据集文件:"
-    echo "  $SHAREGPT_PATH"
-    echo "  $LONGBENCH_PATH"
-    echo ""
-    echo "请先导出数据集:"
-    echo "  python experiments/serve/export_dataset.py --dataset sharegpt --model $MODEL --num-samples $NUM_PROMPTS_PER_PHASE --output $SHAREGPT_PATH"
-    echo "  python experiments/serve/export_dataset.py --dataset longbench --model $MODEL --num-samples $NUM_PROMPTS_PER_PHASE --output $LONGBENCH_PATH"
-    exit 1
-fi
+# 计算 phase 数量和总请求数
+NUM_PHASES=$(echo "$PHASES" | tr ',' '\n' | wc -l)
+TOTAL_PROMPTS=$((NUM_PROMPTS_PER_PHASE * NUM_PHASES))
 
 # 硬件校准文件
 if [ -z "${VLLM_PD_CALIBRATION_FILE:-}" ]; then
@@ -73,7 +67,7 @@ mkdir -p "$OUTPUT_DIR/logs"
 init_experiment_env
 
 echo "========================================"
-echo "Distribution Shift 实验"
+echo "Distribution Shift 实验 (${NUM_PHASES}-phase)"
 echo "========================================"
 echo ""
 echo "实验配置:"
@@ -81,44 +75,49 @@ echo "  MODEL: $MODEL"
 echo "  GPU: $GPU_ID"
 echo "  TB: $TB, BS: $BS"
 echo "  NUM_PROMPTS_PER_PHASE: $NUM_PROMPTS_PER_PHASE"
+echo "  TOTAL_PROMPTS: $TOTAL_PROMPTS"
 echo "  MAX_CONCURRENCY: $MAX_CONCURRENCY"
 echo "  IFR_WINDOW_SIZE: $IFR_WINDOW_SIZE"
-echo "  Phase 1: ShareGPT ($SHAREGPT_PATH)"
-echo "  Phase 2: LongBench ($LONGBENCH_PATH)"
+echo "  PHASES: $PHASES"
+echo "  OUTPUT_VARIANCE: $OUTPUT_VARIANCE"
 echo ""
 
 # ========================================
-# Step 1: 创建拼接数据集
+# Step 1: 生成合成数据集
 # ========================================
-COMBINED_DATASET="${OUTPUT_DIR}/combined_sharegpt_longbench.jsonl"
-echo "创建拼接数据集..."
+SYNTHETIC_DATASET="${OUTPUT_DIR}/synthetic_${NUM_PHASES}phase.jsonl"
+echo "生成合成数据集..."
 
-python3 -c "
+python3 "${SCRIPT_DIR}/generate_distribution_shift_dataset.py" \
+    --model "$MODEL" \
+    --num-prompts-per-phase "$NUM_PROMPTS_PER_PHASE" \
+    --phases "$PHASES" \
+    --variance "$OUTPUT_VARIANCE" \
+    --source-dataset "$SOURCE_DATASET" \
+    --output "$SYNTHETIC_DATASET" \
+    --seed 42
+
+echo ""
+echo "数据集已生成: $SYNTHETIC_DATASET"
+
+# 构建 phases JSON array
+PHASES_JSON=$(python3 -c "
 import json
-
-# 取前 N 条 ShareGPT
-count = 0
-with open('$SHAREGPT_PATH') as f, open('$COMBINED_DATASET', 'w') as out:
-    for line in f:
-        out.write(line)
-        count += 1
-        if count >= $NUM_PROMPTS_PER_PHASE:
-            break
-    print(f'  ShareGPT: {count} prompts')
-
-    # 追加前 N 条 LongBench
-    count2 = 0
-    with open('$LONGBENCH_PATH') as f2:
-        for line in f2:
-            out.write(line)
-            count2 += 1
-            if count2 >= $NUM_PROMPTS_PER_PHASE:
-                break
-    print(f'  LongBench: {count2} prompts')
-    print(f'  Total: {count + count2} prompts')
-"
-
-TOTAL_PROMPTS=$((NUM_PROMPTS_PER_PHASE * 2))
+phases = '$PHASES'.split(',')
+result = []
+for p in phases:
+    inp, out = p.strip().split(':')
+    inp, out = int(inp), int(out)
+    ratio = out / max(inp, 1)
+    if ratio > 1.5:
+        name = 'decode-heavy'
+    elif ratio < 0.5:
+        name = 'prefill-heavy'
+    else:
+        name = 'balanced'
+    result.append({'name': name, 'input_mean': inp, 'output_mean': out})
+print(json.dumps(result))
+")
 
 # 保存实验配置
 cat > "${OUTPUT_DIR}/experiment_config.json" << EOF
@@ -131,11 +130,12 @@ cat > "${OUTPUT_DIR}/experiment_config.json" << EOF
     "bs": ${BS},
     "num_prompts_per_phase": ${NUM_PROMPTS_PER_PHASE},
     "total_prompts": ${TOTAL_PROMPTS},
+    "num_phases": ${NUM_PHASES},
+    "phases": ${PHASES_JSON},
     "max_concurrency": ${MAX_CONCURRENCY},
     "ifr_window_size": ${IFR_WINDOW_SIZE},
     "k_ratio": ${K_RATIO},
-    "phase1_dataset": "ShareGPT",
-    "phase2_dataset": "LongBench",
+    "output_variance": ${OUTPUT_VARIANCE},
     "schedulers": ["pd_ifr", "pd_ratio"],
     "calibration_file": "${VLLM_PD_CALIBRATION_FILE}",
     "timestamp": "$(date -Iseconds)"
@@ -203,12 +203,15 @@ run_single_experiment() {
     echo "开始 benchmark..."
 
     # 运行 benchmark
+    # --custom-output-len -1: 使用 JSONL 中每个请求的 output_len
+    # --ignore-eos: 强制生成指定长度（否则模型遇到 EOS 就停止，无法控制输出长度）
     vllm bench serve \
         --model "$MODEL" \
         --base-url "http://localhost:${port}" \
         --dataset-name custom \
-        --dataset-path "$COMBINED_DATASET" \
-        --custom-output-len "$CUSTOM_OUTPUT_LEN" \
+        --dataset-path "$SYNTHETIC_DATASET" \
+        --custom-output-len -1 \
+        --ignore-eos \
         --num-prompts "$TOTAL_PROMPTS" \
         --num-warmups 0 \
         --request-rate inf \

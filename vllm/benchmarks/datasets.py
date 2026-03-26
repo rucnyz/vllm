@@ -1376,7 +1376,8 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         "--custom-output-len",
         type=int,
         default=256,
-        help="Number of output tokens per request, used only for custom dataset.",
+        help="Number of output tokens per request, used only for custom dataset. "
+        "Set to -1 to use per-request output_len from JSONL data.",
     )
 
     spec_bench_group = parser.add_argument_group("spec bench dataset options")
@@ -2012,11 +2013,15 @@ class CustomDataset(BenchmarkDataset):
                 )
 
             prompt_len = len(tokenizer(prompt).input_ids)
+            if output_len is not None and output_len >= 0:
+                req_output_len = output_len
+            else:
+                req_output_len = int(item.get("output_len", 256))
             sampled_requests.append(
                 SampleRequest(
                     prompt=prompt,
                     prompt_len=prompt_len,
-                    expected_output_len=output_len,
+                    expected_output_len=req_output_len,
                     request_id=request_id_prefix + str(i),
                 )
             )

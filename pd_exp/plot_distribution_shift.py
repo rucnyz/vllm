@@ -7,6 +7,8 @@ Reads schedule stats from pd_ifr and pd_ratio runs, and generates:
   - Panel 2: Sliding-window throughput (tokens/s) over time
   - Panel 3: Preemption count (memory safety indicator)
 
+Supports both 2-phase (legacy) and multi-phase experiments.
+
 Usage:
     python pd_exp/plot_distribution_shift.py \
         pd_exp/outputs/distribution_shift_Qwen3-8B_20260325_120000
@@ -33,6 +35,14 @@ SCHEDULER_DISPLAY = {
 SCHEDULER_COLORS = {
     "pd_ifr": "#2A6F97",
     "pd_ratio": "#B23A3A",
+}
+
+PHASE_COLORS = ["#E8F4FD", "#FFF3E0", "#FFEBEE", "#E8F5E9", "#F3E5F5"]
+
+PHASE_DISPLAY = {
+    "prefill-heavy": "Prefill-heavy",
+    "balanced": "Balanced",
+    "decode-heavy": "Decode-heavy",
 }
 
 
@@ -104,21 +114,64 @@ def compute_sliding_throughput(
     return t_out, thr_out
 
 
-def estimate_shift_iteration(
+def estimate_shift_iterations(
     stats: List[Dict[str, Any]],
     num_prompts_per_phase: int,
-) -> Optional[int]:
-    """Estimate the iteration index where the distribution shift occurs.
+    num_phases: int = 2,
+) -> List[int]:
+    """Estimate iteration indices where distribution shifts occur.
 
-    Heuristic: track cumulative new requests scheduled.  The shift happens
-    around the iteration where cumulative new_reqs ≈ num_prompts_per_phase.
+    Returns a list of shift iterations (one per phase boundary).
+    For num_phases=3, returns 2 shift points.
     """
+    shift_iters = []
     cum_new = 0
+    next_boundary = 1
+
     for i, s in enumerate(stats):
         cum_new += s.get("num_new_reqs", 0)
-        if cum_new >= num_prompts_per_phase:
-            return i
-    return None
+        if cum_new >= next_boundary * num_prompts_per_phase and next_boundary < num_phases:
+            shift_iters.append(i)
+            next_boundary += 1
+
+    return shift_iters
+
+
+def _add_phase_shading(
+    ax,
+    shift_iters: List[int],
+    total_iters: int,
+    phases: List[Dict[str, Any]],
+    use_x_values: bool = True,
+    x_values: Optional[List[float]] = None,
+) -> None:
+    """Add subtle background shading and labels for each phase."""
+    boundaries = [0] + shift_iters + [total_iters]
+    if x_values is not None:
+        # Map iteration boundaries to x-axis values (e.g., timestamps)
+        boundaries_x = []
+        for b in boundaries:
+            idx = min(b, len(x_values) - 1)
+            boundaries_x.append(x_values[idx] if idx >= 0 else x_values[0])
+    else:
+        boundaries_x = boundaries
+
+    for j in range(len(boundaries_x) - 1):
+        color = PHASE_COLORS[j % len(PHASE_COLORS)]
+        ax.axvspan(boundaries_x[j], boundaries_x[j + 1],
+                   alpha=0.15, color=color, zorder=0)
+
+        # Add phase label at top
+        mid_x = (boundaries_x[j] + boundaries_x[j + 1]) / 2
+        if j < len(phases):
+            phase_info = phases[j]
+            name = PHASE_DISPLAY.get(phase_info.get("name", ""), phase_info.get("name", f"Phase {j+1}"))
+            label = f"{name}\n(in={phase_info.get('input_mean', '?')}, out={phase_info.get('output_mean', '?')})"
+        else:
+            label = f"Phase {j + 1}"
+        ax.text(mid_x, 0.97, label, transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=9, alpha=0.7,
+                style="italic")
 
 
 def plot_distribution_shift(
@@ -134,6 +187,8 @@ def plot_distribution_shift(
 
     num_prompts_per_phase = config.get("num_prompts_per_phase", 2000)
     window_size = config.get("ifr_window_size", 500)
+    num_phases = config.get("num_phases", 2)
+    phases = config.get("phases", [])
 
     schedulers = ["pd_ifr", "pd_ratio"]
     all_stats = {}
@@ -151,8 +206,21 @@ def plot_distribution_shift(
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=False)
 
+    # Find shift points from first available scheduler's stats
+    shift_iters = []
+    ref_stats = list(all_stats.values())[0]
+    shift_iters = estimate_shift_iterations(
+        ref_stats, num_prompts_per_phase, num_phases
+    )
+    total_iters = len(ref_stats)
+
     # ── Panel 1: θ* (k_ratio) over iteration ──
     ax1 = axes[0]
+
+    # Phase shading
+    if phases:
+        _add_phase_shading(ax1, shift_iters, total_iters, phases)
+
     for sched, stats in all_stats.items():
         k_ratios = [s.get("k_ratio", None) for s in stats]
         iters = list(range(len(k_ratios)))
@@ -169,17 +237,17 @@ def plot_distribution_shift(
                 label=label,
             )
 
-    # Mark shift point
-    shift_iter = None
-    for sched, stats in all_stats.items():
-        shift_iter = estimate_shift_iteration(stats, num_prompts_per_phase)
-        if shift_iter is not None:
-            break
-
-    if shift_iter is not None:
+    # Mark shift points
+    for si in shift_iters:
         ax1.axvline(
-            shift_iter, color="black", linestyle="--",
-            linewidth=1.5, alpha=0.7, label="Distribution shift",
+            si, color="black", linestyle="--",
+            linewidth=1.5, alpha=0.7,
+        )
+    # Add single legend entry for shift lines
+    if shift_iters:
+        ax1.axvline(
+            shift_iters[0], color="black", linestyle="--",
+            linewidth=0, alpha=0, label="Distribution shift",
         )
 
     ax1.set_ylabel(r"$\theta^{*}$ (k_ratio)")
@@ -193,6 +261,15 @@ def plot_distribution_shift(
 
     # ── Panel 2: Sliding-window throughput ──
     ax2 = axes[1]
+
+    # Phase shading (using timestamps)
+    if phases and ref_stats:
+        timestamps = [s.get("timestamp", 0) for s in ref_stats]
+        _add_phase_shading(
+            ax2, shift_iters, total_iters, phases,
+            x_values=timestamps,
+        )
+
     for sched, stats in all_stats.items():
         t_vals, thr_vals = compute_sliding_throughput(stats, window_sec)
         if t_vals:
@@ -204,14 +281,14 @@ def plot_distribution_shift(
                 label=label,
             )
 
-    # Mark shift time
-    if shift_iter is not None and shift_iter < len(list(all_stats.values())[0]):
-        first_stats = list(all_stats.values())[0]
-        shift_time = first_stats[shift_iter].get("timestamp", 0)
-        ax2.axvline(
-            shift_time, color="black", linestyle="--",
-            linewidth=1.5, alpha=0.7,
-        )
+    # Mark shift times
+    for si in shift_iters:
+        if si < len(ref_stats):
+            shift_time = ref_stats[si].get("timestamp", 0)
+            ax2.axvline(
+                shift_time, color="black", linestyle="--",
+                linewidth=1.5, alpha=0.7,
+            )
 
     ax2.set_ylabel("Throughput (tokens/s)")
     ax2.set_title("Sliding-Window Throughput", fontweight="bold")
@@ -220,6 +297,11 @@ def plot_distribution_shift(
 
     # ── Panel 3: Cumulative preemptions (memory safety) ──
     ax3 = axes[2]
+
+    # Phase shading
+    if phases:
+        _add_phase_shading(ax3, shift_iters, total_iters, phases)
+
     for sched, stats in all_stats.items():
         preemptions = [s.get("num_preempted_reqs", 0) for s in stats]
         cum_preempt = np.cumsum(preemptions)
@@ -233,9 +315,9 @@ def plot_distribution_shift(
             label=label,
         )
 
-    if shift_iter is not None:
+    for si in shift_iters:
         ax3.axvline(
-            shift_iter, color="black", linestyle="--",
+            si, color="black", linestyle="--",
             linewidth=1.5, alpha=0.7,
         )
 
@@ -261,6 +343,8 @@ def print_summary(exp_dir: Path) -> None:
         config = json.load(f)
 
     num_prompts_per_phase = config.get("num_prompts_per_phase", 2000)
+    num_phases = config.get("num_phases", 2)
+    phases = config.get("phases", [])
 
     for sched in ["pd_ifr", "pd_ratio"]:
         stats_path = exp_dir / f"{sched}_stats.json"
@@ -270,44 +354,69 @@ def print_summary(exp_dir: Path) -> None:
         stats = load_stats(stats_path)
         display = SCHEDULER_DISPLAY.get(sched, sched)
 
-        # Find shift point
-        shift_iter = estimate_shift_iteration(stats, num_prompts_per_phase)
+        # Find shift points
+        shift_iters = estimate_shift_iterations(
+            stats, num_prompts_per_phase, num_phases
+        )
 
-        # Compute k_ratio stats before/after shift
+        # Compute k_ratio stats
         k_ratios = [s.get("k_ratio", None) for s in stats]
-        k_ratios = [k for k in k_ratios if k is not None]
+        k_ratios_clean = [k for k in k_ratios if k is not None]
 
-        if shift_iter and shift_iter < len(k_ratios):
-            before = k_ratios[:shift_iter]
-            after = k_ratios[shift_iter:]
+        # Track cumulative new requests
+        new_reqs = [s.get("num_new_reqs", 0) for s in stats]
+        cum_new = np.cumsum(new_reqs)
 
-            # Find convergence: when k_ratio stabilizes after shift
-            # (within 5% of final value for 50 consecutive iterations)
-            final_value = np.mean(after[-100:]) if len(after) > 100 else np.mean(after)
-            convergence_iter = None
-            for i in range(len(after)):
-                if i + 50 <= len(after):
-                    window = after[i:i + 50]
-                    if all(abs(k - final_value) / max(final_value, 0.01) < 0.05
-                           for k in window):
-                        convergence_iter = i
-                        break
+        print(f"\n{display}:")
+        print(f"  Total iterations: {len(stats)}")
+        print(f"  Total new reqs: {int(cum_new[-1]) if len(cum_new) > 0 else 0}")
 
-            print(f"\n{display}:")
-            print(f"  Shift at iteration: {shift_iter}")
-            print(f"  θ* before shift: {np.mean(before):.4f} "
-                  f"(std={np.std(before):.4f})")
-            print(f"  θ* after shift (final): {final_value:.4f}")
-            if convergence_iter is not None:
-                print(f"  Convergence iterations after shift: {convergence_iter}")
-            else:
-                print(f"  Convergence: not reached within {len(after)} iterations")
+        # Per-phase statistics
+        boundaries = [0] + shift_iters + [len(stats)]
+        for p_idx in range(len(boundaries) - 1):
+            start, end = boundaries[p_idx], boundaries[p_idx + 1]
+            phase_k = [k for k in k_ratios[start:end] if k is not None]
+            phase_preempt = sum(
+                s.get("num_preempted_reqs", 0) for s in stats[start:end]
+            )
+            phase_new_reqs = sum(new_reqs[start:end])
 
-            # Preemption stats
-            preemptions = sum(s.get("num_preempted_reqs", 0) for s in stats)
-            print(f"  Total preemptions: {preemptions}")
-        else:
-            print(f"\n{display}: shift point not detected")
+            phase_label = ""
+            if p_idx < len(phases):
+                p = phases[p_idx]
+                phase_label = f" ({p.get('name', '')} in={p.get('input_mean','?')},out={p.get('output_mean','?')})"
+
+            print(f"\n  Phase {p_idx + 1}{phase_label}:")
+            print(f"    Iterations: {end - start}")
+            print(f"    New reqs: {phase_new_reqs}")
+            if phase_k:
+                print(f"    k_ratio: mean={np.mean(phase_k):.4f}, "
+                      f"std={np.std(phase_k):.4f}, "
+                      f"range=[{min(phase_k):.4f}, {max(phase_k):.4f}]")
+            print(f"    Preemptions: {phase_preempt}")
+
+            # Convergence analysis within this phase
+            if phase_k and len(phase_k) > 100:
+                final_val = np.mean(phase_k[-100:])
+                conv_iter = None
+                for ci in range(len(phase_k)):
+                    if ci + 50 <= len(phase_k):
+                        window = phase_k[ci:ci + 50]
+                        if all(abs(k - final_val) / max(abs(final_val), 0.01) < 0.05
+                               for k in window):
+                            conv_iter = ci
+                            break
+                if conv_iter is not None:
+                    # Count new reqs in convergence period
+                    conv_new_reqs = sum(new_reqs[start:start + conv_iter])
+                    print(f"    Convergence: {conv_iter} iters "
+                          f"({conv_new_reqs} new reqs) to θ*={final_val:.4f}")
+                else:
+                    print(f"    Convergence: not reached (final θ*≈{final_val:.4f})")
+
+        # Overall preemptions
+        total_preempt = sum(s.get("num_preempted_reqs", 0) for s in stats)
+        print(f"\n  Total preemptions: {total_preempt}")
 
 
 def main() -> None:
