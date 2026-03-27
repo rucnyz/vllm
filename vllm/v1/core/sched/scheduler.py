@@ -1235,8 +1235,13 @@ class Scheduler(SchedulerInterface):
             self.pd_completed_decode_count = 0
             self.pd_prefilled_count = num_decoding
             self.pd_refill_target = 0
-            # Update N to current batch occupancy
-            self.pd_batch_size_N = max(num_decoding, len(self.running))
+            # Update N to reflect actual demand (running + waiting),
+            # capped at max_num_running_reqs.  Without this, a CP→EB
+            # transition under light running but heavy waiting (e.g. a
+            # concurrency spike) would leave N tiny, starving prefill.
+            self.pd_batch_size_N = min(
+                num_decoding + len(self.waiting),
+                self.max_num_running_reqs)
             self._update_k_star()
         elif has_waiting:
             # No decoding but have waiting → start fresh at Phase 0
@@ -1441,6 +1446,26 @@ class Scheduler(SchedulerInterface):
                 self.pd_completed_decode_count = 0
 
         elif self.pd_phase == 1:
+            # RECOVERY: If N is too small relative to demand (e.g. after a
+            # CP→EB transition under light running but heavy waiting, or a
+            # cold-start), scale N up so that the 1→2 transition can refill
+            # enough requests to keep the pipeline busy.
+            target_n = self.max_num_running_reqs
+            if (self.pd_batch_size_N < target_n
+                    and waiting_count >= target_n // 2
+                    and (time.monotonic() - self.pd_last_n_update_time
+                         >= self.pd_n_update_cooldown)):
+                old_n = self.pd_batch_size_N
+                self.pd_batch_size_N = target_n
+                self._update_k_star()
+                self.pd_last_n_update_time = time.monotonic()
+                self._record_n_update(old_n, self.pd_batch_size_N, "recovery")
+                logger.info(
+                    f"[P/D] N RECOVERY: {old_n} -> {self.pd_batch_size_N} "
+                    f"(queue filled, k*={self.pd_switch_threshold_k}, "
+                    f"avg_out={self.pd_avg_output_tokens:.1f})"
+                )
+
             # Decode -> prefill when ratio condition met:
             #   min(q, N-n) / n >= k* / (N-k*)  i.e.  θ*/(1-θ*)
             # Preserves steady-state ratio θ* regardless of batch size,
@@ -1462,25 +1487,6 @@ class Scheduler(SchedulerInterface):
             # instead of len(running)==0 to allow this.
             elif not has_decoding and has_waiting:
                 self._reset_pd_to_initial()
-            else:
-                # RECOVERY: If N was reduced during cold start but queue is now full,
-                # restore N to max value
-                # Added cooldown check to prevent frequent N updates
-                target_n = self.max_num_running_reqs
-                if (self.pd_batch_size_N < target_n
-                      and waiting_count >= self.max_num_running_reqs // 2
-                      and (time.monotonic() - self.pd_last_n_update_time
-                           >= self.pd_n_update_cooldown)):
-                    old_n = self.pd_batch_size_N
-                    self.pd_batch_size_N = target_n
-                    self._update_k_star()
-                    self.pd_last_n_update_time = time.monotonic()
-                    self._record_n_update(old_n, self.pd_batch_size_N, "recovery")
-                    logger.info(
-                        f"[P/D] N RECOVERY: {old_n} -> {self.pd_batch_size_N} "
-                        f"(queue filled, k*={self.pd_switch_threshold_k}, "
-                        f"avg_out={self.pd_avg_output_tokens:.1f})"
-                    )
 
         elif self.pd_phase == 2:
             # Refill prefill -> decode when refill target met OR no more waiting

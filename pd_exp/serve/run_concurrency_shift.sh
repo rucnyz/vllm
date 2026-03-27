@@ -179,8 +179,8 @@ run_single_experiment() {
             ;;
         pd_auto)
             export VLLM_PD_SCHEDULER_MODE=auto
-            export VLLM_PD_K_MODE=ifr
-            export VLLM_PD_IFR_WINDOW_SIZE=$IFR_WINDOW_SIZE
+            export VLLM_PD_K_MODE=ratio
+            export VLLM_PD_K_RATIO=$K_RATIO
             ;;
     esac
 
