@@ -230,3 +230,4 @@ ep_kernels_workspace/
 
 # PD experiment outputs
 pd_exp/outputs/
+pd_exp/paper/
