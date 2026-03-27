@@ -1,0 +1,19 @@
+{
+    "experiment_type": "concurrency_shift",
+    "purpose": "Validate IFR controller adaptation under concurrency level changes",
+    "model": "Qwen/Qwen3-8B",
+    "gpu_id": 4,
+    "tb": 18432,
+    "bs": 2048,
+    "default_num_prompts_per_phase": 2000,
+    "num_phases": 1,
+    "concurrency_phases": [{"concurrency": 32, "num_prompts": 4000}],
+    "input_len": 512,
+    "output_len": 256,
+    "output_variance": 0.25,
+    "ifr_window_size": 500,
+    "k_ratio": 0.8,
+    "schedulers": ["baseline", "pd_ifr", "pd_ratio", "pd_auto"],
+    "calibration_file": "/scr/rucnyz/projects/vllm/pd_exp/outputs/pd_calibration_Qwen3-8B.json",
+    "timestamp": "2026-03-27T02:06:47+00:00"
+}
