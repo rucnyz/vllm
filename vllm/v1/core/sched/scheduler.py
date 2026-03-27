@@ -317,6 +317,13 @@ class Scheduler(SchedulerInterface):
                 # Maximum theta to prevent excessive waiting
                 self.pd_theta_max = float(os.environ.get(
                     "VLLM_PD_THETA_MAX", "0.80"))
+                # EMA smoothing for θ* to damp oscillations from noisy
+                # hazard-rate estimates.  α=0.3 means ~70% weight on
+                # previous θ*, providing stability while still tracking
+                # distribution shifts.
+                self.pd_ifr_theta_ema_alpha = float(os.environ.get(
+                    "VLLM_PD_IFR_THETA_EMA_ALPHA", "0.3"))
+                self.pd_ifr_theta_initialized = False
 
             # Initialize k* based on mode
             if self.pd_k_mode == "direct":
@@ -637,8 +644,12 @@ class Scheduler(SchedulerInterface):
         The empirical hazard rate at iteration t is:
             ĥ(t) = #{O_i = t} / #{O_i >= t}
 
-        We fit h(t) = p_0 + η * t via weighted least squares over t ∈ [1, t_95],
-        with weights w_t = #{O_i >= t} to prioritize reliable early estimates.
+        We fit h(t) = p_0 + η * t via weighted least squares over
+        t ∈ [t_start, t_95], where t_start is the 5th percentile of
+        observed output lengths.  Fitting only over the support of the
+        distribution avoids the zero-hazard prefix that arises with
+        bounded-support distributions (e.g. uniform, gamma with large
+        shape), which would otherwise drag p_0 negative.
 
         Returns:
             tuple[float, float]: (p_0, η) where η >= 0 for IFR distributions
@@ -649,10 +660,15 @@ class Scheduler(SchedulerInterface):
             # Not enough samples, return current estimates
             return self.pd_hazard_p0, self.pd_hazard_eta
 
-        # Compute t_95 (95th percentile) as cutoff
+        # Compute fitting range: [t_start, t_95]
+        # t_start = 5th percentile — skips the zero-hazard region before
+        # the distribution's effective support begins.
+        # t_95 = 95th percentile — avoids noisy tail estimates.
         sorted_samples = sorted(samples)
+        t_start = sorted_samples[max(0, int(len(sorted_samples) * 0.05))]
+        t_start = max(t_start, 1)
         t_95 = sorted_samples[int(len(sorted_samples) * 0.95)]
-        t_95 = max(t_95, 10)  # Ensure at least 10 time points
+        t_95 = max(t_95, t_start + 10)  # Ensure enough range
 
         # Count occurrences and survivors
         from collections import Counter
@@ -674,7 +690,7 @@ class Scheduler(SchedulerInterface):
         sum_wh = 0.0
         sum_wth = 0.0
 
-        for t in range(1, min(t_95 + 1, max_t + 1)):
+        for t in range(t_start, min(t_95 + 1, max_t + 1)):
             n_t = survivors[t]
             if n_t < 5:  # Skip unreliable estimates
                 continue
@@ -706,8 +722,18 @@ class Scheduler(SchedulerInterface):
         eta = (sum_w * sum_wth - sum_wt * sum_wh) / det
 
         # Ensure valid ranges
-        p_0 = max(0.0001, p_0)  # p_0 must be positive
         eta = max(0.0, eta)     # η >= 0 for IFR (clamp negative to CFR)
+
+        # Floor p_0 at the mean-based completion rate 1/μ_o.
+        # For strongly IFR distributions (e.g. Gamma shape≥2), the WLS
+        # intercept p_0 is near zero because h(0)≈0.  Using the raw
+        # estimate would make θ_cfr vanishingly small and cause the IFR
+        # correction Δθ ∝ η/p_0² to explode.  The geometric rate 1/μ_o
+        # is a natural lower bound: it is the completion rate of a
+        # memoryless process with the same mean output length.
+        sample_mean = sum(samples) / len(samples)
+        p_0_floor = (1.0 / sample_mean) if sample_mean > 0 else 0.01
+        p_0 = max(p_0, p_0_floor)
 
         return p_0, eta
 
@@ -761,7 +787,16 @@ class Scheduler(SchedulerInterface):
         delta_theta = (numerator / denominator) * (duration_effect + per_token_effect)
 
         # Ensure non-negative (should always be positive for IFR)
-        return max(0.0, delta_theta)
+        delta_theta = max(0.0, delta_theta)
+
+        # Cap Δθ at 5·θ_cfr.  The first-order expansion is derived for
+        # small η; when η/p_0² is large the uncapped correction can
+        # exceed 1, making θ* meaningless.  The factor 5 allows the IFR
+        # correction to dominate the CFR base (up to θ* ≤ 6·θ_cfr) while
+        # preventing runaway values.
+        delta_theta = min(delta_theta, 5.0 * theta_cfr)
+
+        return delta_theta
 
     def _compute_optimal_ratio_ifr(self) -> float:
         """
@@ -813,6 +848,8 @@ class Scheduler(SchedulerInterface):
 
         Called every M completions when window has >= W_min samples.
         Updates hazard rate parameters and recomputes θ*.
+        EMA smoothing is applied to θ* to damp oscillations caused by
+        noisy hazard-rate estimates.
         """
         old_ratio = self.pd_k_ratio
         old_k = self.pd_switch_threshold_k
@@ -836,9 +873,18 @@ class Scheduler(SchedulerInterface):
             delta_theta = 0.0
             theta_star = theta_0
 
-        # Step 4: Clamp to θ_max and update k*
-        self.pd_k_ratio = min(theta_star, self.pd_theta_max)
-        self.pd_k_ratio = max(0.01, self.pd_k_ratio)
+        # Step 4: Clamp to [0.01, θ_max]
+        theta_star = max(0.01, min(theta_star, self.pd_theta_max))
+
+        # Step 5: EMA smoothing to damp oscillations from noisy estimates.
+        # During cold start (first update), assign directly.
+        if not self.pd_ifr_theta_initialized:
+            self.pd_k_ratio = theta_star
+            self.pd_ifr_theta_initialized = True
+        else:
+            alpha = self.pd_ifr_theta_ema_alpha
+            self.pd_k_ratio = alpha * theta_star + (1 - alpha) * self.pd_k_ratio
+
         self.pd_switch_threshold_k = max(
             1, int(self.pd_k_ratio * self.pd_batch_size_N))
 

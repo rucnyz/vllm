@@ -156,13 +156,14 @@ class HardwareCalibrator:
         num_warmup: int = 5,
         num_iterations: int = 20,
         max_num_batched_tokens: int = 16384,
-        max_num_seqs: int = 256,
+        max_num_seqs: int = 1024,
         gpu_memory_utilization: float = 0.9,
     ):
         self.model = model
         self.dtype = dtype
         self.prefill_sizes = prefill_sizes or [256, 512, 1024, 2048, 4096]
-        self.decode_counts = decode_counts or [16, 32, 64, 128, 256]
+        self.decode_counts = decode_counts or [
+            16, 32, 64, 128, 256, 384, 512, 768, 1024]
         self.decode_context_len = decode_context_len
         self.num_warmup = num_warmup
         self.num_iterations = num_iterations
@@ -477,7 +478,7 @@ def calibrate_hardware_params(
     num_warmup: int = 5,
     num_iterations: int = 20,
     max_num_batched_tokens: int = 16384,
-    max_num_seqs: int = 256,
+    max_num_seqs: int = 1024,
     gpu_memory_utilization: float = 0.9,
     output_file: str | None = None,
 ) -> HardwareParams:
@@ -578,7 +579,7 @@ def main():
     parser.add_argument(
         "--decode-counts",
         type=str,
-        default="16,32,64,128,256",
+        default="16,32,64,128,256,384,512,768,1024",
         help="Comma-separated list of decode batch sizes to test",
     )
     parser.add_argument(
@@ -608,8 +609,8 @@ def main():
     parser.add_argument(
         "--max-num-seqs",
         type=int,
-        default=256,
-        help="Max sequences (default: 256)",
+        default=1024,
+        help="Max sequences (default: 1024)",
     )
     parser.add_argument(
         "--gpu-memory-utilization",
