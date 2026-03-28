@@ -189,7 +189,7 @@ ensure_calibration() {
 
     echo "未找到校准文件，自动运行硬件校准..."
     mkdir -p "$calibration_dir"
-    python -m vllm.v1.core.sched.calibration \
+    python3 -m vllm.v1.core.sched.calibration \
         --model "$model" \
         --output "$calibration_file" || return 1
     export VLLM_PD_CALIBRATION_FILE="$calibration_file"
