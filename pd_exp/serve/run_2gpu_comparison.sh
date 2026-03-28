@@ -110,6 +110,9 @@ run_tp2_bench() {
         pd_ratio)
             env_prefix="$env_prefix VLLM_USE_PD_SCHEDULER=1 VLLM_PD_K_MODE=ratio VLLM_PD_K_RATIO=$K_RATIO VLLM_PD_CALIBRATION_FILE=$VLLM_PD_CALIBRATION_FILE"
             ;;
+        pd_auto)
+            env_prefix="$env_prefix VLLM_PD_SCHEDULER_MODE=auto VLLM_PD_K_MODE=ratio VLLM_PD_K_RATIO=$K_RATIO VLLM_PD_CALIBRATION_FILE=$VLLM_PD_CALIBRATION_FILE"
+            ;;
     esac
 
     env $env_prefix vllm serve "$MODEL" \
@@ -210,6 +213,7 @@ run_disagg_bench() {
 run_tp2_bench "baseline" "bench_baseline.json" || echo "警告: baseline 失败"
 run_tp2_bench "pd_ifr" "bench_pd_ifr.json" || echo "警告: pd_ifr 失败"
 run_tp2_bench "pd_ratio" "bench_pd_ratio.json" || echo "警告: pd_ratio 失败"
+run_tp2_bench "pd_auto" "bench_pd_auto.json" || echo "警告: pd_auto 失败"
 
 if [ "$SKIP_DISAGG" != "1" ]; then
     run_disagg_bench "bench_disagg.json" || echo "警告: disagg 失败"
