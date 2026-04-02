@@ -11,7 +11,7 @@
 #   INPUT_LEN / OUTPUT_LEN: input/output 长度
 #   SKIP_DISAGG: 设为1跳过所有disagg
 
-set -e
+set +e  # 不因单个实验失败退出，由调用方处理
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../common.sh"
@@ -32,6 +32,7 @@ SOURCE_DATASET=${SOURCE_DATASET:-"alpaca"}
 K_RATIO=${K_RATIO:-0.8}
 PORT=${PORT:-13000}
 SKIP_DISAGG=${SKIP_DISAGG:-0}
+DISAGG_BENCH_TIMEOUT=${DISAGG_BENCH_TIMEOUT:-600}
 KV_BUFFER_SIZE=${KV_BUFFER_SIZE:-2e10}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.9}
 DISAGG_MEM_UTIL=${DISAGG_MEM_UTIL:-0.8}
@@ -147,7 +148,7 @@ run_disagg_bench() {
 
     # 清理 PD 调度器环境变量
     unset VLLM_PD_SCHEDULER_MODE VLLM_PD_K_MODE VLLM_PD_K_RATIO \
-          VLLM_PD_CALIBRATION_FILE VLLM_USE_PD_SCHEDULER 2>/dev/null || true
+          VLLM_USE_PD_SCHEDULER 2>/dev/null || true
 
     # 分配 GPU: 前 n_prefill 个做 prefill，后 n_decode 个做 decode
     local gpus=($GPU1 $GPU2 $GPU3 $GPU4)
@@ -187,6 +188,7 @@ run_disagg_bench() {
 
         CUDA_VISIBLE_DEVICES=$gpu vllm serve "$MODEL" \
             --port $port --gpu-memory-utilization $DISAGG_MEM_UTIL $dtype_arg \
+            --no-enable-chunked-prefill \
             --kv-transfer-config \
             '{"kv_connector":"P2pNcclConnector","kv_role":"kv_producer","kv_rank":0,"kv_parallel_size":2,"kv_buffer_size":'"$KV_BUFFER_SIZE"',"kv_port":'"$kv_port"'}' \
             > "${log_dir}/disagg_${config_name}_prefill${i}.log" 2>&1 &
@@ -206,6 +208,7 @@ run_disagg_bench() {
 
         CUDA_VISIBLE_DEVICES=$gpu vllm serve "$MODEL" \
             --port $port --gpu-memory-utilization $DISAGG_MEM_UTIL $dtype_arg \
+            --no-enable-chunked-prefill \
             --kv-transfer-config \
             '{"kv_connector":"P2pNcclConnector","kv_role":"kv_consumer","kv_rank":1,"kv_parallel_size":2,"kv_buffer_size":'"$KV_BUFFER_SIZE"',"kv_port":'"$kv_port"'}' \
             > "${log_dir}/disagg_${config_name}_decode${i}.log" 2>&1 &
@@ -260,10 +263,14 @@ run_disagg_bench() {
     fi
 
     local status=0
-    vllm bench serve "${bench_common[@]}" \
+    timeout "$DISAGG_BENCH_TIMEOUT" \
+        vllm bench serve "${bench_common[@]}" \
         --base-url "http://localhost:9000" \
         --result-filename "$result_file" \
         >> "${log_dir}/disagg_${config_name}_bench.log" 2>&1 || status=$?
+    if [ $status -eq 124 ]; then
+        echo "disagg ${config_name} 超时 (${DISAGG_BENCH_TIMEOUT}s)"
+    fi
 
     kill $proxy_pid 2>/dev/null
     for i in "${!pids[@]}"; do
@@ -280,16 +287,16 @@ run_disagg_bench() {
 }
 
 # ========================================
-# 运行实验
+# 运行实验 (先跑 disagg，更早发现问题)
 # ========================================
-run_dp4_bench "baseline" "bench_baseline.json" || echo "警告: baseline 失败"
-run_dp4_bench "pd_auto" "bench_pd_auto.json" || echo "警告: pd_auto 失败"
-
 if [ "$SKIP_DISAGG" != "1" ]; then
     run_disagg_bench 1 3 "bench_disagg_1P3D.json" || echo "警告: disagg 1P+3D 失败"
     run_disagg_bench 2 2 "bench_disagg_2P2D.json" || echo "警告: disagg 2P+2D 失败"
     run_disagg_bench 3 1 "bench_disagg_3P1D.json" || echo "警告: disagg 3P+1D 失败"
 fi
+
+run_dp4_bench "baseline" "bench_baseline.json" || echo "警告: baseline 失败"
+run_dp4_bench "pd_auto" "bench_pd_auto.json" || echo "警告: pd_auto 失败"
 
 # ========================================
 # 汇总结果
