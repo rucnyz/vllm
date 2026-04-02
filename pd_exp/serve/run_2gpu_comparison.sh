@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# 2-GPU 公平对比: baseline(TP=2) vs pd_ifr(TP=2) vs disagg(P/D分离)
+# 2-GPU 公平对比: baseline(DP=2) vs pd_auto(DP=2) vs disagg(P/D分离)
 #
 # 用法: ./run_2gpu_comparison.sh [GPU1] [GPU2]
 #
@@ -9,7 +9,7 @@
 #   MAX_CONCURRENCY: 并发数，默认 64
 #   NUM_PROMPTS: 请求数，默认 1000
 #   INPUT_LEN / OUTPUT_LEN: 固定 input/output 长度
-#   SKIP_DISAGG: 设为1跳过disagg (高并发下可能hang)
+#   SKIP_DISAGG: 设为1跳过disagg (高并发下可能OOM)
 
 set -e
 
@@ -26,7 +26,6 @@ INPUT_LEN=${INPUT_LEN:-512}
 OUTPUT_LEN=${OUTPUT_LEN:-256}
 OUTPUT_VARIANCE=${OUTPUT_VARIANCE:-0.25}
 SOURCE_DATASET=${SOURCE_DATASET:-"alpaca"}
-IFR_WINDOW_SIZE=${IFR_WINDOW_SIZE:-500}
 K_RATIO=${K_RATIO:-0.8}
 PORT=${PORT:-13000}
 SKIP_DISAGG=${SKIP_DISAGG:-0}
@@ -85,13 +84,13 @@ fi
 # ========================================
 # 辅助函数
 # ========================================
-run_tp2_bench() {
+run_dp2_bench() {
     local scheduler=$1
     local result_file=$2
     local log_file="${OUTPUT_DIR}/logs/${scheduler}.log"
 
     echo ""
-    echo "--- ${scheduler} (TP=2) ---"
+    echo "--- ${scheduler} (DP=2) ---"
 
     # 清理
     lsof -t -i:$PORT 2>/dev/null | xargs -r kill -9 2>/dev/null
@@ -104,19 +103,13 @@ run_tp2_bench() {
         baseline)
             env_prefix="$env_prefix"
             ;;
-        pd_ifr)
-            env_prefix="$env_prefix VLLM_USE_PD_SCHEDULER=1 VLLM_PD_K_MODE=ifr VLLM_PD_IFR_WINDOW_SIZE=$IFR_WINDOW_SIZE VLLM_PD_CALIBRATION_FILE=$VLLM_PD_CALIBRATION_FILE"
-            ;;
-        pd_ratio)
-            env_prefix="$env_prefix VLLM_USE_PD_SCHEDULER=1 VLLM_PD_K_MODE=ratio VLLM_PD_K_RATIO=$K_RATIO VLLM_PD_CALIBRATION_FILE=$VLLM_PD_CALIBRATION_FILE"
-            ;;
         pd_auto)
             env_prefix="$env_prefix VLLM_PD_SCHEDULER_MODE=auto VLLM_PD_K_MODE=ratio VLLM_PD_K_RATIO=$K_RATIO VLLM_PD_CALIBRATION_FILE=$VLLM_PD_CALIBRATION_FILE"
             ;;
     esac
 
     env $env_prefix vllm serve "$MODEL" \
-        --port $PORT --gpu-memory-utilization 0.9 --tensor-parallel-size 2 \
+        --port $PORT --gpu-memory-utilization 0.9 --data-parallel-size 2 \
         $dtype_arg > "$log_file" 2>&1 &
     local pid=$!
 
@@ -148,6 +141,10 @@ run_disagg_bench() {
     lsof -t -i:9000 -i:9100 -i:9200 -i:14579 -i:14580 2>/dev/null | xargs -r kill -9 2>/dev/null
     wait_for_gpu_memory $GPU1 60 || return 1
     wait_for_gpu_memory $GPU2 60 || return 1
+
+    # 清理 PD 调度器环境变量，避免影响 disagg
+    unset VLLM_PD_SCHEDULER_MODE VLLM_PD_K_MODE VLLM_PD_K_RATIO \
+          VLLM_PD_CALIBRATION_FILE VLLM_USE_PD_SCHEDULER 2>/dev/null || true
 
     export VLLM_HOST_IP=127.0.0.1
 
@@ -210,10 +207,8 @@ run_disagg_bench() {
 # ========================================
 # 运行实验
 # ========================================
-run_tp2_bench "baseline" "bench_baseline.json" || echo "警告: baseline 失败"
-run_tp2_bench "pd_ifr" "bench_pd_ifr.json" || echo "警告: pd_ifr 失败"
-run_tp2_bench "pd_ratio" "bench_pd_ratio.json" || echo "警告: pd_ratio 失败"
-run_tp2_bench "pd_auto" "bench_pd_auto.json" || echo "警告: pd_auto 失败"
+run_dp2_bench "baseline" "bench_baseline.json" || echo "警告: baseline 失败"
+run_dp2_bench "pd_auto" "bench_pd_auto.json" || echo "警告: pd_auto 失败"
 
 if [ "$SKIP_DISAGG" != "1" ]; then
     run_disagg_bench "bench_disagg.json" || echo "警告: disagg 失败"
@@ -227,8 +222,8 @@ echo "========================================"
 echo "结果汇总 (concurrency=${MAX_CONCURRENCY}, ${NUM_PROMPTS} prompts)"
 echo "========================================"
 echo ""
-printf "%-15s %12s %10s %10s\n" "Scheduler" "Throughput" "TTFT(ms)" "TPOT(ms)"
-printf "%-15s %12s %10s %10s\n" "----------" "----------" "--------" "--------"
+printf "%-15s %15s %15s %10s %10s\n" "Scheduler" "TotalThrput" "OutputThrput" "TTFT(ms)" "TPOT(ms)"
+printf "%-15s %15s %15s %10s %10s\n" "----------" "-----------" "------------" "--------" "--------"
 
 for f in "$OUTPUT_DIR"/bench_*.json; do
     [ -f "$f" ] || continue
@@ -237,7 +232,7 @@ for f in "$OUTPUT_DIR"/bench_*.json; do
 import json, sys
 name = sys.argv[1]
 d = json.load(open(sys.argv[2]))
-print(f'{name:<15s} {d[\"output_throughput\"]:12.2f} {d[\"mean_ttft_ms\"]:10.2f} {d[\"mean_tpot_ms\"]:10.2f}')
+print(f'{name:<15s} {d[\"total_token_throughput\"]:15.2f} {d[\"output_throughput\"]:15.2f} {d[\"mean_ttft_ms\"]:10.2f} {d[\"mean_tpot_ms\"]:10.2f}')
 " "$name" "$f" 2>/dev/null || true
 done
 
