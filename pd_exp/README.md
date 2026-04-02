@@ -16,6 +16,9 @@ pd_exp/
 ├── common.sh                     # 公共函数库 (所有实验脚本共用)
 ├── dataset_utils.py              # 数据集加载工具
 ├── serve/                        # Online serving 实验 (IFR controller 验证)
+│   ├── run_4gpu_comparison.sh    # 4-GPU 对比 (baseline/pd_auto/disagg)
+│   ├── run_all_experiments.sh    # 全量实验 (3 workload x 3 concurrency)
+│   ├── run_2gpu_comparison.sh    # 2-GPU 对比
 │   ├── run_distribution_shift.sh # Input/output 分布突变
 │   ├── run_concurrency_shift.sh  # 并发水平突变
 │   ├── generate_distribution_shift_dataset.py
@@ -92,6 +95,54 @@ CONCURRENCY_PHASES="32:1000,2048:3000,256:2000" \
 - 高并发 (2048) 时 PD 吞吐反超 baseline (+7.6%)，**TPOT 仅为 baseline 的一半** (49.5 vs 104.7ms)
 - PD 的 TPOT 在所有 phase 均优于 baseline，prefill/decode 分离有效减少了 decode 被 prefill 打断的干扰
 - 代价是 TTFT 更高，prefill 需要等待 decode slot
+
+### 4-GPU 公平对比 (baseline vs pd_auto vs disagg)
+
+在相同 GPU 数量 (4) 下对比：baseline/pd_auto 用 DP=4，disagg 用 vLLM 官方 P/D 分离（1P+3D, 2P+2D, 3P+1D）。
+
+```bash
+bash pd_exp/serve/run_4gpu_comparison.sh [GPU1] [GPU2] [GPU3] [GPU4]
+
+# 自定义
+NUM_PROMPTS=2000 MAX_CONCURRENCY=128 INPUT_LEN=1024 OUTPUT_LEN=128 \
+    bash pd_exp/serve/run_4gpu_comparison.sh 4 5 6 7
+
+# 跳过 disagg
+SKIP_DISAGG=1 bash pd_exp/serve/run_4gpu_comparison.sh 0 1 2 3
+```
+
+#### 全量实验 (3 workload x 3 concurrency = 9 组)
+
+```bash
+bash pd_exp/serve/run_all_experiments.sh [GPU1] [GPU2] [GPU3] [GPU4]
+```
+
+在新机器上跑之前需要删除旧校准文件（校准参数与硬件相关）：
+
+```bash
+rm -f pd_exp/outputs/pd_calibration_Qwen3-8B.json
+bash pd_exp/serve/run_all_experiments.sh 0 1 2 3
+```
+
+实验矩阵：
+
+| Workload | INPUT_LEN | OUTPUT_LEN |
+|----------|-----------|------------|
+| Prefill-heavy | 1024 | 128 |
+| Balanced | 512 | 512 |
+| Decode-heavy | 128 | 1024 |
+
+每种 workload 跑 concurrency = 128, 256, 512 三档。
+
+环境变量：
+- `SKIP_DISAGG=1`: 跳过 disagg 实验
+- `DISAGG_BENCH_TIMEOUT=600`: disagg bench 超时秒数（默认 600），超时自动跳过
+- `DISAGG_MEM_UTIL=0.8`: disagg 实例显存利用率（默认 0.8）
+- `KV_BUFFER_SIZE=2e10`: KV transfer buffer 大小（默认 20GB）
+
+已知问题：
+- disagg 3P1D 在高并发 (>=256) 下 decode 实例容易 OOM（单 GPU 承载所有 decode）
+- disagg chunked prefill 已禁用以规避 P2P NCCL connector 断言失败 bug
 
 ### 2-GPU 公平对比 (baseline vs pd_ifr vs pd_ratio vs disagg)
 
