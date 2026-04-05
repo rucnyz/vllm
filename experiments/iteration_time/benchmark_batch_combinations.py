@@ -63,6 +63,8 @@ class BenchmarkConfig:
     max_num_seqs: int = 256
     block_size: int = 16
     gpu_memory_utilization: float = 0.9
+    max_model_len: int | None = None
+    hf_overrides: dict | None = None
     output_json: str | None = None
     enforce_eager: bool = True
 
@@ -115,7 +117,7 @@ class BatchBenchmark:
         print(f"  max_num_seqs: {self.config.max_num_seqs}")
         print(f"  gpu_memory_utilization: {self.config.gpu_memory_utilization}")
 
-        engine_args = EngineArgs(
+        engine_kwargs = dict(
             model=self.config.model,
             dtype=self.config.dtype,
             max_num_batched_tokens=self.config.max_num_batched_tokens,
@@ -126,6 +128,11 @@ class BatchBenchmark:
             enforce_eager=self.config.enforce_eager,
             block_size=self.config.block_size,
         )
+        if self.config.max_model_len is not None:
+            engine_kwargs["max_model_len"] = self.config.max_model_len
+        if self.config.hf_overrides is not None:
+            engine_kwargs["hf_overrides"] = self.config.hf_overrides
+        engine_args = EngineArgs(**engine_kwargs)
 
         vllm_config = engine_args.create_engine_config()
         executor_class = Executor.get_class(vllm_config)
@@ -290,7 +297,7 @@ class BatchBenchmark:
 
         # Run several iterations of prefill + decode to warm up GPU
         num_warmup_iters = 20
-        warmup_prefill_size = max(self.config.prefill_chunk_sizes)
+        warmup_prefill_size = min(max(self.config.prefill_chunk_sizes), 4096)
 
         for _ in range(num_warmup_iters):
             self._cleanup_all_requests()
@@ -657,6 +664,18 @@ def add_cli_args(parser: argparse.ArgumentParser):
         help="GPU memory utilization (0.0 to 1.0)",
     )
     parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=None,
+        help="Override model's max context length",
+    )
+    parser.add_argument(
+        "--hf-overrides",
+        type=json.loads,
+        default=None,
+        help="JSON dict to override HuggingFace config fields (e.g. rope_scaling)",
+    )
+    parser.add_argument(
         "--output-json",
         type=str,
         default=None,
@@ -701,6 +720,8 @@ def main(args: argparse.Namespace | None = None):
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_num_seqs=args.max_num_seqs,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len,
+        hf_overrides=args.hf_overrides,
         output_json=args.output_json,
         enforce_eager=args.enforce_eager,
     )
