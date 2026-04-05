@@ -351,7 +351,7 @@ The plateau spans $[0.6, 0.9]$ on Gamma ($\geq87\%$ of peak) and $[0.5, 0.8]$ on
 
 Thank you for the follow-up. Our 2-GPU experiment only allowed 1P+1D, limiting disagg’s flexibility. We now scale to 4 GPUs with multiple P:D ratios (1P+3D, 2P+2D, 3P+1D) and three workloads ($\mu_L:\mu_o$ = 1024:128, 512:512, 128:1024) for a fairer comparison.
 
-THETA+ (DP=4) vs disagg on 4×RTX PRO 6000 and 4×H200 (Qwen3-8B, 2000 prompts, $c=128,256,512$). “−” denotes OOM or timeout failure. Throughput is in tok/s; TTFT and TPOT are in ms. Best per-row results are in **bold**.
+THETA+ (DP=4) vs disagg on 4×RTX PRO 6000 and 4×H200 (Qwen3-8B, 2000 prompts, $c=128,512,1024$). “−” denotes OOM or timeout failure. Throughput is in tok/s; TTFT and TPOT are in ms. Best per-row results are in **bold**.
 
 |||RTX PRO 6000||||H200||||
 |:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|
@@ -366,16 +366,6 @@ THETA+ (DP=4) vs disagg on 4×RTX PRO 6000 and 4×H200 (Qwen3-8B, 2000 prompts, 
 |Decode-heavy|Throughput|**7,690**|7,469|6,848|5,450|**19,336**|18,861|17,227|13,536|
 |(128:1024)|TTFT|**62**|223|166|220|**44**|233|179|220|
 ||TPOT|**18.2**|18.6|20.4|25.6|**7.2**|**7.2**|7.9|10.2|
-|**$c=256$**||||||||||
-|Prefill-heavy|Throughput|37,208|23,102|**44,892**|−|**87,268**|40,638|77,117|−|
-|(1024:128)|TTFT|**381**|10,283|3,369|−|**307**|6,103|2,614|−|
-||TPOT|58.5|**14.5**|23.3|−|23.8|**6.4**|8.3|−|
-|Balanced|Throughput|16,870|**19,831**|17,551|11,402|43,729|**47,433**|42,016|26,455|
-|(512:512)|TTFT|**229**|844|505|664|**152**|681|395|596|
-||TPOT|28.7|**22.9**|26.9|42.1|10.9|**8.9**|10.9|17.6|
-|Decode-heavy|Throughput|**12,699**|12,176|10,595|7,021|**29,763**|29,495|24,820|16,682|
-|(128:1024)|TTFT|**119**|719|404|592|**110**|715|438|599|
-||TPOT|**21.3**|21.7|25.4|38.9|8.9|**8.5**|10.6|16.0|
 |**$c=512$**||||||||||
 |Prefill-heavy|Throughput|**47,322**|22,531|43,326|−|**105,432**|39,925|78,486|−|
 |(1024:128)|TTFT|**1,205**|21,412|9,245|−|**843**|12,357|5,741|−|
@@ -386,13 +376,25 @@ THETA+ (DP=4) vs disagg on 4×RTX PRO 6000 and 4×H200 (Qwen3-8B, 2000 prompts, 
 |Decode-heavy|Throughput|**18,396**|17,224|13,169|7,579|**46,782**|38,287|30,567|17,544|
 |(128:1024)|TTFT|**284**|1,842|1,074|2,295|**314**|1,908|1,216|1,720|
 ||TPOT|**28.2**|28.8|39.1|69.4|**10.8**|11.9|16.2|29.4|
+|**$c=1024$**||||||||||
+|Prefill-heavy|Throughput|**52,426**|23,013|43,971|−|**120,810**|41,943|78,986|−|
+|(1024:128)|TTFT|**3,876**|37,333|17,961|−|**2,386**|20,889|10,710|−|
+||TPOT|141.1|**14.5**|23.2|−|57.3|**6.3**|8.2|−|
+|Balanced|Throughput|**30,704**|27,127|−|−|**65,472**|53,652|−|−|
+|(512:512)|TTFT|**2,062**|16,984|−|−|**1,987**|10,814|−|−|
+||TPOT|47.9|**30.4**|−|−|26.4|**10.2**|−|−|
+|Decode-heavy|Throughput|**23,160**|19,476|14,068|−|**44,084**|42,051|32,668|16,250|
+|(128:1024)|TTFT|**1,217**|7,246|5,003|−|**2,621**|5,688|4,098|7,247|
+||TPOT|44.2|**43.8**|67.8|−|21.8|**18.2**|26.8|57.3|
+
+Results for $c\in\lbrace 256,768\rbrace$ are available in the [extended table](https://i.imgur.com/RHSdFFP.png).
 
 **Analysis.** Both approaches can separate prefill and decode phases: disagg assigns dedicated GPUs so phases run **concurrently across GPUs**; THETA+ adaptively switches to exclusive batching under heavy per-GPU load so phases alternate **on the same GPU**, and defaults to CP under light load. We organize findings into four points.
 
-**(1) Disagg achieves higher throughput on most prefill-heavy and balanced workloads at $c\leq256$ (7/18 settings).** Per-GPU load under DP=4 is light ($\leq$64 req/GPU), leaving compute underutilized. Disagg’s dedicated GPUs run prefill and decode concurrently, yielding higher throughput. At $c=128$, 2P+2D exceeds THETA+ by +63% (RTX) and +26% (H200) on prefill-heavy workload. For balanced workload, 1P+3D leads by +8–18%. Disagg also achieves lower TPOT in most settings, as dedicated decode GPUs are never interrupted by prefill.
+**(1) Disagg achieves higher throughput on prefill-heavy and balanced workloads at low concurrency (4/18 settings).** At $c=128$, per-GPU load under DP=4 is light ($\leq$32 req/GPU), leaving compute underutilized. Disagg’s dedicated GPUs run prefill and decode concurrently, yielding higher throughput: 2P+2D exceeds THETA+ by +62% (RTX) and +26% (H200) on prefill-heavy; 1P+3D leads by +9–14% on balanced. Disagg also achieves lower TPOT in these settings, as dedicated decode GPUs are never interrupted by prefill.
 
-**(2) THETA+ achieves higher throughput in the remaining 11/18 settings, covering all decode-heavy workloads and all $c\geq512$ settings.** As load increases, GPUs saturate (closing the utilization gap) while KV transfer overhead grows: (i) *High concurrency*: KV transfer bandwidth saturates as prefill GPUs flood decode GPUs, and decode-side KV occupancy grows without backpressure, causing OOM (3P+1D at $c\geq256$ for prefill-heavy workload). On H200 at $c=512$, THETA+ leads by +34% on prefill-heavy and +25% on balanced. At $c\in\lbrace 768,1024\rbrace$, THETA+ leads across all workloads while more disagg configs OOM ([full results](https://i.imgur.com/zds3tnP.png)). (ii) *Decode-heavy*: short prefills ($L=128$) offer little compute to parallelize yet KV overhead persists—THETA+ wins at all $c$ by up to +22% on H200.
+**(2) THETA+ achieves higher throughput in the remaining 14/18 settings, covering all decode-heavy workloads and all $c\geq512$ settings.** As load increases, GPUs saturate (closing the utilization gap) while KV transfer overhead grows: (i) *High concurrency*: KV transfer bandwidth saturates as prefill GPUs flood decode GPUs, and decode-side KV occupancy grows without backpressure, causing OOM (3P+1D OOMs at $c\geq512$ for prefill-heavy; 2P+2D also OOMs at $c=1024$ for balanced). On H200 at $c=1024$, THETA+ leads by +53% on prefill-heavy and +22% on balanced. (ii) *Decode-heavy*: short prefills ($L=128$) offer little compute to parallelize yet KV overhead persists—THETA+ wins at all $c$ by up to +22% on H200.
 
-**(3) THETA+ achieves the lowest TTFT in all 18 settings**, typically $2\text{--}9\times$ lower. Under DP=4, every GPU handles prefill, so requests spread across all 4 GPUs; under disagg, only a subset serves prefill (e.g., 2 in 2P+2D, 1 in 1P+3D), concentrating queuing pressure on fewer GPUs and compounding delay non-linearly under heavy load.
+**(3) THETA+ achieves the lowest TTFT in all 18 settings**, typically $2\text{--}8\times$ lower. Under DP=4, every GPU handles prefill, so requests spread across all 4 GPUs; under disagg, only a subset serves prefill (e.g., 2 in 2P+2D, 1 in 1P+3D), concentrating queuing pressure on fewer GPUs and compounding delay non-linearly under heavy load.
 
-**(4) Disagg requires workload-specific tuning; THETA+ does not.** The optimal P:D ratio varies (2P+2D for prefill-heavy, 1P+3D for balanced), and the wrong choice is costly (1P+3D is 45% slower than 2P+2D on prefill-heavy). In practice, THETA+ provides competitive throughput, the lowest TTFT, and no OOM across all tested configurations—without tuning.
+**(4) Disagg requires workload-specific tuning; THETA+ does not.** The optimal P:D ratio varies (2P+2D for prefill-heavy, 1P+3D for balanced), and the wrong choice is costly (1P+3D is 45% slower than 2P+2D on prefill-heavy at $c=128$). At high concurrency, disagg configs increasingly OOM while THETA+ completes all tested configurations—without tuning or failure.

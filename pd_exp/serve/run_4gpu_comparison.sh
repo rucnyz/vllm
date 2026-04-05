@@ -10,6 +10,7 @@
 #   NUM_PROMPTS: 请求数，默认 4000
 #   INPUT_LEN / OUTPUT_LEN: input/output 长度
 #   SKIP_DISAGG: 设为1跳过所有disagg
+#   DISAGG_BASE_PORT: disagg 端口基数，默认 9000 (proxy=BASE, prefill=BASE+100+i, decode=BASE+200+i)
 
 set +e  # 不因单个实验失败退出，由调用方处理
 
@@ -32,6 +33,7 @@ SOURCE_DATASET=${SOURCE_DATASET:-"alpaca"}
 K_RATIO=${K_RATIO:-0.8}
 PORT=${PORT:-13000}
 SKIP_DISAGG=${SKIP_DISAGG:-0}
+DISAGG_BASE_PORT=${DISAGG_BASE_PORT:-9000}
 DISAGG_BENCH_TIMEOUT=${DISAGG_BENCH_TIMEOUT:-600}
 KV_BUFFER_SIZE=${KV_BUFFER_SIZE:-2e10}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.9}
@@ -159,12 +161,13 @@ run_disagg_bench() {
     echo "  Decode GPUs: ${decode_gpus[*]}"
 
     # 清理端口
-    local all_ports="9000"
+    local proxy_port=$DISAGG_BASE_PORT
+    local all_ports="$proxy_port"
     for i in $(seq 0 $((n_prefill - 1))); do
-        all_ports="$all_ports,$((9100 + i)),$((14579 + i * 2))"
+        all_ports="$all_ports,$((DISAGG_BASE_PORT + 100 + i)),$((DISAGG_BASE_PORT + 5579 + i * 2))"
     done
     for i in $(seq 0 $((n_decode - 1))); do
-        all_ports="$all_ports,$((9200 + i)),$((14580 + i * 2))"
+        all_ports="$all_ports,$((DISAGG_BASE_PORT + 200 + i)),$((DISAGG_BASE_PORT + 5580 + i * 2))"
     done
     lsof -t -i:${all_ports} 2>/dev/null | xargs -r kill -9 2>/dev/null || true
 
@@ -183,8 +186,8 @@ run_disagg_bench() {
     # 启动 prefill 实例
     for i in $(seq 0 $((n_prefill - 1))); do
         local gpu=${prefill_gpus[$i]}
-        local port=$((9100 + i))
-        local kv_port=$((14579 + i * 2))
+        local port=$((DISAGG_BASE_PORT + 100 + i))
+        local kv_port=$((DISAGG_BASE_PORT + 5579 + i * 2))
 
         CUDA_VISIBLE_DEVICES=$gpu vllm serve "$MODEL" \
             --port $port --gpu-memory-utilization $DISAGG_MEM_UTIL $dtype_arg \
@@ -203,8 +206,8 @@ run_disagg_bench() {
     # 启动 decode 实例
     for i in $(seq 0 $((n_decode - 1))); do
         local gpu=${decode_gpus[$i]}
-        local port=$((9200 + i))
-        local kv_port=$((14580 + i * 2))
+        local port=$((DISAGG_BASE_PORT + 200 + i))
+        local kv_port=$((DISAGG_BASE_PORT + 5580 + i * 2))
 
         CUDA_VISIBLE_DEVICES=$gpu vllm serve "$MODEL" \
             --port $port --gpu-memory-utilization $DISAGG_MEM_UTIL $dtype_arg \
@@ -222,7 +225,7 @@ run_disagg_bench() {
 
     # 等待所有实例启动
     for i in $(seq 0 $((n_prefill - 1))); do
-        local port=$((9100 + i))
+        local port=$((DISAGG_BASE_PORT + 100 + i))
         local pid_idx=$i
         if ! wait_for_server $port ${pids[$pid_idx]} 300 "${log_dir}/disagg_${config_name}_prefill${i}.log"; then
             echo "disagg ${config_name} prefill${i} 启动失败"
@@ -231,7 +234,7 @@ run_disagg_bench() {
         fi
     done
     for i in $(seq 0 $((n_decode - 1))); do
-        local port=$((9200 + i))
+        local port=$((DISAGG_BASE_PORT + 200 + i))
         local pid_idx=$((n_prefill + i))
         if ! wait_for_server $port ${pids[$pid_idx]} 300 "${log_dir}/disagg_${config_name}_decode${i}.log"; then
             echo "disagg ${config_name} decode${i} 启动失败"
@@ -243,7 +246,7 @@ run_disagg_bench() {
 
     # 启动 multi proxy
     python3 "${SCRIPT_DIR}/disagg_multi_proxy.py" \
-        --port 9000 \
+        --port $proxy_port \
         --prefill-urls "$prefill_urls" \
         --decode-urls "$decode_urls" \
         --prefill-kv-ports "$prefill_kv_ports" \
@@ -253,7 +256,7 @@ run_disagg_bench() {
     sleep 3
 
     # 验证
-    if ! curl -s --max-time 60 http://localhost:9000/v1/completions \
+    if ! curl -s --max-time 60 http://localhost:${proxy_port}/v1/completions \
         -H "Content-Type: application/json" \
         -d '{"model":"'"$MODEL"'","prompt":"test","max_tokens":1}' >/dev/null 2>&1; then
         echo "disagg ${config_name} proxy 验证失败"
@@ -265,7 +268,7 @@ run_disagg_bench() {
     local status=0
     timeout "$DISAGG_BENCH_TIMEOUT" \
         vllm bench serve "${bench_common[@]}" \
-        --base-url "http://localhost:9000" \
+        --base-url "http://localhost:${proxy_port}" \
         --result-filename "$result_file" \
         >> "${log_dir}/disagg_${config_name}_bench.log" 2>&1 || status=$?
     if [ $status -eq 124 ]; then
@@ -280,6 +283,11 @@ run_disagg_bench() {
         else
             kill_server ${pids[$i]} ${decode_gpus[$((gpu_idx - n_prefill))]}
         fi
+    done
+
+    # 等待 GPU 显存释放和 zmq/kv 端口从 TIME_WAIT 释放，避免下一个 disagg 实验冲突
+    for gpu in $GPU1 $GPU2 $GPU3 $GPU4; do
+        wait_for_gpu_memory $gpu 60 || true
     done
 
     [ $status -eq 0 ] && echo "disagg ${config_name} 完成" || echo "disagg ${config_name} 失败 (exit=$status)"
