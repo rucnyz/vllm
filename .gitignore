@@ -231,3 +231,5 @@ ep_kernels_workspace/
 # PD experiment outputs
 pd_exp/outputs/
 pd_exp/paper/
+pd_exp/syn_cfr/outputs/
+pd_exp_outputs/
