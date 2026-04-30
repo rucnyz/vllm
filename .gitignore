@@ -233,3 +233,16 @@ pd_exp/outputs/
 pd_exp/paper/
 pd_exp/syn_cfr/outputs/
 pd_exp_outputs/
+
+# Iteration-time experiment outputs (keep .py/.sh sources, ignore data/plots)
+experiments/iteration_time/*.json
+experiments/iteration_time/*.pdf
+experiments/iteration_time/*.png
+experiments/iteration_time/*.nsys-rep
+experiments/iteration_time/*.sqlite
+experiments/iteration_time/plots/
+
+# Local-only scratch in repo root
+/tmp*/
+/torchinductor_rucnyz/
+/*.lock
