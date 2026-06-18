@@ -178,6 +178,11 @@ class CompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    forced_output_ids: list[int] | None = Field(
+        default=None,
+        description="Teacher-forcing: override sampled tokens with these IDs (agentreplay).",
+    )
+
     repetition_detection: RepetitionDetectionParams | None = Field(
         default=None,
         description="Parameters for detecting repetitive N-gram patterns "
@@ -312,8 +317,9 @@ class CompletionRequest(OpenAIBaseModel):
 
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
-            # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+        if hasattr(self, "forced_output_ids") and self.forced_output_ids:
+            extra_args["forced_output_ids"] = self.forced_output_ids
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
