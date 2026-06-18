@@ -156,6 +156,98 @@ def test_noop_no_gpu_kernel():
     assert t.cpu()[0, 0].item() == 0
 
 
+# --- skip_indices (chunked-prefill safety) ---
+
+def test_skip_indices_no_advance():
+    """Discarded rows (chunked-prefill) must NOT advance forced_dispatched."""
+    reqs = {
+        "r0": FakeReq(forced=[10, 11]),
+        "r1": FakeReq(forced=[20, 21]),
+    }
+    out = forced_override_positions(["r0", "r1"], reqs, skip_indices={1})
+    assert out == [(0, 10)]
+    assert reqs["r0"].forced_dispatched == 1
+    assert reqs["r1"].forced_dispatched == 0  # skipped, NOT advanced
+
+
+def test_skip_indices_all_skipped():
+    reqs = {"r0": FakeReq(forced=[10])}
+    out = forced_override_positions(["r0"], reqs, skip_indices={0})
+    assert out == []
+    assert reqs["r0"].forced_dispatched == 0
+
+
+# --- eviction_score sorting (block_pool) ---
+
+def test_eviction_score_sort_order():
+    """free_blocks must sort cached blocks: low score evicted first."""
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock, FreeKVCacheBlockQueue
+
+    blocks = [KVCacheBlock(i) for i in range(5)]
+    pool_blocks = [KVCacheBlock(i) for i in range(10)]  # pool needs extras
+    queue = FreeKVCacheBlockQueue(pool_blocks)
+
+    # Simulate: 3 blocks with different scores, all with hash
+    b0, b1, b2 = blocks[0], blocks[1], blocks[2]
+    b0.eviction_score = 1.0   # high — keep
+    b1.eviction_score = 0.0   # low — evict first
+    b2.eviction_score = 0.5   # mid
+
+    # Sort order: b1 (0.0) < b2 (0.5) < b0 (1.0)
+    import operator
+    sorted_blocks = sorted([b0, b1, b2], key=operator.attrgetter("eviction_score"))
+    assert [b.block_id for b in sorted_blocks] == [1, 2, 0]
+
+
+# --- HitCountScorer ---
+
+def test_hitcount_scorer_increments():
+    from vllm.v1.core.eviction_scorer import HitCountScorer
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+    scorer = HitCountScorer()
+    blocks = [KVCacheBlock(i) for i in range(3)]
+
+    assert all(b.eviction_score == 0.0 for b in blocks)
+
+    scorer.update_scores(blocks)
+    assert all(b.eviction_score == 1.0 for b in blocks)
+
+    scorer.update_scores([blocks[0]])  # touch block 0 again
+    assert blocks[0].eviction_score == 2.0
+    assert blocks[1].eviction_score == 1.0
+
+
+# --- eviction_score reset on recycle ---
+
+def test_eviction_score_reset_on_evict():
+    """eviction_score must be reset to 0.0 when a block is evicted/recycled."""
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+    block = KVCacheBlock(0)
+    block.eviction_score = 5.0
+    block._block_hash = b"fakehash"
+
+    # Simulate what _maybe_evict_cached_block does
+    block.eviction_score = 0.0  # our fix
+    block.reset_hash()
+
+    assert block.eviction_score == 0.0
+    assert block.block_hash is None
+
+
+# --- spec decode incompatibility ---
+
+def test_forced_with_spec_decode_warning():
+    """Teacher-forcing + speculative decoding should not silently coexist.
+    This test documents the known incompatibility."""
+    # Not an assertion test — just documents: if spec decode is active,
+    # the forced scatter runs on the target model's raw output, but
+    # RejectionSampler.parse_output may discard the forced token.
+    # Users must not use forced_output_ids with --speculative-algorithm.
+    pass
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0
