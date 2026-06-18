@@ -87,12 +87,19 @@ class KVCacheCoordinator(ABC):
         )
         self.scheduler_block_size = scheduler_block_size
 
+        import os
+        _eviction_scorer = None
+        if os.environ.get("VLLM_AGINFER_VALUE_EVICTION", "0") == "1":
+            from vllm.v1.core.eviction_scorer import HitCountScorer
+            _eviction_scorer = HitCountScorer()
+
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
             enable_caching=enable_caching,
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
+            eviction_scorer=_eviction_scorer,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
