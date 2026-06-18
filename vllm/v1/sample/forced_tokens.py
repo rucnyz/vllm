@@ -36,6 +36,7 @@ def _get_forced(req: "CachedRequestState") -> list | None:
 def forced_override_positions(
     req_ids: Sequence[str],
     requests: dict[str, "CachedRequestState"],
+    skip_indices: set[int] | None = None,
 ) -> List[Tuple[int, int]]:
     """Return (batch_index, forced_token) for each request that should
     have its sampled token overridden this step.
@@ -43,9 +44,15 @@ def forced_override_positions(
     Pure bookkeeping — no tensor ops. The ``forced_dispatched`` counter
     advances at dispatch time (not commit time), so the 1-step lag
     under async scheduling is handled correctly.
+
+    ``skip_indices``: batch positions whose sampled token will be
+    discarded (e.g. chunked-prefill dummy tokens). Skipped to avoid
+    advancing the counter for a token that won't be committed.
     """
     out: List[Tuple[int, int]] = []
     for i, rid in enumerate(req_ids):
+        if skip_indices and i in skip_indices:
+            continue
         req = requests.get(rid)
         if req is None:
             continue
@@ -63,6 +70,7 @@ def apply_forced_tokens(
     req_ids: Sequence[str],
     requests: dict[str, "CachedRequestState"],
     sampled_token_ids: torch.Tensor,
+    skip_indices: set[int] | None = None,
 ) -> None:
     """Scatter forced tokens onto the GPU sampled_token_ids tensor.
 
@@ -75,7 +83,7 @@ def apply_forced_tokens(
         requests: the model_runner's CachedRequestState dict.
         sampled_token_ids: GPU tensor, shape (batch, num_samples).
     """
-    overrides = forced_override_positions(req_ids, requests)
+    overrides = forced_override_positions(req_ids, requests, skip_indices)
     if not overrides:
         return
     idx = torch.tensor(

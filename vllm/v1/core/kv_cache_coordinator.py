@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
@@ -87,7 +88,6 @@ class KVCacheCoordinator(ABC):
         )
         self.scheduler_block_size = scheduler_block_size
 
-        import os
         _eviction_scorer = None
         if os.environ.get("VLLM_AGINFER_VALUE_EVICTION", "0") == "1":
             from vllm.v1.core.eviction_scorer import HitCountScorer

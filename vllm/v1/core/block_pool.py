@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import operator
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -385,6 +386,8 @@ class BlockPool:
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
+        block.eviction_score = 0.0
+
         block_hash = block.block_hash
         if block_hash is None:
             # The block doesn't have hash, eviction is not needed
@@ -451,7 +454,7 @@ class BlockPool:
         # When all scores are 0.0 (default), this is a stable no-op
         # preserving the caller's LRU ordering.
         if blocks_with_hash:
-            blocks_with_hash.sort(key=lambda b: b.eviction_score)
+            blocks_with_hash.sort(key=operator.attrgetter("eviction_score"))
         self.free_block_queue.append_n(blocks_with_hash)
 
     def evict_blocks(self, block_ids: set[int]) -> None:

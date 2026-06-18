@@ -318,7 +318,7 @@ class CompletionRequest(OpenAIBaseModel):
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             extra_args["kv_transfer_params"] = self.kv_transfer_params
-        if hasattr(self, "forced_output_ids") and self.forced_output_ids:
+        if self.forced_output_ids:
             extra_args["forced_output_ids"] = self.forced_output_ids
         return SamplingParams.from_optional(
             n=self.n,

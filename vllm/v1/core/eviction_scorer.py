@@ -20,7 +20,6 @@ free_blocks preserves LRU order (do-no-harm).
 """
 from __future__ import annotations
 
-import time
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol
 
@@ -41,9 +40,6 @@ class HitCountScorer:
     increments the block's score by 1. Blocks that are shared by
     many requests accumulate high scores and survive eviction.
     """
-
-    def __init__(self):
-        self._boot_time = time.monotonic()
 
     def update_scores(self, blocks: Sequence["KVCacheBlock"]) -> None:
         for block in blocks:

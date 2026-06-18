@@ -3636,7 +3636,8 @@ class GPUModelRunner(
         sampled_token_ids = sampler_output.sampled_token_ids
         from vllm.v1.sample.forced_tokens import apply_forced_tokens
         apply_forced_tokens(
-            self.input_batch.req_ids, self.requests, sampled_token_ids)
+            self.input_batch.req_ids, self.requests, sampled_token_ids,
+            skip_indices=set(discard_sampled_tokens_req_indices.tolist()))
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
         logprobs_lists = None

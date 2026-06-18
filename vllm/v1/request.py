@@ -101,9 +101,6 @@ class Request:
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
 
-        # Teacher-forcing: forced output token sequence for replay.
-        self.forced_output_ids: list[int] | None = None
-        self.forced_dispatched: int = 0
 
         if pooling_params is not None:
             # Pooling models.
@@ -119,9 +116,6 @@ class Request:
                 self.kv_transfer_params = sampling_params.extra_args.get(
                     "kv_transfer_params"
                 )
-                forced = sampling_params.extra_args.get("forced_output_ids")
-                if forced:
-                    self.forced_output_ids = list(forced)
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
