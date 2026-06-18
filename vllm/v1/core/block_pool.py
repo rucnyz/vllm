@@ -435,8 +435,13 @@ class BlockPool:
                 else:
                     blocks_with_hash.append(block)
 
-        # Blocks without hash always get evicted first - prepend them last to the tail
+        # Blocks without hash always get evicted first
         self.free_block_queue.prepend_n(blocks_without_hash)
+        # Sort cached blocks by eviction_score: low score = evicted first.
+        # When all scores are 0.0 (default), this is a stable no-op
+        # preserving the caller's LRU ordering.
+        if blocks_with_hash:
+            blocks_with_hash.sort(key=lambda b: b.eviction_score)
         self.free_block_queue.append_n(blocks_with_hash)
 
     def evict_blocks(self, block_ids: set[int]) -> None:

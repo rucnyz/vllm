@@ -133,6 +133,11 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # Pluggable eviction score (aginfer value-aware scheduling).
+    # Higher = more valuable = evicted later. Default 0.0 = LRU order.
+    # Set externally by the scheduling policy; read by BlockPool.free_blocks.
+    eviction_score: float = 0.0
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
